@@ -1,6 +1,7 @@
 "use client";
 
-import { Conversation } from "@/lib/whatsapp";
+import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
+import { businessColor, Conversation, isOutbound } from "@/lib/whatsapp";
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -13,6 +14,7 @@ interface ConversationListProps {
   onBack: () => void;
   visible: boolean;
   hasBusiness: boolean;
+  unreadCounts: Record<string, number>;
 }
 
 function formatTime(value: string) {
@@ -26,6 +28,10 @@ function formatTime(value: string) {
   });
 }
 
+function initial(label: string): string {
+  return label.trim().charAt(0).toUpperCase() || "?";
+}
+
 export function ConversationList({
   conversations,
   selectedChatId,
@@ -37,17 +43,20 @@ export function ConversationList({
   onBack,
   visible,
   hasBusiness,
+  unreadCounts,
 }: ConversationListProps) {
+  const color = businessColor(selectedBusinessSlug ?? "");
+
   return (
     <section
       data-business-slug={selectedBusinessSlug ?? undefined}
-      className={`${visible ? "flex" : "hidden"} md:flex w-full md:w-80 flex-shrink-0 flex-col border-r border-zinc-200 bg-white`}
+      className={`${visible ? "flex" : "hidden"} md:flex w-full md:w-96 flex-shrink-0 flex-col border-r border-zinc-200 bg-white`}
     >
-      <div className="flex items-center gap-2 border-b border-zinc-200 px-4 py-4">
-        <button onClick={onBack} className="text-sm text-emerald-700 md:hidden">
+      <div className="flex items-center gap-2 border-b border-zinc-200 px-5 py-4">
+        <button onClick={onBack} className="cursor-pointer text-sm text-zinc-500 md:hidden">
           ← Businesses
         </button>
-        <h2 className="truncate text-base font-semibold text-zinc-900 md:block">
+        <h2 className="truncate text-sm font-semibold text-zinc-900">
           {businessLabel || "Conversations"}
         </h2>
       </div>
@@ -61,32 +70,67 @@ export function ConversationList({
       </div>
       <div className="flex-1 overflow-y-auto">
         {!hasBusiness && (
-          <p className="px-4 py-6 text-sm text-zinc-500">Select a business to view conversations.</p>
+          <p className="px-5 py-6 text-sm text-zinc-500">Select a business to view conversations.</p>
         )}
         {hasBusiness && conversations.length === 0 && (
-          <p className="px-4 py-6 text-sm text-zinc-500">No conversations found.</p>
+          <p className="px-5 py-6 text-sm text-zinc-500">No conversations found.</p>
         )}
-        {conversations.map((conversation) => (
-          <button
-            key={conversation.chatId}
-            onClick={() => onSelect(conversation.chatId)}
-            className={`flex w-full flex-col gap-1 border-b border-zinc-100 px-4 py-3 text-left hover:bg-zinc-50 ${
-              selectedChatId === conversation.chatId ? "bg-emerald-50" : ""
-            }`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate text-sm font-medium text-zinc-900">
-                {conversation.contactName || conversation.contactNumber || conversation.chatId}
+        {conversations.map((conversation) => {
+          const displayName =
+            conversation.contactName || conversation.contactNumber || conversation.chatId;
+          const unread = unreadCounts[conversation.chatId] ?? 0;
+          const outboundLast = isOutbound(conversation.lastMessage.direction);
+          const lastMediaKind = classifyMedia(conversation.lastMessage);
+          const preview =
+            conversation.lastMessage.message_body ||
+            (lastMediaKind ? mediaPreviewLabel(conversation.lastMessage, lastMediaKind) : "");
+          return (
+            <button
+              key={conversation.chatId}
+              onClick={() => onSelect(conversation.chatId)}
+              className={`flex w-full items-start gap-3 border-b border-zinc-100 px-5 py-3 text-left hover:bg-zinc-50 ${
+                selectedChatId === conversation.chatId ? "bg-zinc-50" : ""
+              }`}
+            >
+              <span
+                className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white ${color.solid}`}
+                aria-hidden
+              >
+                {initial(displayName)}
               </span>
-              <span className="flex-shrink-0 text-xs text-zinc-400">
-                {formatTime(conversation.lastMessage.timestamp)}
-              </span>
-            </div>
-            <span className="truncate text-sm text-zinc-500">
-              {conversation.lastMessage.message_body || "[Media message]"}
-            </span>
-          </button>
-        ))}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span
+                    className={`truncate text-sm ${unread > 0 ? "font-semibold text-zinc-900" : "font-medium text-zinc-800"}`}
+                  >
+                    {displayName}
+                  </span>
+                  <span className="flex-shrink-0 text-xs text-zinc-400">
+                    {formatTime(conversation.lastMessage.timestamp)}
+                  </span>
+                </div>
+                {conversation.contactNumber && (
+                  <p className="truncate text-xs text-zinc-400">{conversation.contactNumber}</p>
+                )}
+                <div className="mt-0.5 flex items-center justify-between gap-2">
+                  <span
+                    className={`truncate text-sm ${unread > 0 ? "text-zinc-700" : "text-zinc-500"}`}
+                  >
+                    {outboundLast ? "You: " : ""}
+                    {preview}
+                  </span>
+                  {unread > 0 && (
+                    <span
+                      className={`flex-shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold text-white ${color.solid}`}
+                    >
+                      {unread > 9 ? "9+" : unread}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </button>
+          );
+        })}
       </div>
     </section>
   );

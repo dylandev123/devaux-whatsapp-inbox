@@ -5,9 +5,10 @@ import { useState } from "react";
 interface ReplyBoxProps {
   disabled: boolean;
   onSend: (text: string) => Promise<void>;
+  accentClassName?: string;
 }
 
-export function ReplyBox({ disabled, onSend }: ReplyBoxProps) {
+export function ReplyBox({ disabled, onSend, accentClassName = "bg-emerald-600" }: ReplyBoxProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +54,7 @@ export function ReplyBox({ disabled, onSend }: ReplyBoxProps) {
         <button
           type="submit"
           disabled={disabled || sending || !text.trim()}
-          className="flex-shrink-0 rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          className={`flex-shrink-0 cursor-pointer rounded-md px-4 py-2 text-sm font-medium text-white disabled:opacity-50 ${accentClassName}`}
         >
           {sending ? "Sending..." : "Send"}
         </button>

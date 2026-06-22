@@ -10,6 +10,60 @@ export function businessLabel(slug: string): string {
   return BUSINESS_LABELS[slug] ?? slug;
 }
 
+export interface BusinessColor {
+  dot: string;
+  text: string;
+  bg: string;
+  border: string;
+  /** Stronger shade for buttons/outbound bubbles; always paired with white text. */
+  solid: string;
+}
+
+// Only 4 of the 5 businesses had a colour specified; "supplify" falls back to
+// a neutral slate until a colour is chosen for it.
+export const BUSINESS_COLORS: Record<string, BusinessColor> = {
+  by_sea: {
+    dot: "bg-blue-500",
+    text: "text-blue-700",
+    bg: "bg-blue-50",
+    border: "border-blue-500",
+    solid: "bg-blue-600",
+  },
+  dog_food: {
+    dot: "bg-green-500",
+    text: "text-green-700",
+    bg: "bg-green-50",
+    border: "border-green-500",
+    solid: "bg-green-600",
+  },
+  cool_pool: {
+    dot: "bg-teal-500",
+    text: "text-teal-700",
+    bg: "bg-teal-50",
+    border: "border-teal-500",
+    solid: "bg-teal-600",
+  },
+  candock: {
+    dot: "bg-orange-500",
+    text: "text-orange-700",
+    bg: "bg-orange-50",
+    border: "border-orange-500",
+    solid: "bg-orange-600",
+  },
+};
+
+const DEFAULT_BUSINESS_COLOR: BusinessColor = {
+  dot: "bg-slate-400",
+  text: "text-slate-700",
+  bg: "bg-slate-50",
+  border: "border-slate-400",
+  solid: "bg-slate-600",
+};
+
+export function businessColor(slug: string): BusinessColor {
+  return BUSINESS_COLORS[slug] ?? DEFAULT_BUSINESS_COLOR;
+}
+
 export interface WhatsappMessage {
   id: string;
   business_slug: string;
@@ -45,6 +99,21 @@ export function isOutbound(direction: string | null | undefined): boolean {
 
 export function isSessionConnected(status: string | null | undefined): boolean {
   return ["connected", "online", "active"].includes((status ?? "").toLowerCase());
+}
+
+const SYSTEM_CHAT_IDS = new Set(["status@broadcast", "broadcast"]);
+
+export function isSystemChatId(chatId: string): boolean {
+  const normalized = chatId.toLowerCase();
+  return SYSTEM_CHAT_IDS.has(normalized) || normalized.endsWith("@broadcast");
+}
+
+export function filterCustomerMessages(messages: WhatsappMessage[]): WhatsappMessage[] {
+  return messages.filter((m) => !isSystemChatId(m.chat_id));
+}
+
+export function isRealCustomerConversation(conversation: Conversation): boolean {
+  return conversation.messages.some((m) => !isOutbound(m.direction));
 }
 
 export function groupConversations(messages: WhatsappMessage[]): Conversation[] {

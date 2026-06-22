@@ -1,19 +1,30 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import {
   businessLabel,
+  filterCustomerMessages,
   groupConversations,
+  isRealCustomerConversation,
   isSessionConnected,
   matchesSearch,
   resolveRecipientNumber,
   WhatsappMessage,
   WhatsappSession,
 } from "@/lib/whatsapp";
+import {
+  fetchUnreadCounts,
+  markConversationRead,
+  sumUnreadByBusiness,
+  unreadByChatId,
+  UnreadCount,
+} from "@/lib/reads";
 import { Sidebar } from "@/components/whatsapp/Sidebar";
 import { ConversationList } from "@/components/whatsapp/ConversationList";
 import { MessageThread } from "@/components/whatsapp/MessageThread";
+import { CustomerPanel } from "@/components/customers/CustomerPanel";
+import { CustomerSearch } from "@/components/customers/CustomerSearch";
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -24,6 +35,18 @@ export function Inbox() {
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [showProfile, setShowProfile] = useState(false);
+  const [showCustomerSearch, setShowCustomerSearch] = useState(false);
+  const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
+  const pendingChatIdRef = useRef<string | null>(null);
+
+  const loadUnreadCounts = useCallback(async () => {
+    try {
+      setUnreadCounts(await fetchUnreadCounts());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load unread counts");
+    }
+  }, []);
 
   const loadSessions = useCallback(async () => {
     const { data, error: fetchError } = await supabase
@@ -61,6 +84,12 @@ export function Inbox() {
   }, [loadSessions]);
 
   useEffect(() => {
+    loadUnreadCounts();
+    const interval = setInterval(loadUnreadCounts, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [loadUnreadCounts]);
+
+  useEffect(() => {
     if (selectedBusinessSlug || sessions.length === 0) return;
     const firstConnected = sessions.find((s) => isSessionConnected(s.status));
     if (firstConnected) {
@@ -69,8 +98,14 @@ export function Inbox() {
   }, [sessions, selectedBusinessSlug]);
 
   useEffect(() => {
-    setSelectedChatId(null);
+    if (pendingChatIdRef.current) {
+      setSelectedChatId(pendingChatIdRef.current);
+      pendingChatIdRef.current = null;
+    } else {
+      setSelectedChatId(null);
+    }
     setSearch("");
+    setShowProfile(false);
   }, [selectedBusinessSlug]);
 
   useEffect(() => {
@@ -84,7 +119,9 @@ export function Inbox() {
   }, [selectedBusinessSlug, loadMessages]);
 
   const conversations = useMemo(() => {
-    const grouped = groupConversations(messages);
+    const grouped = groupConversations(filterCustomerMessages(messages)).filter(
+      isRealCustomerConversation
+    );
     console.log("Grouped conversations", grouped);
     return grouped;
   }, [messages]);
@@ -97,11 +134,50 @@ export function Inbox() {
     [conversations, selectedChatId]
   );
 
+  // Mark the open conversation read whenever it's selected, and again any
+  // time its last message changes (e.g. a new inbound message arrives while
+  // it's still the active chat). Read state lives server-side in
+  // conversation_reads (see lib/reads.ts), so this syncs across devices.
+  useEffect(() => {
+    if (!selectedBusinessSlug || !selectedConversation) return;
+    const businessSlug = selectedBusinessSlug;
+    const chatId = selectedConversation.chatId;
+    const lastReadAt = selectedConversation.lastMessage.timestamp;
+
+    // Optimistic: clear the badge immediately rather than waiting on the
+    // next 5s poll.
+    setUnreadCounts((prev) => prev.filter((c) => !(c.businessSlug === businessSlug && c.chatId === chatId)));
+
+    markConversationRead(businessSlug, chatId, lastReadAt).catch((err) => {
+      setError(err instanceof Error ? err.message : "Failed to mark conversation read");
+    });
+  }, [selectedBusinessSlug, selectedConversation]);
+
+  const businessUnreadCounts = useMemo(() => sumUnreadByBusiness(unreadCounts), [unreadCounts]);
+  const chatUnreadCounts = useMemo(
+    () => unreadByChatId(unreadCounts, selectedBusinessSlug),
+    [unreadCounts, selectedBusinessSlug]
+  );
+
   const mobilePane: "sidebar" | "list" | "thread" = selectedChatId
     ? "thread"
     : selectedBusinessSlug
     ? "list"
     : "sidebar";
+
+  const customerPhoneNumber = selectedConversation
+    ? resolveRecipientNumber(selectedConversation.contactNumber, selectedConversation.chatId)
+    : null;
+
+  function jumpToConversation(businessSlug: string, chatId: string) {
+    setShowCustomerSearch(false);
+    if (businessSlug === selectedBusinessSlug) {
+      setSelectedChatId(chatId);
+      return;
+    }
+    pendingChatIdRef.current = chatId;
+    setSelectedBusinessSlug(businessSlug);
+  }
 
   async function handleSend(text: string) {
     if (!selectedBusinessSlug || !selectedConversation) return;
@@ -136,6 +212,8 @@ export function Inbox() {
         sessions={sessions}
         selectedBusinessSlug={selectedBusinessSlug}
         onSelect={setSelectedBusinessSlug}
+        onOpenCustomerSearch={() => setShowCustomerSearch(true)}
+        unreadCounts={businessUnreadCounts}
         visible={mobilePane === "sidebar"}
       />
       <ConversationList
@@ -149,13 +227,26 @@ export function Inbox() {
         onBack={() => setSelectedBusinessSlug(null)}
         visible={mobilePane === "list"}
         hasBusiness={Boolean(selectedBusinessSlug)}
+        unreadCounts={chatUnreadCounts}
       />
       <MessageThread
         conversation={selectedConversation}
+        businessSlug={selectedBusinessSlug}
         onBack={() => setSelectedChatId(null)}
         onSend={handleSend}
+        onToggleProfile={() => setShowProfile((v) => !v)}
+        showProfile={showProfile}
         visible={mobilePane === "thread"}
       />
+      {showProfile && customerPhoneNumber && (
+        <CustomerPanel phoneNumber={customerPhoneNumber} onClose={() => setShowProfile(false)} />
+      )}
+      {showCustomerSearch && (
+        <CustomerSearch
+          onClose={() => setShowCustomerSearch(false)}
+          onSelectConversation={jumpToConversation}
+        />
+      )}
     </div>
   );
 }

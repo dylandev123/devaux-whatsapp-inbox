@@ -41,7 +41,7 @@ export default function LoginPage() {
         onSubmit={handleSubmit}
         className="w-full max-w-sm rounded-lg border border-zinc-200 bg-white p-6 shadow-sm"
       >
-        <h1 className="mb-1 text-lg font-semibold text-zinc-900">WhatsApp Inbox</h1>
+        <h1 className="mb-1 text-lg font-semibold text-zinc-900">Devaux Communications</h1>
         <p className="mb-6 text-sm text-zinc-500">Sign in to continue</p>
 
         {error && (
