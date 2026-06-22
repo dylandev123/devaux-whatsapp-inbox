@@ -1,3 +1,8 @@
+// Seed-data fallback only — once supabase/migrations/20260623000300_business_management.sql
+// is run, the real source of truth is the `whatsapp_businesses` table, loaded
+// into the directory cache below via setBusinessDirectory(). These statics
+// are what businessLabel()/businessColor() fall back to before that first
+// load completes, or for a slug that's missing from the table for some reason.
 export const BUSINESS_LABELS: Record<string, string> = {
   dog_food: "Dog Food St. Lucia",
   by_sea: "By Sea Tours",
@@ -6,9 +11,13 @@ export const BUSINESS_LABELS: Record<string, string> = {
   candock: "Candock Carib",
 };
 
-export function businessLabel(slug: string): string {
-  return BUSINESS_LABELS[slug] ?? slug;
-}
+const FALLBACK_BUSINESS_COLOUR_NAMES: Record<string, string> = {
+  dog_food: "green",
+  by_sea: "blue",
+  cool_pool: "teal",
+  candock: "orange",
+  supplify: "purple",
+};
 
 export interface BusinessColor {
   dot: string;
@@ -19,49 +28,51 @@ export interface BusinessColor {
   solid: string;
 }
 
-// Only 4 of the 5 businesses had a colour specified; "supplify" falls back to
-// a neutral slate until a colour is chosen for it.
-export const BUSINESS_COLORS: Record<string, BusinessColor> = {
-  by_sea: {
-    dot: "bg-blue-500",
-    text: "text-blue-700",
-    bg: "bg-blue-50",
-    border: "border-blue-500",
-    solid: "bg-blue-600",
-  },
-  dog_food: {
-    dot: "bg-green-500",
-    text: "text-green-700",
-    bg: "bg-green-50",
-    border: "border-green-500",
-    solid: "bg-green-600",
-  },
-  cool_pool: {
-    dot: "bg-teal-500",
-    text: "text-teal-700",
-    bg: "bg-teal-50",
-    border: "border-teal-500",
-    solid: "bg-teal-600",
-  },
-  candock: {
-    dot: "bg-orange-500",
-    text: "text-orange-700",
-    bg: "bg-orange-50",
-    border: "border-orange-500",
-    solid: "bg-orange-600",
-  },
+// Named palette matching the `colour` column on whatsapp_businesses (a few
+// extras included beyond the 5 seeded businesses, for the admin colour picker).
+export const COLOR_PALETTE: Record<string, BusinessColor> = {
+  slate: { dot: "bg-slate-400", text: "text-slate-700", bg: "bg-slate-50", border: "border-slate-400", solid: "bg-slate-600" },
+  green: { dot: "bg-green-500", text: "text-green-700", bg: "bg-green-50", border: "border-green-500", solid: "bg-green-600" },
+  blue: { dot: "bg-blue-500", text: "text-blue-700", bg: "bg-blue-50", border: "border-blue-500", solid: "bg-blue-600" },
+  teal: { dot: "bg-teal-500", text: "text-teal-700", bg: "bg-teal-50", border: "border-teal-500", solid: "bg-teal-600" },
+  orange: { dot: "bg-orange-500", text: "text-orange-700", bg: "bg-orange-50", border: "border-orange-500", solid: "bg-orange-600" },
+  purple: { dot: "bg-purple-500", text: "text-purple-700", bg: "bg-purple-50", border: "border-purple-500", solid: "bg-purple-600" },
+  red: { dot: "bg-red-500", text: "text-red-700", bg: "bg-red-50", border: "border-red-500", solid: "bg-red-600" },
+  pink: { dot: "bg-pink-500", text: "text-pink-700", bg: "bg-pink-50", border: "border-pink-500", solid: "bg-pink-600" },
+  indigo: { dot: "bg-indigo-500", text: "text-indigo-700", bg: "bg-indigo-50", border: "border-indigo-500", solid: "bg-indigo-600" },
+  amber: { dot: "bg-amber-500", text: "text-amber-700", bg: "bg-amber-50", border: "border-amber-500", solid: "bg-amber-600" },
 };
 
-const DEFAULT_BUSINESS_COLOR: BusinessColor = {
-  dot: "bg-slate-400",
-  text: "text-slate-700",
-  bg: "bg-slate-50",
-  border: "border-slate-400",
-  solid: "bg-slate-600",
-};
+export function colorByName(name: string | null | undefined): BusinessColor {
+  return COLOR_PALETTE[(name ?? "slate").toLowerCase()] ?? COLOR_PALETTE.slate;
+}
+
+interface BusinessDirectoryEntry {
+  displayName: string;
+  colourName: string;
+}
+
+let businessDirectory = new Map<string, BusinessDirectoryEntry>();
+
+// Populated from whatsapp_businesses (see lib/businesses.ts). Call this once
+// the table has loaded so every existing businessLabel()/businessColor()
+// call site picks up live data with no further changes.
+export function setBusinessDirectory(
+  rows: { business_slug: string; display_name: string; colour: string | null }[]
+): void {
+  businessDirectory = new Map(
+    rows.map((r) => [r.business_slug, { displayName: r.display_name, colourName: r.colour ?? "slate" }])
+  );
+}
+
+export function businessLabel(slug: string): string {
+  return businessDirectory.get(slug)?.displayName ?? BUSINESS_LABELS[slug] ?? slug;
+}
 
 export function businessColor(slug: string): BusinessColor {
-  return BUSINESS_COLORS[slug] ?? DEFAULT_BUSINESS_COLOR;
+  const liveColourName = businessDirectory.get(slug)?.colourName;
+  if (liveColourName) return colorByName(liveColourName);
+  return colorByName(FALLBACK_BUSINESS_COLOUR_NAMES[slug]);
 }
 
 export interface WhatsappMessage {

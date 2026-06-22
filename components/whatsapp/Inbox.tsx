@@ -10,9 +10,11 @@ import {
   isSessionConnected,
   matchesSearch,
   resolveRecipientNumber,
+  setBusinessDirectory,
   WhatsappMessage,
   WhatsappSession,
 } from "@/lib/whatsapp";
+import { fetchActiveBusinesses, WhatsappBusinessRow } from "@/lib/businesses";
 import {
   fetchUnreadCounts,
   markConversationRead,
@@ -29,6 +31,7 @@ import { CustomerSearch } from "@/components/customers/CustomerSearch";
 const POLL_INTERVAL_MS = 5000;
 
 export function Inbox() {
+  const [businesses, setBusinesses] = useState<WhatsappBusinessRow[]>([]);
   const [sessions, setSessions] = useState<WhatsappSession[]>([]);
   const [selectedBusinessSlug, setSelectedBusinessSlug] = useState<string | null>(null);
   const [messages, setMessages] = useState<WhatsappMessage[]>([]);
@@ -45,6 +48,16 @@ export function Inbox() {
       setUnreadCounts(await fetchUnreadCounts());
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load unread counts");
+    }
+  }, []);
+
+  const loadBusinesses = useCallback(async () => {
+    try {
+      const rows = await fetchActiveBusinesses();
+      setBusinesses(rows);
+      setBusinessDirectory(rows);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load businesses");
     }
   }, []);
 
@@ -76,6 +89,12 @@ export function Inbox() {
     console.log("Loaded messages", businessSlug, data);
     setMessages(data ?? []);
   }, []);
+
+  useEffect(() => {
+    loadBusinesses();
+    const interval = setInterval(loadBusinesses, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [loadBusinesses]);
 
   useEffect(() => {
     loadSessions();
@@ -209,6 +228,7 @@ export function Inbox() {
         </div>
       )}
       <Sidebar
+        businesses={businesses}
         sessions={sessions}
         selectedBusinessSlug={selectedBusinessSlug}
         onSelect={setSelectedBusinessSlug}

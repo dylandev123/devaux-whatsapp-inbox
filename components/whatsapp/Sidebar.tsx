@@ -1,9 +1,11 @@
 "use client";
 
 import { supabase } from "@/lib/supabaseClient";
-import { BUSINESS_LABELS, businessColor, businessLabel, isSessionConnected, WhatsappSession } from "@/lib/whatsapp";
+import { WhatsappBusinessRow } from "@/lib/businesses";
+import { businessColor, businessLabel, isSessionConnected, WhatsappSession } from "@/lib/whatsapp";
 
 interface SidebarProps {
+  businesses: WhatsappBusinessRow[];
   sessions: WhatsappSession[];
   selectedBusinessSlug: string | null;
   onSelect: (slug: string) => void;
@@ -12,13 +14,8 @@ interface SidebarProps {
   visible: boolean;
 }
 
-interface BusinessRow {
-  business_slug: string;
-  label: string;
-  connected: boolean;
-}
-
 export function Sidebar({
+  businesses,
   sessions,
   selectedBusinessSlug,
   onSelect,
@@ -27,14 +24,6 @@ export function Sidebar({
   visible,
 }: SidebarProps) {
   const sessionBySlug = new Map(sessions.map((s) => [s.business_slug, s]));
-  const slugs = Array.from(
-    new Set([...Object.keys(BUSINESS_LABELS), ...sessions.map((s) => s.business_slug)])
-  );
-  const businesses: BusinessRow[] = slugs.map((slug) => ({
-    business_slug: slug,
-    label: businessLabel(slug),
-    connected: isSessionConnected(sessionBySlug.get(slug)?.status),
-  }));
 
   return (
     <aside
@@ -64,16 +53,18 @@ export function Sidebar({
       </div>
       <nav className="flex-1 overflow-y-auto py-2">
         {businesses.map((business) => {
-          const isSelected = selectedBusinessSlug === business.business_slug;
-          const color = businessColor(business.business_slug);
-          const unread = unreadCounts[business.business_slug] ?? 0;
+          const slug = business.business_slug;
+          const isSelected = selectedBusinessSlug === slug;
+          const color = businessColor(slug);
+          const unread = unreadCounts[slug] ?? 0;
+          const connected = isSessionConnected(sessionBySlug.get(slug)?.status);
           return (
             <button
-              key={business.business_slug}
+              key={slug}
               type="button"
               onClick={() => {
-                console.log("Selected business", business.business_slug);
-                onSelect(business.business_slug);
+                console.log("Selected business", slug);
+                onSelect(slug);
               }}
               aria-pressed={isSelected}
               className={`flex w-full cursor-pointer items-center gap-3 border-l-[3px] px-4 py-3 text-left text-sm transition-colors hover:bg-zinc-50 ${
@@ -82,7 +73,7 @@ export function Sidebar({
             >
               <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${color.dot}`} aria-hidden />
               <span className={`flex-1 truncate ${unread > 0 ? "font-semibold" : ""}`}>
-                {business.label}
+                {businessLabel(slug)}
               </span>
               {unread > 0 && (
                 <span
@@ -92,15 +83,18 @@ export function Sidebar({
                 </span>
               )}
               <span
-                title={business.connected ? "Connected" : "Disconnected"}
+                title={connected ? "Connected" : "Disconnected"}
                 className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${
-                  business.connected ? "bg-emerald-500" : "bg-zinc-300"
+                  connected ? "bg-emerald-500" : "bg-zinc-300"
                 }`}
                 aria-hidden
               />
             </button>
           );
         })}
+        {businesses.length === 0 && (
+          <p className="px-4 py-3 text-sm text-zinc-500">No active businesses configured.</p>
+        )}
       </nav>
     </aside>
   );
