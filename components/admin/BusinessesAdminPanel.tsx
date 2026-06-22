@@ -155,7 +155,7 @@ export function BusinessesAdminPanel() {
 
   return (
     <section>
-      <h1 className="text-lg font-semibold text-zinc-900">WhatsApp business sessions</h1>
+      <h2 className="text-lg font-semibold text-zinc-900">WhatsApp business sessions</h2>
       <p className="mt-1 text-sm text-zinc-500">
         Live sessions reported by the WhatsApp backend. A business added above will only appear
         here once the backend actually starts a session for it.

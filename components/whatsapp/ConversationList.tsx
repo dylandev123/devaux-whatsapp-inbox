@@ -52,8 +52,11 @@ export function ConversationList({
       data-business-slug={selectedBusinessSlug ?? undefined}
       className={`${visible ? "flex" : "hidden"} md:flex w-full md:w-96 flex-shrink-0 flex-col border-r border-zinc-200 bg-white`}
     >
-      <div className="flex items-center gap-2 border-b border-zinc-200 px-5 py-4">
-        <button onClick={onBack} className="cursor-pointer text-sm text-zinc-500 md:hidden">
+      <div className="flex items-center gap-2 border-b border-zinc-200 px-3 py-3 sm:px-5 sm:py-4">
+        <button
+          onClick={onBack}
+          className="-ml-1 flex-shrink-0 cursor-pointer rounded-md px-2 py-2 text-sm text-zinc-500 hover:bg-zinc-100 md:hidden"
+        >
           ← Businesses
         </button>
         <h2 className="truncate text-sm font-semibold text-zinc-900">

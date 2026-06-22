@@ -13,6 +13,10 @@ import { COLOR_PALETTE } from "@/lib/whatsapp";
 const POLL_INTERVAL_MS = 5000;
 const COLOR_NAMES = Object.keys(COLOR_PALETTE);
 
+function isMissingBusinessesTable(err: unknown): boolean {
+  return err instanceof Error && /PGRST205|Could not find the table/i.test(err.message);
+}
+
 interface Draft {
   display_name: string;
   colour: string;
@@ -39,14 +43,21 @@ export function BusinessManagementPanel() {
   const [addSubmitting, setAddSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [flowMessage, setFlowMessage] = useState<string | null>(null);
+  const [migrationMissing, setMigrationMissing] = useState(false);
 
   const loadBusinesses = useCallback(async () => {
     try {
       const rows = await fetchManagedBusinesses();
       setBusinesses(rows);
       setError(null);
+      setMigrationMissing(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load businesses");
+      if (isMissingBusinessesTable(err)) {
+        setMigrationMissing(true);
+        setError(null);
+      } else {
+        setError(err instanceof Error ? err.message : "Failed to load businesses");
+      }
     } finally {
       setLoading(false);
     }
@@ -155,11 +166,36 @@ export function BusinessManagementPanel() {
     }
   }
 
+  if (migrationMissing) {
+    return (
+      <section>
+        <h2 className="text-lg font-semibold text-zinc-900">Manage businesses</h2>
+        <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <p className="font-medium">Adding/editing businesses from this page isn&apos;t set up yet.</p>
+          <p className="mt-1">
+            The <code className="rounded bg-amber-100 px-1 py-0.5">whatsapp_businesses</code> table
+            doesn&apos;t exist in Supabase yet — someone needs to run{" "}
+            <code className="rounded bg-amber-100 px-1 py-0.5">
+              supabase/migrations/20260623000300_business_management.sql
+            </code>{" "}
+            in the Supabase SQL editor first.
+          </p>
+          <p className="mt-2 font-medium">What works right now, below:</p>
+          <ul className="mt-1 list-inside list-disc">
+            <li>Viewing the status of the 5 existing WhatsApp sessions</li>
+            <li>Viewing/scanning QR codes for sessions awaiting a scan</li>
+            <li>Restarting an existing session</li>
+          </ul>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section>
       <div className="flex items-center justify-between gap-2">
         <div>
-          <h1 className="text-lg font-semibold text-zinc-900">Manage businesses</h1>
+          <h2 className="text-lg font-semibold text-zinc-900">Manage businesses</h2>
           <p className="mt-1 text-sm text-zinc-500">
             Adds/edits go straight to Supabase. Backend reload/start happen automatically when you
             add a business, but only work once the backend supports them.

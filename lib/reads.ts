@@ -1,4 +1,5 @@
 import { supabase } from "@/lib/supabaseClient";
+import { logAndDescribeError } from "@/lib/errors";
 
 // Mirrors conversation_reads + its two RPCs from
 // supabase/migrations/20260623000100_unread_counts.sql. Read state lives in
@@ -18,7 +19,9 @@ interface UnreadCountRow {
 
 export async function fetchUnreadCounts(): Promise<UnreadCount[]> {
   const { data, error } = await supabase.rpc("conversation_unread_counts");
-  if (error) throw error;
+  if (error) {
+    throw new Error(logAndDescribeError("fetchUnreadCounts", error));
+  }
   return ((data ?? []) as UnreadCountRow[]).map((row) => ({
     businessSlug: row.business_slug,
     chatId: row.chat_id,
@@ -36,7 +39,11 @@ export async function markConversationRead(
     p_chat_id: chatId,
     p_last_read_at: lastReadAt,
   });
-  if (error) throw error;
+  if (error) {
+    throw new Error(
+      logAndDescribeError(`markConversationRead(${businessSlug}, ${chatId})`, error)
+    );
+  }
 }
 
 export function sumUnreadByBusiness(counts: UnreadCount[]): Record<string, number> {

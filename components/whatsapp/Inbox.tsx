@@ -14,7 +14,7 @@ import {
   WhatsappMessage,
   WhatsappSession,
 } from "@/lib/whatsapp";
-import { fetchActiveBusinesses, WhatsappBusinessRow } from "@/lib/businesses";
+import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
 import {
   fetchUnreadCounts,
   markConversationRead,
@@ -22,6 +22,7 @@ import {
   unreadByChatId,
   UnreadCount,
 } from "@/lib/reads";
+import { logAndDescribeError } from "@/lib/errors";
 import { Sidebar } from "@/components/whatsapp/Sidebar";
 import { ConversationList } from "@/components/whatsapp/ConversationList";
 import { MessageThread } from "@/components/whatsapp/MessageThread";
@@ -29,11 +30,38 @@ import { CustomerPanel } from "@/components/customers/CustomerPanel";
 import { CustomerSearch } from "@/components/customers/CustomerSearch";
 
 const POLL_INTERVAL_MS = 5000;
+const SELECTED_BUSINESS_STORAGE_KEY = "devaux:selectedBusinessSlug";
+
+function readPersistedBusinessSlug(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(SELECTED_BUSINESS_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistBusinessSlug(slug: string | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (slug) {
+      window.localStorage.setItem(SELECTED_BUSINESS_STORAGE_KEY, slug);
+    } else {
+      window.localStorage.removeItem(SELECTED_BUSINESS_STORAGE_KEY);
+    }
+  } catch {
+    // localStorage can throw in some private-browsing modes — non-fatal, just skip persistence.
+  }
+}
 
 export function Inbox() {
   const [businesses, setBusinesses] = useState<WhatsappBusinessRow[]>([]);
   const [sessions, setSessions] = useState<WhatsappSession[]>([]);
-  const [selectedBusinessSlug, setSelectedBusinessSlug] = useState<string | null>(null);
+  // Seeded from localStorage so a manually selected business survives a
+  // refresh instead of always re-deriving from "first connected session".
+  const [selectedBusinessSlug, setSelectedBusinessSlug] = useState<string | null>(
+    readPersistedBusinessSlug
+  );
   const [messages, setMessages] = useState<WhatsappMessage[]>([]);
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -42,23 +70,29 @@ export function Inbox() {
   const [showCustomerSearch, setShowCustomerSearch] = useState(false);
   const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
   const pendingChatIdRef = useRef<string | null>(null);
+  // Auto-select-first-connected is only allowed to run once per session,
+  // regardless of how many times `sessions` re-polls — otherwise a stale
+  // closure or transient empty state could yank the user back to whichever
+  // business happens to be connected, even after they deliberately picked
+  // a different one.
+  const hasAutoSelectedRef = useRef(false);
 
   const loadUnreadCounts = useCallback(async () => {
     try {
       setUnreadCounts(await fetchUnreadCounts());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load unread counts");
+      // Non-critical: badges just stay at their last known value. Logged in
+      // full so the real cause (e.g. a migration that hasn't been run yet)
+      // is visible in the console without interrupting the whole inbox with
+      // a banner every 5 seconds.
+      logAndDescribeError("loadUnreadCounts", err);
     }
   }, []);
 
   const loadBusinesses = useCallback(async () => {
-    try {
-      const rows = await fetchActiveBusinesses();
-      setBusinesses(rows);
-      setBusinessDirectory(rows);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load businesses");
-    }
+    const { businesses: rows } = await fetchActiveBusinessesOrFallback();
+    setBusinesses(rows);
+    setBusinessDirectory(rows);
   }, []);
 
   const loadSessions = useCallback(async () => {
@@ -67,7 +101,7 @@ export function Inbox() {
       .select("business_slug, status, updated_at, last_connected_at")
       .order("business_slug", { ascending: true });
     if (fetchError) {
-      setError(fetchError.message);
+      setError(logAndDescribeError("loadSessions", fetchError));
       return;
     }
     setSessions(data ?? []);
@@ -83,10 +117,9 @@ export function Inbox() {
       .order("timestamp", { ascending: true })
       .limit(500);
     if (fetchError) {
-      setError(fetchError.message);
+      setError(logAndDescribeError("loadMessages", fetchError));
       return;
     }
-    console.log("Loaded messages", businessSlug, data);
     setMessages(data ?? []);
   }, []);
 
@@ -108,15 +141,34 @@ export function Inbox() {
     return () => clearInterval(interval);
   }, [loadUnreadCounts]);
 
+  // If a business was restored from localStorage but no longer exists in the
+  // active business list (deactivated, or it was a stale value from a
+  // different browser profile), drop it so the normal auto-select effect
+  // below can take over instead of silently showing an empty conversation list.
   useEffect(() => {
+    if (!selectedBusinessSlug || businesses.length === 0) return;
+    const stillActive = businesses.some((b) => b.business_slug === selectedBusinessSlug);
+    if (!stillActive) {
+      setSelectedBusinessSlug(null);
+      persistBusinessSlug(null);
+    }
+  }, [businesses, selectedBusinessSlug]);
+
+  // Auto-select the first connected business, but only as a one-time initial
+  // default — never overrides a business the user (or localStorage) already
+  // selected, and never re-fires after it has run once.
+  useEffect(() => {
+    if (hasAutoSelectedRef.current) return;
     if (selectedBusinessSlug || sessions.length === 0) return;
     const firstConnected = sessions.find((s) => isSessionConnected(s.status));
     if (firstConnected) {
+      hasAutoSelectedRef.current = true;
       setSelectedBusinessSlug(firstConnected.business_slug);
     }
   }, [sessions, selectedBusinessSlug]);
 
   useEffect(() => {
+    persistBusinessSlug(selectedBusinessSlug);
     if (pendingChatIdRef.current) {
       setSelectedChatId(pendingChatIdRef.current);
       pendingChatIdRef.current = null;
@@ -138,11 +190,7 @@ export function Inbox() {
   }, [selectedBusinessSlug, loadMessages]);
 
   const conversations = useMemo(() => {
-    const grouped = groupConversations(filterCustomerMessages(messages)).filter(
-      isRealCustomerConversation
-    );
-    console.log("Grouped conversations", grouped);
-    return grouped;
+    return groupConversations(filterCustomerMessages(messages)).filter(isRealCustomerConversation);
   }, [messages]);
   const filteredConversations = useMemo(
     () => conversations.filter((c) => matchesSearch(c, search)),
@@ -154,23 +202,30 @@ export function Inbox() {
   );
 
   // Mark the open conversation read whenever it's selected, and again any
-  // time its last message changes (e.g. a new inbound message arrives while
-  // it's still the active chat). Read state lives server-side in
-  // conversation_reads (see lib/reads.ts), so this syncs across devices.
+  // time its last message actually changes (e.g. a new inbound message
+  // arrives while it's still the active chat). Depending on the chat id +
+  // timestamp (not the whole `selectedConversation` object) matters: that
+  // object is rebuilt from scratch on every 5s message poll even when
+  // nothing changed, which was causing this to re-fire — and re-call the
+  // mark-read RPC — every 5 seconds instead of only when something real changed.
+  const lastMessageTimestamp = selectedConversation?.lastMessage.timestamp ?? null;
   useEffect(() => {
-    if (!selectedBusinessSlug || !selectedConversation) return;
+    if (!selectedBusinessSlug || !selectedConversation || !lastMessageTimestamp) return;
     const businessSlug = selectedBusinessSlug;
     const chatId = selectedConversation.chatId;
-    const lastReadAt = selectedConversation.lastMessage.timestamp;
+    const lastReadAt = lastMessageTimestamp;
 
     // Optimistic: clear the badge immediately rather than waiting on the
     // next 5s poll.
     setUnreadCounts((prev) => prev.filter((c) => !(c.businessSlug === businessSlug && c.chatId === chatId)));
 
     markConversationRead(businessSlug, chatId, lastReadAt).catch((err) => {
-      setError(err instanceof Error ? err.message : "Failed to mark conversation read");
+      // Non-critical for the same reason as loadUnreadCounts above: don't
+      // interrupt the conversation with a banner over a read-receipt failure.
+      logAndDescribeError("markConversationRead", err);
     });
-  }, [selectedBusinessSlug, selectedConversation]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedBusinessSlug, selectedConversation?.chatId, lastMessageTimestamp]);
 
   const businessUnreadCounts = useMemo(() => sumUnreadByBusiness(unreadCounts), [unreadCounts]);
   const chatUnreadCounts = useMemo(
@@ -188,6 +243,11 @@ export function Inbox() {
     ? resolveRecipientNumber(selectedConversation.contactNumber, selectedConversation.chatId)
     : null;
 
+  function selectBusiness(slug: string) {
+    hasAutoSelectedRef.current = true;
+    setSelectedBusinessSlug(slug);
+  }
+
   function jumpToConversation(businessSlug: string, chatId: string) {
     setShowCustomerSearch(false);
     if (businessSlug === selectedBusinessSlug) {
@@ -195,7 +255,7 @@ export function Inbox() {
       return;
     }
     pendingChatIdRef.current = chatId;
-    setSelectedBusinessSlug(businessSlug);
+    selectBusiness(businessSlug);
   }
 
   async function handleSend(text: string) {
@@ -231,7 +291,7 @@ export function Inbox() {
         businesses={businesses}
         sessions={sessions}
         selectedBusinessSlug={selectedBusinessSlug}
-        onSelect={setSelectedBusinessSlug}
+        onSelect={selectBusiness}
         onOpenCustomerSearch={() => setShowCustomerSearch(true)}
         unreadCounts={businessUnreadCounts}
         visible={mobilePane === "sidebar"}

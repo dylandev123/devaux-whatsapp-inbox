@@ -33,7 +33,7 @@ export function ReplyBox({ disabled, onSend, accentClassName = "bg-emerald-600" 
         e.preventDefault();
         submit();
       }}
-      className="border-t border-zinc-200 bg-white p-3"
+      className="border-t border-zinc-200 bg-white p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
     >
       {error && <p className="mb-2 text-xs text-red-600">{error}</p>}
       <div className="flex items-end gap-2">

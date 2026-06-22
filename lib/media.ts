@@ -39,7 +39,7 @@ function getExtension(url: string): string {
 }
 
 /** Returns null when the message carries no media at all. */
-export function classifyMedia(message: WhatsappMessage): MediaKind | null {
+export function classifyMedia(message: Pick<WhatsappMessage, "media_url" | "message_type">): MediaKind | null {
   if (!message.media_url) return null;
 
   const type = (message.message_type ?? "").toLowerCase();
@@ -59,20 +59,20 @@ export function classifyMedia(message: WhatsappMessage): MediaKind | null {
   return "unknown";
 }
 
-export function isVoiceNote(message: WhatsappMessage): boolean {
+export function isVoiceNote(message: Pick<WhatsappMessage, "message_type">): boolean {
   const type = (message.message_type ?? "").toLowerCase();
   return type === "ptt" || type === "voice" || type === "voice_note";
 }
 
 /** Short label for previews (conversation list, notifications) where there's no room for a full attachment card. */
-export function mediaPreviewLabel(message: WhatsappMessage, kind: MediaKind): string {
+export function mediaPreviewLabel(message: Pick<WhatsappMessage, "message_type">, kind: MediaKind): string {
   switch (kind) {
     case "image":
-      return "📷 Photo";
+      return "📷 Image";
     case "video":
       return "🎥 Video";
     case "audio":
-      return isVoiceNote(message) ? "🎤 Voice message" : "🎧 Audio message";
+      return isVoiceNote(message) ? "🎤 Voice Note" : "🎧 Audio message";
     case "document":
       return "📄 Document";
     default:

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { getFileName, isVoiceNote, MediaKind } from "@/lib/media";
 import { WhatsappMessage } from "@/lib/whatsapp";
 
@@ -9,6 +9,47 @@ interface MediaAttachmentProps {
   kind: MediaKind;
   /** Whether the surrounding bubble is the solid (outbound) colour, for contrast. */
   outbound: boolean;
+}
+
+function ImageLightbox({ url, alt, onClose }: { url: string; alt: string; onClose: () => void }) {
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
+      onClick={onClose}
+    >
+      <button
+        type="button"
+        onClick={onClose}
+        className="absolute right-3 top-3 cursor-pointer rounded-full bg-white/10 px-3 py-2 text-sm font-medium text-white hover:bg-white/20"
+      >
+        Close
+      </button>
+      {/* eslint-disable-next-line @next/next/no-img-element -- remote, arbitrary-host bridge URLs */}
+      <img
+        src={url}
+        alt={alt}
+        onClick={(e) => e.stopPropagation()}
+        className="max-h-full max-w-full rounded-lg object-contain"
+      />
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        className="absolute bottom-3 right-3 cursor-pointer rounded-md bg-white/10 px-3 py-2 text-xs font-medium text-white hover:bg-white/20"
+      >
+        Open original ↗
+      </a>
+    </div>
+  );
 }
 
 function BrokenMedia({ url, label, outbound }: { url: string; label: string; outbound: boolean }) {
@@ -62,7 +103,7 @@ function AttachmentCard({
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className={`flex-shrink-0 rounded-md px-2.5 py-1 text-xs font-medium ${
+        className={`flex-shrink-0 rounded-md px-3 py-2 text-xs font-medium ${
           outbound ? "bg-white/20 text-white hover:bg-white/30" : "bg-zinc-200 text-zinc-700 hover:bg-zinc-300"
         }`}
       >
@@ -74,6 +115,7 @@ function AttachmentCard({
 
 export function MediaAttachment({ message, kind, outbound }: MediaAttachmentProps) {
   const [broken, setBroken] = useState(false);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
   const url = message.media_url;
   if (!url) return null;
 
@@ -84,22 +126,36 @@ export function MediaAttachment({ message, kind, outbound }: MediaAttachmentProp
         : kind === "video"
         ? "Video"
         : kind === "audio"
-        ? isVoiceNote(message) ? "Voice message" : "Audio message"
+        ? isVoiceNote(message) ? "Voice Note" : "Audio message"
         : "Attachment";
     return <BrokenMedia url={url} label={label} outbound={outbound} />;
   }
 
   if (kind === "image") {
     return (
-      <a href={url} target="_blank" rel="noopener noreferrer" className="block">
-        {/* eslint-disable-next-line @next/next/no-img-element -- remote, arbitrary-host bridge URLs */}
-        <img
-          src={url}
-          alt={message.message_body || "Image attachment"}
-          onError={() => setBroken(true)}
-          className="max-h-72 w-auto max-w-full rounded-lg bg-zinc-100 object-contain"
-        />
-      </a>
+      <>
+        <button
+          type="button"
+          onClick={() => setLightboxOpen(true)}
+          className="block max-w-full cursor-zoom-in"
+          aria-label="Open full size image"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element -- remote, arbitrary-host bridge URLs */}
+          <img
+            src={url}
+            alt={message.message_body || "Image attachment"}
+            onError={() => setBroken(true)}
+            className="max-h-72 w-auto max-w-full rounded-lg bg-zinc-100 object-contain"
+          />
+        </button>
+        {lightboxOpen && (
+          <ImageLightbox
+            url={url}
+            alt={message.message_body || "Image attachment"}
+            onClose={() => setLightboxOpen(false)}
+          />
+        )}
+      </>
     );
   }
 
@@ -130,7 +186,7 @@ export function MediaAttachment({ message, kind, outbound }: MediaAttachmentProp
   }
 
   if (kind === "audio") {
-    const label = isVoiceNote(message) ? "🎤 Voice message" : "🎧 Audio message";
+    const label = isVoiceNote(message) ? "🎤 Voice Note" : "🎧 Audio message";
     return (
       <div className="flex flex-col gap-1.5">
         <p className={`text-xs font-medium ${outbound ? "text-white/80" : "text-zinc-500"}`}>

@@ -37,7 +37,7 @@ export function Sidebar({
         <button
           type="button"
           onClick={() => supabase.auth.signOut()}
-          className="cursor-pointer text-xs font-medium text-zinc-400 hover:text-zinc-900"
+          className="-mr-1 cursor-pointer rounded-md px-2 py-2 text-xs font-medium text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900"
         >
           Log out
         </button>
