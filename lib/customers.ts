@@ -1,5 +1,7 @@
 import { supabase } from "@/lib/supabaseClient";
 import { logAndDescribeError } from "@/lib/errors";
+import { searchBookingCustomerIds } from "@/lib/bookings";
+import { ContactNameInfo } from "@/lib/contactName";
 
 // Mirrors the `customers` table created in
 // supabase/migrations/20260622000000_customers.sql plus the `stage` column
@@ -86,6 +88,65 @@ export async function fetchCustomerByPhone(phoneNumber: string): Promise<Custome
     throw new Error(logAndDescribeError("fetchCustomerByPhone", error));
   }
   return data;
+}
+
+// Lightweight name-only lookup, polled into the inbox so the conversation
+// list and message header can apply the same first/last → whatsapp_name →
+// phone_number → "Unknown Contact" fallback chain as the customer profile
+// (see lib/contactName.ts), instead of only ever showing the raw WhatsApp
+// push name captured on the message itself.
+export async function fetchContactDirectory(): Promise<Map<string, ContactNameInfo>> {
+  const { data, error } = await supabase
+    .from("customers")
+    .select("phone_number, first_name, last_name, whatsapp_name");
+  if (error) {
+    throw new Error(logAndDescribeError("fetchContactDirectory", error));
+  }
+  const directory = new Map<string, ContactNameInfo>();
+  for (const row of data ?? []) {
+    directory.set(row.phone_number, {
+      firstName: row.first_name,
+      lastName: row.last_name,
+      whatsappName: row.whatsapp_name,
+      phoneNumber: row.phone_number,
+    });
+  }
+  return directory;
+}
+
+// For the /contacts page. Client-side aggregation, same tradeoff noted on
+// fetchCustomerBusinessStats below — fine at current scale, swap for a view
+// or RPC if the customer list grows large enough to matter.
+export async function fetchAllCustomers(): Promise<Customer[]> {
+  const { data, error } = await supabase
+    .from("customers")
+    .select(CUSTOMER_COLUMNS)
+    .order("last_message_at", { ascending: false, nullsFirst: false });
+  if (error) {
+    throw new Error(logAndDescribeError("fetchAllCustomers", error));
+  }
+  return data ?? [];
+}
+
+// Businesses each phone number has messaged, for every customer at once —
+// used by the /contacts page instead of calling fetchCustomerBusinessStats
+// once per row.
+export async function fetchBusinessesContactedByPhone(): Promise<Map<string, string[]>> {
+  const { data, error } = await supabase.from("whatsapp_messages").select("business_slug, contact_number");
+  if (error) {
+    throw new Error(logAndDescribeError("fetchBusinessesContactedByPhone", error));
+  }
+  const sets = new Map<string, Set<string>>();
+  for (const row of data ?? []) {
+    if (!row.contact_number) continue;
+    if (!sets.has(row.contact_number)) sets.set(row.contact_number, new Set());
+    sets.get(row.contact_number)!.add(row.business_slug);
+  }
+  const result = new Map<string, string[]>();
+  for (const [phone, set] of sets) {
+    result.set(phone, Array.from(set));
+  }
+  return result;
 }
 
 export async function updateCustomer(
@@ -175,7 +236,9 @@ export interface CustomerSearchResult extends Customer {
 }
 
 // Searches the customers table across all businesses by name/phone/email,
-// plus a separate exact-tag pass (PostgREST can't ILIKE inside an array).
+// plus a separate exact-tag pass (PostgREST can't ILIKE inside an array),
+// plus any customer whose booking reference or hotel name matches (see
+// supabase/migrations/20260623000600_customer_bookings.sql).
 export async function searchCustomers(query: string): Promise<CustomerSearchResult[]> {
   const q = query.trim();
   if (!q) return [];
@@ -183,7 +246,7 @@ export async function searchCustomers(query: string): Promise<CustomerSearchResu
   // or-filter grammar (e.g. searching "Smith, John").
   const like = `"%${q.replace(/"/g, '\\"')}%"`;
 
-  const [byFields, byTag] = await Promise.all([
+  const [byFields, byTag, bookingCustomerIds] = await Promise.all([
     supabase
       .from("customers")
       .select(CUSTOMER_COLUMNS)
@@ -192,6 +255,7 @@ export async function searchCustomers(query: string): Promise<CustomerSearchResu
       )
       .limit(25),
     supabase.from("customers").select(CUSTOMER_COLUMNS).contains("tags", [q]).limit(25),
+    searchBookingCustomerIds(q),
   ]);
 
   if (byFields.error) {
@@ -204,6 +268,20 @@ export async function searchCustomers(query: string): Promise<CustomerSearchResu
   const merged = new Map<string, Customer>();
   for (const row of [...(byFields.data ?? []), ...(byTag.data ?? [])]) {
     merged.set(row.id, row);
+  }
+
+  const missingBookingCustomerIds = bookingCustomerIds.filter((id) => !merged.has(id));
+  if (missingBookingCustomerIds.length > 0) {
+    const { data: bookingCustomers, error: bookingCustomersError } = await supabase
+      .from("customers")
+      .select(CUSTOMER_COLUMNS)
+      .in("id", missingBookingCustomerIds);
+    if (bookingCustomersError) {
+      throw new Error(logAndDescribeError("searchCustomers(bookingCustomers)", bookingCustomersError));
+    }
+    for (const row of bookingCustomers ?? []) {
+      merged.set(row.id, row);
+    }
   }
 
   const customers = Array.from(merged.values());

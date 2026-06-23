@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { WhatsappBusinessRow } from "@/lib/businesses";
 import { businessColor, businessLabel, isSessionConnected, WhatsappSession } from "@/lib/whatsapp";
@@ -42,7 +43,7 @@ export function Sidebar({
           Log out
         </button>
       </div>
-      <div className="px-3 pt-3">
+      <div className="flex flex-col gap-2 px-3 pt-3">
         <button
           type="button"
           onClick={onOpenCustomerSearch}
@@ -50,6 +51,12 @@ export function Sidebar({
         >
           Search customers…
         </button>
+        <Link
+          href="/contacts"
+          className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-left text-sm text-zinc-500 hover:border-zinc-300 hover:text-zinc-700"
+        >
+          Contacts
+        </Link>
       </div>
       <nav className="flex-1 overflow-y-auto py-2">
         {businesses.map((business) => {

@@ -1,6 +1,8 @@
 "use client";
 
-import { businessColor, businessLabel, Conversation } from "@/lib/whatsapp";
+import { businessColor, businessLabel, Conversation, resolveRecipientNumber } from "@/lib/whatsapp";
+import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
+import { CONVERSATION_STATUSES, ConversationStatusValue } from "@/lib/conversationStatus";
 import { MessageBubble } from "./MessageBubble";
 import { ReplyBox } from "./ReplyBox";
 
@@ -12,6 +14,9 @@ interface MessageThreadProps {
   onToggleProfile: () => void;
   showProfile: boolean;
   visible: boolean;
+  contactDirectory: Map<string, ContactNameInfo>;
+  status: ConversationStatusValue;
+  onStatusChange: (status: ConversationStatusValue) => void;
 }
 
 function initial(label: string): string {
@@ -26,11 +31,21 @@ export function MessageThread({
   onToggleProfile,
   showProfile,
   visible,
+  contactDirectory,
+  status,
+  onStatusChange,
 }: MessageThreadProps) {
   const color = businessColor(businessSlug ?? "");
   const businessName = businessSlug ? businessLabel(businessSlug) : null;
+  const phoneNumber = conversation
+    ? resolveRecipientNumber(conversation.contactNumber, conversation.chatId)
+    : null;
   const displayName = conversation
-    ? conversation.contactName || conversation.contactNumber || conversation.chatId
+    ? resolveContactName({
+        ...contactDirectory.get(phoneNumber ?? ""),
+        whatsappName: contactDirectory.get(phoneNumber ?? "")?.whatsappName ?? conversation.contactName,
+        phoneNumber,
+      })
     : "Select a conversation";
 
   return (
@@ -61,6 +76,20 @@ export function MessageThread({
             <p className="truncate text-xs text-zinc-500">{conversation.contactNumber}</p>
           )}
         </div>
+        {conversation && (
+          <select
+            value={status}
+            onChange={(e) => onStatusChange(e.target.value as ConversationStatusValue)}
+            aria-label="Conversation status"
+            className="flex-shrink-0 rounded-md border border-zinc-200 bg-white px-2 py-2 text-xs text-zinc-600 outline-none focus:border-emerald-500"
+          >
+            {CONVERSATION_STATUSES.map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
+        )}
         {conversation && (
           <button
             type="button"

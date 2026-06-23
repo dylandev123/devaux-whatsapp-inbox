@@ -15,6 +15,13 @@ import {
   WhatsappSession,
 } from "@/lib/whatsapp";
 import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
+import { fetchContactDirectory } from "@/lib/customers";
+import { ContactNameInfo } from "@/lib/contactName";
+import {
+  ConversationStatusValue,
+  fetchConversationStatuses,
+  setConversationStatus,
+} from "@/lib/conversationStatus";
 import {
   fetchUnreadCounts,
   markConversationRead,
@@ -69,6 +76,11 @@ export function Inbox() {
   const [showProfile, setShowProfile] = useState(false);
   const [showCustomerSearch, setShowCustomerSearch] = useState(false);
   const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
+  const [contactDirectory, setContactDirectory] = useState<Map<string, ContactNameInfo>>(new Map());
+  const [conversationStatuses, setConversationStatuses] = useState<Map<string, ConversationStatusValue>>(
+    new Map()
+  );
+  const [statusFilter, setStatusFilter] = useState<ConversationStatusValue | "All">("Active");
   const pendingChatIdRef = useRef<string | null>(null);
   // Auto-select-first-connected is only allowed to run once per session,
   // regardless of how many times `sessions` re-polls — otherwise a stale
@@ -93,6 +105,26 @@ export function Inbox() {
     const { businesses: rows } = await fetchActiveBusinessesOrFallback();
     setBusinesses(rows);
     setBusinessDirectory(rows);
+  }, []);
+
+  const loadContactDirectory = useCallback(async () => {
+    try {
+      setContactDirectory(await fetchContactDirectory());
+    } catch (err) {
+      // Non-critical: names just fall back to the raw WhatsApp push name
+      // captured on the message itself.
+      logAndDescribeError("loadContactDirectory", err);
+    }
+  }, []);
+
+  const loadConversationStatuses = useCallback(async (businessSlug: string) => {
+    try {
+      setConversationStatuses(await fetchConversationStatuses(businessSlug));
+    } catch (err) {
+      // Non-critical: if conversation_status hasn't been migrated yet,
+      // every conversation just behaves as "Active" (the default anyway).
+      logAndDescribeError("loadConversationStatuses", err);
+    }
   }, []);
 
   const loadSessions = useCallback(async () => {
@@ -140,6 +172,22 @@ export function Inbox() {
     const interval = setInterval(loadUnreadCounts, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [loadUnreadCounts]);
+
+  useEffect(() => {
+    loadContactDirectory();
+    const interval = setInterval(loadContactDirectory, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [loadContactDirectory]);
+
+  useEffect(() => {
+    if (!selectedBusinessSlug) {
+      setConversationStatuses(new Map());
+      return;
+    }
+    loadConversationStatuses(selectedBusinessSlug);
+    const interval = setInterval(() => loadConversationStatuses(selectedBusinessSlug), POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [selectedBusinessSlug, loadConversationStatuses]);
 
   // If a business was restored from localStorage but no longer exists in the
   // active business list (deactivated, or it was a stale value from a
@@ -193,8 +241,15 @@ export function Inbox() {
     return groupConversations(filterCustomerMessages(messages)).filter(isRealCustomerConversation);
   }, [messages]);
   const filteredConversations = useMemo(
-    () => conversations.filter((c) => matchesSearch(c, search)),
-    [conversations, search]
+    () =>
+      conversations
+        .filter((c) => matchesSearch(c, search))
+        .filter((c) => {
+          if (statusFilter === "All") return true;
+          const status = conversationStatuses.get(c.chatId) ?? "Active";
+          return status === statusFilter;
+        }),
+    [conversations, search, statusFilter, conversationStatuses]
   );
   const selectedConversation = useMemo(
     () => conversations.find((c) => c.chatId === selectedChatId) ?? null,
@@ -246,6 +301,22 @@ export function Inbox() {
   function selectBusiness(slug: string) {
     hasAutoSelectedRef.current = true;
     setSelectedBusinessSlug(slug);
+  }
+
+  async function handleStatusChange(chatId: string, status: ConversationStatusValue) {
+    if (!selectedBusinessSlug) return;
+    // Optimistic: update locally first so the row/header reflect the change
+    // immediately rather than waiting on the next 5s poll.
+    setConversationStatuses((prev) => new Map(prev).set(chatId, status));
+    if (status !== "Active" && statusFilter !== "All" && statusFilter !== status && chatId === selectedChatId) {
+      setSelectedChatId(null);
+    }
+    try {
+      await setConversationStatus(selectedBusinessSlug, chatId, status);
+    } catch (err) {
+      setError(logAndDescribeError("handleStatusChange", err));
+      loadConversationStatuses(selectedBusinessSlug);
+    }
   }
 
   function jumpToConversation(businessSlug: string, chatId: string) {
@@ -308,6 +379,10 @@ export function Inbox() {
         visible={mobilePane === "list"}
         hasBusiness={Boolean(selectedBusinessSlug)}
         unreadCounts={chatUnreadCounts}
+        contactDirectory={contactDirectory}
+        statusByChatId={conversationStatuses}
+        statusFilter={statusFilter}
+        onStatusFilterChange={setStatusFilter}
       />
       <MessageThread
         conversation={selectedConversation}
@@ -317,9 +392,16 @@ export function Inbox() {
         onToggleProfile={() => setShowProfile((v) => !v)}
         showProfile={showProfile}
         visible={mobilePane === "thread"}
+        contactDirectory={contactDirectory}
+        status={selectedChatId ? conversationStatuses.get(selectedChatId) ?? "Active" : "Active"}
+        onStatusChange={(status) => selectedChatId && handleStatusChange(selectedChatId, status)}
       />
       {showProfile && customerPhoneNumber && (
-        <CustomerPanel phoneNumber={customerPhoneNumber} onClose={() => setShowProfile(false)} />
+        <CustomerPanel
+          phoneNumber={customerPhoneNumber}
+          businessSlug={selectedBusinessSlug}
+          onClose={() => setShowProfile(false)}
+        />
       )}
       {showCustomerSearch && (
         <CustomerSearch

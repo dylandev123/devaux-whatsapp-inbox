@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { CustomerSearchResult, searchCustomers } from "@/lib/customers";
 import { businessColor, businessLabel } from "@/lib/whatsapp";
+import { resolveContactName } from "@/lib/contactName";
 
 interface CustomerSearchProps {
   onClose: () => void;
@@ -83,7 +84,12 @@ export function CustomerSearch({ onClose, onSelectConversation }: CustomerSearch
               >
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium text-zinc-900">
-                    {customer.whatsapp_name || customer.first_name || customer.phone_number}
+                    {resolveContactName({
+                      firstName: customer.first_name,
+                      lastName: customer.last_name,
+                      whatsappName: customer.whatsapp_name,
+                      phoneNumber: customer.phone_number,
+                    })}
                   </p>
                   <p className="truncate text-xs text-zinc-500">{customer.phone_number}</p>
                 </div>
