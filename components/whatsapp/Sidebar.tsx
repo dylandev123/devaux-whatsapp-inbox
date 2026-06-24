@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { supabase } from "@/lib/supabaseClient";
 import { WhatsappBusinessRow } from "@/lib/businesses";
 import { businessColor, businessLabel, isSessionConnected, WhatsappSession } from "@/lib/whatsapp";
+import { ProfileMenu } from "@/components/auth/ProfileMenu";
 
 interface SidebarProps {
   businesses: WhatsappBusinessRow[];
@@ -35,13 +35,7 @@ export function Sidebar({
           <h1 className="text-base font-semibold tracking-tight text-zinc-900">Devaux Communications</h1>
           <p className="text-xs text-zinc-500">WhatsApp inbox</p>
         </div>
-        <button
-          type="button"
-          onClick={() => supabase.auth.signOut()}
-          className="-mr-1 cursor-pointer rounded-md px-2 py-2 text-xs font-medium text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900"
-        >
-          Log out
-        </button>
+        <ProfileMenu />
       </div>
       <div className="flex flex-col gap-2 px-3 pt-3">
         <button

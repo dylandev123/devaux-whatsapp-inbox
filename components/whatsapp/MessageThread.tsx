@@ -2,6 +2,7 @@
 
 import { businessColor, businessLabel, Conversation, resolveRecipientNumber } from "@/lib/whatsapp";
 import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
+import { telHref } from "@/lib/phone";
 import { CONVERSATION_STATUSES, ConversationStatusValue } from "@/lib/conversationStatus";
 import { MessageBubble } from "./MessageBubble";
 import { ReplyBox } from "./ReplyBox";
@@ -40,10 +41,12 @@ export function MessageThread({
   const phoneNumber = conversation
     ? resolveRecipientNumber(conversation.contactNumber, conversation.chatId)
     : null;
+  const directoryEntry = contactDirectory.get(phoneNumber ?? "");
   const displayName = conversation
     ? resolveContactName({
-        ...contactDirectory.get(phoneNumber ?? ""),
-        whatsappName: contactDirectory.get(phoneNumber ?? "")?.whatsappName ?? conversation.contactName,
+        ...directoryEntry,
+        businessContactName: directoryEntry?.businessContactName ?? conversation.businessContactName,
+        whatsappName: directoryEntry?.whatsappName ?? conversation.contactName,
         phoneNumber,
       })
     : "Select a conversation";
@@ -73,7 +76,12 @@ export function MessageThread({
           )}
           <h2 className="truncate text-sm font-semibold text-zinc-900">{displayName}</h2>
           {conversation?.contactNumber && (
-            <p className="truncate text-xs text-zinc-500">{conversation.contactNumber}</p>
+            <a
+              href={telHref(conversation.contactNumber)}
+              className="truncate text-xs text-zinc-500 hover:text-emerald-600 hover:underline"
+            >
+              {conversation.contactNumber}
+            </a>
           )}
         </div>
         {conversation && (

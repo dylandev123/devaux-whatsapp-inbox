@@ -143,7 +143,7 @@ export function Inbox() {
     const { data, error: fetchError } = await supabase
       .from("whatsapp_messages")
       .select(
-        "id, business_slug, chat_id, contact_name, contact_number, direction, message_body, message_type, media_url, created_at, timestamp"
+        "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp"
       )
       .eq("business_slug", businessSlug)
       .order("timestamp", { ascending: true })

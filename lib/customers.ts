@@ -13,6 +13,7 @@ export interface Customer {
   id: string;
   phone_number: string;
   whatsapp_name: string | null;
+  business_contact_name: string | null;
   first_name: string | null;
   last_name: string | null;
   email: string | null;
@@ -76,7 +77,7 @@ export interface CustomerTimelineMessage {
 }
 
 const CUSTOMER_COLUMNS =
-  "id, phone_number, whatsapp_name, first_name, last_name, email, notes, tags, stage, created_at, updated_at, last_message_at, source_business";
+  "id, phone_number, whatsapp_name, business_contact_name, first_name, last_name, email, notes, tags, stage, created_at, updated_at, last_message_at, source_business";
 
 export async function fetchCustomerByPhone(phoneNumber: string): Promise<Customer | null> {
   const { data, error } = await supabase
@@ -98,13 +99,14 @@ export async function fetchCustomerByPhone(phoneNumber: string): Promise<Custome
 export async function fetchContactDirectory(): Promise<Map<string, ContactNameInfo>> {
   const { data, error } = await supabase
     .from("customers")
-    .select("phone_number, first_name, last_name, whatsapp_name");
+    .select("phone_number, first_name, last_name, whatsapp_name, business_contact_name");
   if (error) {
     throw new Error(logAndDescribeError("fetchContactDirectory", error));
   }
   const directory = new Map<string, ContactNameInfo>();
   for (const row of data ?? []) {
     directory.set(row.phone_number, {
+      businessContactName: row.business_contact_name,
       firstName: row.first_name,
       lastName: row.last_name,
       whatsappName: row.whatsapp_name,

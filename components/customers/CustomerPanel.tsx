@@ -24,6 +24,7 @@ import {
 import { businessColor, businessLabel, isOutbound } from "@/lib/whatsapp";
 import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
 import { resolveContactName } from "@/lib/contactName";
+import { telHref } from "@/lib/phone";
 import { CreateBookingModal } from "./CreateBookingModal";
 
 interface CustomerPanelProps {
@@ -238,6 +239,7 @@ export function CustomerPanel({ phoneNumber, businessSlug, onClose }: CustomerPa
   }
 
   const displayName = resolveContactName({
+    businessContactName: customer?.business_contact_name,
     firstName: form.first_name,
     lastName: form.last_name,
     whatsappName: customer?.whatsapp_name,
@@ -310,7 +312,10 @@ export function CustomerPanel({ phoneNumber, businessSlug, onClose }: CustomerPa
                 <p className="text-sm text-zinc-500">WhatsApp name: {customer.whatsapp_name}</p>
               )}
               <p className="text-sm text-zinc-500">
-                Phone: <span className="text-zinc-700">{customer.phone_number}</span>
+                Phone:{" "}
+                <a href={telHref(customer.phone_number)} className="text-zinc-700 hover:text-emerald-600 hover:underline">
+                  {customer.phone_number}
+                </a>
               </p>
 
               <dl className="mt-3 grid grid-cols-2 gap-y-2 text-xs text-zinc-500">

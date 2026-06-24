@@ -85,6 +85,7 @@ export function CustomerSearch({ onClose, onSelectConversation }: CustomerSearch
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium text-zinc-900">
                     {resolveContactName({
+                      businessContactName: customer.business_contact_name,
                       firstName: customer.first_name,
                       lastName: customer.last_name,
                       whatsappName: customer.whatsapp_name,

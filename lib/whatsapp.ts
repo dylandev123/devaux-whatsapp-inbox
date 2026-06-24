@@ -81,6 +81,10 @@ export interface WhatsappMessage {
   chat_id: string;
   contact_name: string | null;
   contact_number: string | null;
+  // The name saved in the connected WhatsApp Business account's own
+  // phonebook, when the bridge reports it — see lib/contactName.ts. Always
+  // null until the bridge sends it.
+  business_contact_name: string | null;
   direction: string | null;
   message_body: string | null;
   message_type: string | null;
@@ -100,6 +104,7 @@ export interface Conversation {
   chatId: string;
   contactName: string | null;
   contactNumber: string | null;
+  businessContactName: string | null;
   lastMessage: WhatsappMessage;
   messages: WhatsappMessage[];
 }
@@ -136,11 +141,13 @@ export function groupConversations(messages: WhatsappMessage[]): Conversation[] 
       existing.lastMessage = message;
       existing.contactName = message.contact_name ?? existing.contactName;
       existing.contactNumber = message.contact_number ?? existing.contactNumber;
+      existing.businessContactName = message.business_contact_name ?? existing.businessContactName;
     } else {
       map.set(message.chat_id, {
         chatId: message.chat_id,
         contactName: message.contact_name,
         contactNumber: message.contact_number,
+        businessContactName: message.business_contact_name,
         lastMessage: message,
         messages: [message],
       });

@@ -8,7 +8,9 @@ import {
 } from "@/lib/customers";
 import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
 import { resolveContactName } from "@/lib/contactName";
+import { telHref } from "@/lib/phone";
 import { businessColor, businessLabel, setBusinessDirectory } from "@/lib/whatsapp";
+import { ProfileMenu } from "@/components/auth/ProfileMenu";
 
 function formatDate(value: string | null): string {
   if (!value) return "—";
@@ -62,6 +64,7 @@ export function ContactsPage() {
     return customers
       .map((customer) => {
         const displayName = resolveContactName({
+          businessContactName: customer.business_contact_name,
           firstName: customer.first_name,
           lastName: customer.last_name,
           whatsappName: customer.whatsapp_name,
@@ -80,10 +83,15 @@ export function ContactsPage() {
   return (
     <div className="min-h-dvh bg-zinc-50 px-4 py-8 sm:px-8">
       <div className="mx-auto max-w-5xl">
-        <h1 className="text-xl font-semibold text-zinc-900">Contacts</h1>
-        <p className="mt-1 text-sm text-zinc-500">
-          Every customer who has messaged any business, across all conversations.
-        </p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-xl font-semibold text-zinc-900">Contacts</h1>
+            <p className="mt-1 text-sm text-zinc-500">
+              Every customer who has messaged any business, across all conversations.
+            </p>
+          </div>
+          <ProfileMenu />
+        </div>
 
         <div className="mt-4 flex flex-col gap-2 sm:flex-row">
           <input
@@ -140,7 +148,11 @@ export function ContactsPage() {
               {rows.map(({ customer, displayName, contactedSlugs }) => (
                 <tr key={customer.id} className="border-b border-zinc-100 last:border-0">
                   <td className="px-4 py-3 font-medium text-zinc-900">{displayName}</td>
-                  <td className="px-4 py-3 text-zinc-600">{customer.phone_number}</td>
+                  <td className="px-4 py-3 text-zinc-600">
+                    <a href={telHref(customer.phone_number)} className="hover:text-emerald-600 hover:underline">
+                      {customer.phone_number}
+                    </a>
+                  </td>
                   <td className="px-4 py-3">
                     {customer.stage ? (
                       <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-600">

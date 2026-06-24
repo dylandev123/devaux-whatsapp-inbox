@@ -101,9 +101,11 @@ export function ConversationList({
         )}
         {conversations.map((conversation) => {
           const phoneNumber = resolveRecipientNumber(conversation.contactNumber, conversation.chatId);
+          const directoryEntry = contactDirectory.get(phoneNumber);
           const displayName = resolveContactName({
-            ...contactDirectory.get(phoneNumber),
-            whatsappName: contactDirectory.get(phoneNumber)?.whatsappName ?? conversation.contactName,
+            ...directoryEntry,
+            businessContactName: directoryEntry?.businessContactName ?? conversation.businessContactName,
+            whatsappName: directoryEntry?.whatsappName ?? conversation.contactName,
             phoneNumber,
           });
           const status = statusByChatId.get(conversation.chatId) ?? "Active";
