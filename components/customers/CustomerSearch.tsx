@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { CustomerSearchResult, searchCustomers } from "@/lib/customers";
 import { businessColor, businessLabel } from "@/lib/whatsapp";
 import { resolveContactName } from "@/lib/contactName";
+import { formatPhoneDisplay, isPlausiblePhoneNumber } from "@/lib/phone";
 
 interface CustomerSearchProps {
   onClose: () => void;
@@ -92,7 +93,11 @@ export function CustomerSearch({ onClose, onSelectConversation }: CustomerSearch
                       phoneNumber: customer.phone_number,
                     })}
                   </p>
-                  <p className="truncate text-xs text-zinc-500">{customer.phone_number}</p>
+                  <p className="truncate text-xs text-zinc-500">
+                    {isPlausiblePhoneNumber(customer.phone_number)
+                      ? formatPhoneDisplay(customer.phone_number) ?? customer.phone_number
+                      : "No phone number on file"}
+                  </p>
                 </div>
                 {customer.latestBusinessSlug && (
                   <span

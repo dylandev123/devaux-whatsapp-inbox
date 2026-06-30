@@ -8,7 +8,7 @@ import {
 } from "@/lib/customers";
 import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
 import { resolveContactName } from "@/lib/contactName";
-import { telHref } from "@/lib/phone";
+import { formatPhoneDisplay, isPlausiblePhoneNumber, telHref } from "@/lib/phone";
 import { businessColor, businessLabel, setBusinessDirectory } from "@/lib/whatsapp";
 import { ProfileMenu } from "@/components/auth/ProfileMenu";
 
@@ -149,9 +149,13 @@ export function ContactsPage() {
                 <tr key={customer.id} className="border-b border-zinc-100 last:border-0">
                   <td className="px-4 py-3 font-medium text-zinc-900">{displayName}</td>
                   <td className="px-4 py-3 text-zinc-600">
-                    <a href={telHref(customer.phone_number)} className="hover:text-emerald-600 hover:underline">
-                      {customer.phone_number}
-                    </a>
+                    {isPlausiblePhoneNumber(customer.phone_number) ? (
+                      <a href={telHref(customer.phone_number)} className="hover:text-emerald-600 hover:underline">
+                        {formatPhoneDisplay(customer.phone_number) ?? customer.phone_number}
+                      </a>
+                    ) : (
+                      <span className="text-zinc-400">No phone number on file</span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     {customer.stage ? (

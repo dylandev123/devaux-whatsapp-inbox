@@ -2,7 +2,7 @@
 
 import { businessColor, businessLabel, Conversation, resolveRecipientNumber } from "@/lib/whatsapp";
 import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
-import { telHref } from "@/lib/phone";
+import { formatPhoneDisplay, resolveDisplayPhone, telHref } from "@/lib/phone";
 import { CONVERSATION_STATUSES, ConversationStatusValue } from "@/lib/conversationStatus";
 import { MessageBubble } from "./MessageBubble";
 import { ReplyBox } from "./ReplyBox";
@@ -50,6 +50,10 @@ export function MessageThread({
         phoneNumber,
       })
     : "Select a conversation";
+  const { phone: dialablePhone, isLid } = conversation
+    ? resolveDisplayPhone(conversation.contactNumber, conversation.chatId)
+    : { phone: null, isLid: false };
+  const formattedPhone = formatPhoneDisplay(dialablePhone);
 
   return (
     <section className={`${visible ? "flex" : "hidden"} md:flex min-w-0 flex-1 flex-col bg-zinc-50`}>
@@ -75,13 +79,16 @@ export function MessageThread({
             </p>
           )}
           <h2 className="truncate text-sm font-semibold text-zinc-900">{displayName}</h2>
-          {conversation?.contactNumber && (
+          {formattedPhone && dialablePhone && (
             <a
-              href={telHref(conversation.contactNumber)}
+              href={telHref(dialablePhone)}
               className="truncate text-xs text-zinc-500 hover:text-emerald-600 hover:underline"
             >
-              {conversation.contactNumber}
+              {formattedPhone}
             </a>
+          )}
+          {!formattedPhone && isLid && (
+            <p className="truncate text-xs text-zinc-400">No phone number on file</p>
           )}
         </div>
         {conversation && (

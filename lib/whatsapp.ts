@@ -128,10 +128,6 @@ export function filterCustomerMessages(messages: WhatsappMessage[]): WhatsappMes
   return messages.filter((m) => !isSystemChatId(m.chat_id));
 }
 
-export function isRealCustomerConversation(conversation: Conversation): boolean {
-  return conversation.messages.some((m) => !isOutbound(m.direction));
-}
-
 export function groupConversations(messages: WhatsappMessage[]): Conversation[] {
   const map = new Map<string, Conversation>();
   for (const message of messages) {

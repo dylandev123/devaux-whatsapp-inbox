@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -m 10 \"http://159.223.151.41:3030/api/status\" -H \"x-admin-secret: GuccaP-muwmam-3mehwy\")",
+      "Bash(curl -s -m 10 \"http://159.223.151.41:3030/\" -H \"x-admin-secret: GuccaP-muwmam-3mehwy\")"
+    ]
+  }
+}

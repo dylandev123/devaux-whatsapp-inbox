@@ -3,7 +3,8 @@
 import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
 import { businessColor, Conversation, isOutbound, resolveRecipientNumber } from "@/lib/whatsapp";
 import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
-import { CONVERSATION_STATUS_FILTERS, ConversationStatusValue } from "@/lib/conversationStatus";
+import { INBOX_FILTERS, InboxFilterValue, ConversationStatusValue } from "@/lib/conversationStatus";
+import { formatPhoneDisplay, resolveDisplayPhone } from "@/lib/phone";
 
 interface ConversationListProps {
   conversations: Conversation[];
@@ -16,11 +17,12 @@ interface ConversationListProps {
   onBack: () => void;
   visible: boolean;
   hasBusiness: boolean;
+  loading: boolean;
   unreadCounts: Record<string, number>;
   contactDirectory: Map<string, ContactNameInfo>;
   statusByChatId: Map<string, ConversationStatusValue>;
-  statusFilter: ConversationStatusValue | "All";
-  onStatusFilterChange: (value: ConversationStatusValue | "All") => void;
+  statusFilter: InboxFilterValue;
+  onStatusFilterChange: (value: InboxFilterValue) => void;
 }
 
 function formatTime(value: string) {
@@ -49,6 +51,7 @@ export function ConversationList({
   onBack,
   visible,
   hasBusiness,
+  loading,
   unreadCounts,
   contactDirectory,
   statusByChatId,
@@ -74,10 +77,10 @@ export function ConversationList({
         </h2>
         <select
           value={statusFilter}
-          onChange={(e) => onStatusFilterChange(e.target.value as ConversationStatusValue | "All")}
+          onChange={(e) => onStatusFilterChange(e.target.value as InboxFilterValue)}
           className="flex-shrink-0 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-xs text-zinc-600 outline-none focus:border-emerald-500"
         >
-          {CONVERSATION_STATUS_FILTERS.map((value) => (
+          {INBOX_FILTERS.map((value) => (
             <option key={value} value={value}>
               {value}
             </option>
@@ -96,7 +99,10 @@ export function ConversationList({
         {!hasBusiness && (
           <p className="px-5 py-6 text-sm text-zinc-500">Select a business to view conversations.</p>
         )}
-        {hasBusiness && conversations.length === 0 && (
+        {hasBusiness && loading && conversations.length === 0 && (
+          <p className="px-5 py-6 text-sm text-zinc-500">Loading conversations…</p>
+        )}
+        {hasBusiness && !loading && conversations.length === 0 && (
           <p className="px-5 py-6 text-sm text-zinc-500">No conversations found.</p>
         )}
         {conversations.map((conversation) => {
@@ -108,6 +114,9 @@ export function ConversationList({
             whatsappName: directoryEntry?.whatsappName ?? conversation.contactName,
             phoneNumber,
           });
+          const formattedPhone = formatPhoneDisplay(
+            resolveDisplayPhone(conversation.contactNumber, conversation.chatId).phone
+          );
           const status = statusByChatId.get(conversation.chatId) ?? "Active";
           const unread = unreadCounts[conversation.chatId] ?? 0;
           const outboundLast = isOutbound(conversation.lastMessage.direction);
@@ -141,8 +150,8 @@ export function ConversationList({
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5">
-                  {conversation.contactNumber && (
-                    <p className="truncate text-xs text-zinc-400">{conversation.contactNumber}</p>
+                  {formattedPhone && (
+                    <p className="truncate text-xs text-zinc-400">{formattedPhone}</p>
                   )}
                   {statusFilter === "All" && status !== "Active" && (
                     <span className="flex-shrink-0 rounded-full bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500">

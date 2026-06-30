@@ -7,12 +7,13 @@ import { logAndDescribeError } from "@/lib/errors";
 export type ConversationStatusValue = "Active" | "Archived" | "Spam";
 
 export const CONVERSATION_STATUSES: ConversationStatusValue[] = ["Active", "Archived", "Spam"];
-export const CONVERSATION_STATUS_FILTERS: (ConversationStatusValue | "All")[] = [
-  "Active",
-  "Archived",
-  "Spam",
-  "All",
-];
+
+// Inbox-level filter, layered on top of ConversationStatusValue: "Unread" is
+// derived client-side from conversation_reads (see lib/reads.ts) rather than
+// stored in conversation_status, since read state is per-staff-member and
+// status is shared across the whole team.
+export type InboxFilterValue = ConversationStatusValue | "All" | "Unread";
+export const INBOX_FILTERS: InboxFilterValue[] = ["All", "Active", "Unread", "Archived", "Spam"];
 
 export interface ConversationStatusRow {
   business_slug: string;

@@ -24,11 +24,14 @@ import {
 import { businessColor, businessLabel, isOutbound } from "@/lib/whatsapp";
 import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
 import { resolveContactName } from "@/lib/contactName";
-import { telHref } from "@/lib/phone";
+import { formatPhoneDisplay, telHref } from "@/lib/phone";
 import { CreateBookingModal } from "./CreateBookingModal";
 
 interface CustomerPanelProps {
   phoneNumber: string;
+  // True when `phoneNumber` is actually a WhatsApp @lid privacy id rather
+  // than a real, dialable phone number — see lib/phone.ts.
+  isLid?: boolean;
   businessSlug: string | null;
   onClose: () => void;
 }
@@ -99,7 +102,7 @@ function BookingCard({ booking }: { booking: CustomerBooking }) {
   );
 }
 
-export function CustomerPanel({ phoneNumber, businessSlug, onClose }: CustomerPanelProps) {
+export function CustomerPanel({ phoneNumber, isLid = false, businessSlug, onClose }: CustomerPanelProps) {
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [stats, setStats] = useState<CustomerBusinessStat[]>([]);
   const [timeline, setTimeline] = useState<CustomerTimelineMessage[]>([]);
@@ -313,9 +316,13 @@ export function CustomerPanel({ phoneNumber, businessSlug, onClose }: CustomerPa
               )}
               <p className="text-sm text-zinc-500">
                 Phone:{" "}
-                <a href={telHref(customer.phone_number)} className="text-zinc-700 hover:text-emerald-600 hover:underline">
-                  {customer.phone_number}
-                </a>
+                {isLid ? (
+                  <span className="text-zinc-400">No phone number on file</span>
+                ) : (
+                  <a href={telHref(customer.phone_number)} className="text-zinc-700 hover:text-emerald-600 hover:underline">
+                    {formatPhoneDisplay(customer.phone_number) ?? customer.phone_number}
+                  </a>
+                )}
               </p>
 
               <dl className="mt-3 grid grid-cols-2 gap-y-2 text-xs text-zinc-500">

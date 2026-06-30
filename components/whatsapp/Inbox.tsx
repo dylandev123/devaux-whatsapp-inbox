@@ -6,7 +6,6 @@ import {
   businessLabel,
   filterCustomerMessages,
   groupConversations,
-  isRealCustomerConversation,
   isSessionConnected,
   matchesSearch,
   resolveRecipientNumber,
@@ -14,12 +13,14 @@ import {
   WhatsappMessage,
   WhatsappSession,
 } from "@/lib/whatsapp";
+import { resolveDisplayPhone } from "@/lib/phone";
 import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
 import { fetchContactDirectory } from "@/lib/customers";
 import { ContactNameInfo } from "@/lib/contactName";
 import {
   ConversationStatusValue,
   fetchConversationStatuses,
+  InboxFilterValue,
   setConversationStatus,
 } from "@/lib/conversationStatus";
 import {
@@ -70,6 +71,7 @@ export function Inbox() {
     readPersistedBusinessSlug
   );
   const [messages, setMessages] = useState<WhatsappMessage[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -80,7 +82,7 @@ export function Inbox() {
   const [conversationStatuses, setConversationStatuses] = useState<Map<string, ConversationStatusValue>>(
     new Map()
   );
-  const [statusFilter, setStatusFilter] = useState<ConversationStatusValue | "All">("Active");
+  const [statusFilter, setStatusFilter] = useState<InboxFilterValue>("Active");
   const pendingChatIdRef = useRef<string | null>(null);
   // Auto-select-first-connected is only allowed to run once per session,
   // regardless of how many times `sessions` re-polls — otherwise a stale
@@ -230,26 +232,39 @@ export function Inbox() {
   useEffect(() => {
     if (!selectedBusinessSlug) {
       setMessages([]);
+      setMessagesLoading(false);
       return;
     }
-    loadMessages(selectedBusinessSlug);
+    setMessagesLoading(true);
+    loadMessages(selectedBusinessSlug).finally(() => setMessagesLoading(false));
     const interval = setInterval(() => loadMessages(selectedBusinessSlug), POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [selectedBusinessSlug, loadMessages]);
 
+  // Every conversation for the selected business is shown — including ones
+  // with only outbound (business-initiated) messages, since those are real
+  // conversations too. Read state ("Unread") and team status ("Active" /
+  // "Archived" / "Spam") are separate concerns from search, so each gets its
+  // own filter pass below.
   const conversations = useMemo(() => {
-    return groupConversations(filterCustomerMessages(messages)).filter(isRealCustomerConversation);
+    return groupConversations(filterCustomerMessages(messages));
   }, [messages]);
+  const businessUnreadCounts = useMemo(() => sumUnreadByBusiness(unreadCounts), [unreadCounts]);
+  const chatUnreadCounts = useMemo(
+    () => unreadByChatId(unreadCounts, selectedBusinessSlug),
+    [unreadCounts, selectedBusinessSlug]
+  );
   const filteredConversations = useMemo(
     () =>
       conversations
         .filter((c) => matchesSearch(c, search))
         .filter((c) => {
           if (statusFilter === "All") return true;
+          if (statusFilter === "Unread") return (chatUnreadCounts[c.chatId] ?? 0) > 0;
           const status = conversationStatuses.get(c.chatId) ?? "Active";
           return status === statusFilter;
         }),
-    [conversations, search, statusFilter, conversationStatuses]
+    [conversations, search, statusFilter, conversationStatuses, chatUnreadCounts]
   );
   const selectedConversation = useMemo(
     () => conversations.find((c) => c.chatId === selectedChatId) ?? null,
@@ -282,12 +297,6 @@ export function Inbox() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedBusinessSlug, selectedConversation?.chatId, lastMessageTimestamp]);
 
-  const businessUnreadCounts = useMemo(() => sumUnreadByBusiness(unreadCounts), [unreadCounts]);
-  const chatUnreadCounts = useMemo(
-    () => unreadByChatId(unreadCounts, selectedBusinessSlug),
-    [unreadCounts, selectedBusinessSlug]
-  );
-
   const mobilePane: "sidebar" | "list" | "thread" = selectedChatId
     ? "thread"
     : selectedBusinessSlug
@@ -297,6 +306,12 @@ export function Inbox() {
   const customerPhoneNumber = selectedConversation
     ? resolveRecipientNumber(selectedConversation.contactNumber, selectedConversation.chatId)
     : null;
+  // CustomerPanel's "phone" row needs to know whether that resolved number is
+  // an actual dialable phone or just a WhatsApp @lid privacy id, so it can
+  // show an honest "no phone number" state instead of the raw id.
+  const customerIsLid = selectedConversation
+    ? resolveDisplayPhone(selectedConversation.contactNumber, selectedConversation.chatId).isLid
+    : false;
 
   function selectBusiness(slug: string) {
     hasAutoSelectedRef.current = true;
@@ -378,6 +393,7 @@ export function Inbox() {
         onBack={() => setSelectedBusinessSlug(null)}
         visible={mobilePane === "list"}
         hasBusiness={Boolean(selectedBusinessSlug)}
+        loading={messagesLoading}
         unreadCounts={chatUnreadCounts}
         contactDirectory={contactDirectory}
         statusByChatId={conversationStatuses}
@@ -399,6 +415,7 @@ export function Inbox() {
       {showProfile && customerPhoneNumber && (
         <CustomerPanel
           phoneNumber={customerPhoneNumber}
+          isLid={customerIsLid}
           businessSlug={selectedBusinessSlug}
           onClose={() => setShowProfile(false)}
         />
