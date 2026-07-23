@@ -8,6 +8,7 @@ import {
   WhatsappBusinessRow,
 } from "@/lib/businesses";
 import { reloadBusinesses, startSession } from "@/lib/admin/whatsappAdmin";
+import { normalizeBusinessSlug } from "@/lib/businessSlug";
 import { COLOR_PALETTE } from "@/lib/whatsapp";
 
 const POLL_INTERVAL_MS = 5000;
@@ -133,7 +134,7 @@ export function BusinessManagementPanel() {
     setFlowMessage(null);
     try {
       const created = await createBusiness({
-        business_slug: addSlug.trim(),
+        business_slug: normalizeBusinessSlug(addSlug),
         display_name: addName.trim(),
         colour: addColour,
         sort_order: Number(addSortOrder) || 0,

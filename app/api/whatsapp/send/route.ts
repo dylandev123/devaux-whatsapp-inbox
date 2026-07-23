@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { normalizeBusinessSlug } from "@/lib/businessSlug";
 
 interface SendPayload {
   businessSlug?: string;
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
       "Content-Type": "application/json",
       "x-admin-secret": adminSecret,
     },
-    body: JSON.stringify({ businessSlug, to, body }),
+    body: JSON.stringify({ businessSlug: normalizeBusinessSlug(businessSlug), to, body }),
   });
 
   const data = await upstream.json().catch(() => null);

@@ -2,6 +2,8 @@
 // (WHATSAPP_API_URL). Never import this from a client component — it reads
 // WHATSAPP_ADMIN_SECRET, which must never reach the browser.
 
+import { normalizeBusinessSlug } from "@/lib/businessSlug";
+
 // Confirmed against the live backend: GET /api/status returns
 // { sessions: [{ businessSlug, status, hasQr }] }.
 const STATUS_PATH = process.env.WHATSAPP_STATUS_PATH ?? "/api/status";
@@ -26,15 +28,15 @@ export interface BridgeResult<T> {
 }
 
 export function qrPath(businessSlug: string): string {
-  return QR_PATH_TEMPLATE.replace("{slug}", encodeURIComponent(businessSlug));
+  return QR_PATH_TEMPLATE.replace("{slug}", encodeURIComponent(normalizeBusinessSlug(businessSlug)));
 }
 
 export function restartPath(businessSlug: string): string {
-  return RESTART_PATH_TEMPLATE.replace("{slug}", encodeURIComponent(businessSlug));
+  return RESTART_PATH_TEMPLATE.replace("{slug}", encodeURIComponent(normalizeBusinessSlug(businessSlug)));
 }
 
 export function startPath(businessSlug: string): string {
-  return START_PATH_TEMPLATE.replace("{slug}", encodeURIComponent(businessSlug));
+  return START_PATH_TEMPLATE.replace("{slug}", encodeURIComponent(normalizeBusinessSlug(businessSlug)));
 }
 
 export function reloadBusinessesPath(): string {
