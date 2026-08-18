@@ -80,6 +80,18 @@ export function mediaPreviewLabel(message: Pick<WhatsappMessage, "message_type">
   }
 }
 
+// Routes an image src through /api/whatsapp/media instead of loading it
+// directly. The bridge serves media over plain HTTP with no TLS available at
+// all, so an <img src> pointed straight at it is blocked as mixed content on
+// this app's HTTPS origin — this proxies it through our own HTTPS domain
+// instead (see app/api/whatsapp/media/route.ts). Only used for images: that's
+// the one attachment kind this app inlines as an embedded <img> resource
+// (video/audio/document keep linking to the original URL, which browsers
+// don't mixed-content-block for top-level navigation).
+export function imageProxySrc(url: string): string {
+  return `/api/whatsapp/media?url=${encodeURIComponent(url)}`;
+}
+
 export function getFileName(url: string): string {
   try {
     const path = new URL(url).pathname;

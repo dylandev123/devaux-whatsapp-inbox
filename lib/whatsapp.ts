@@ -1,3 +1,5 @@
+import { formatPhoneDisplay, parseWhatsappJid } from "@/lib/phone";
+
 // Seed-data fallback only — once supabase/migrations/20260623000300_business_management.sql
 // is run, the real source of truth is the `whatsapp_businesses` table, loaded
 // into the directory cache below via setBusinessDirectory(). These statics
@@ -91,6 +93,15 @@ export interface WhatsappMessage {
   media_url: string | null;
   created_at: string;
   timestamp: string;
+  // Group-chat sender identity, pulled from the Baileys `raw` payload the
+  // bridge already stores (raw.key.participant / raw.key.participantPn /
+  // raw.pushName) via lightweight JSON-path selects — see
+  // resolveGroupSenderName() below. Only populated for messages the bridge
+  // received in a group ("@g.us") chat; null for everything else, including
+  // every 1:1 message.
+  sender_participant?: string | null;
+  sender_participant_pn?: string | null;
+  sender_push_name?: string | null;
 }
 
 export interface WhatsappSession {
@@ -115,6 +126,29 @@ export function isOutbound(direction: string | null | undefined): boolean {
 
 export function isSessionConnected(status: string | null | undefined): boolean {
   return ["connected", "online", "active"].includes((status ?? "").toLowerCase());
+}
+
+// Group-chat display name for whoever actually sent an inbound message —
+// distinct from `contact_name`, which for a group conversation as a whole
+// just tracks whichever participant sent the *latest* message (see
+// groupConversations() below). Priority: contact_name (the bridge already
+// sets this to the sender's WhatsApp pushName for group messages) ->
+// sender_push_name (same value, straight from the raw payload, in case a
+// row ever has one without the other) -> a formatted phone number from
+// participantPn/participant when no name was ever reported. Returns null
+// for 1:1 chats and outbound messages, so callers can render nothing there.
+export function resolveGroupSenderName(message: WhatsappMessage): string | null {
+  if (isOutbound(message.direction)) return null;
+  if (parseWhatsappJid(message.chat_id).kind !== "group") return null;
+
+  const pushName = (message.contact_name || message.sender_push_name || "").trim();
+  if (pushName) return pushName;
+
+  const parsed = parseWhatsappJid(message.sender_participant_pn || message.sender_participant);
+  if (parsed.kind === "phone" && parsed.digits) {
+    return formatPhoneDisplay(parsed.digits);
+  }
+  return "Unknown participant";
 }
 
 const SYSTEM_CHAT_IDS = new Set(["status@broadcast", "broadcast"]);

@@ -1,7 +1,7 @@
 "use client";
 
 import { classifyMedia } from "@/lib/media";
-import { isOutbound, WhatsappMessage } from "@/lib/whatsapp";
+import { isOutbound, resolveGroupSenderName, WhatsappMessage } from "@/lib/whatsapp";
 import { MediaAttachment } from "./MediaAttachment";
 
 interface MessageBubbleProps {
@@ -24,6 +24,7 @@ export function MessageBubble({ message, accentClassName }: MessageBubbleProps) 
   const outbound = isOutbound(message.direction);
   const mediaKind = classifyMedia(message);
   const caption = message.message_body?.trim();
+  const senderName = resolveGroupSenderName(message);
 
   return (
     <div className={`flex ${outbound ? "justify-end" : "justify-start"}`}>
@@ -32,6 +33,7 @@ export function MessageBubble({ message, accentClassName }: MessageBubbleProps) 
           outbound ? `${accentClassName} text-white` : "bg-white text-zinc-900"
         }`}
       >
+        {senderName && <p className="text-xs font-semibold text-emerald-600">{senderName}</p>}
         {mediaKind && <MediaAttachment message={message} kind={mediaKind} outbound={outbound} />}
         {caption && <p className="whitespace-pre-wrap break-words">{caption}</p>}
         {!mediaKind && !caption && <p className="whitespace-pre-wrap break-words text-sm opacity-70">—</p>}

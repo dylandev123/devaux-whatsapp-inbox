@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getFileName, isVoiceNote, MediaKind } from "@/lib/media";
+import { getFileName, imageProxySrc, isVoiceNote, MediaKind } from "@/lib/media";
 import { WhatsappMessage } from "@/lib/whatsapp";
 
 interface MediaAttachmentProps {
@@ -132,6 +132,11 @@ export function MediaAttachment({ message, kind, outbound }: MediaAttachmentProp
   }
 
   if (kind === "image") {
+    // Loaded through the same-origin proxy, not `url` directly — the bridge
+    // serves media over plain HTTP with no TLS available, which the browser
+    // blocks as mixed content on this app's HTTPS origin. See
+    // lib/media.ts's imageProxySrc() and app/api/whatsapp/media/route.ts.
+    const proxiedSrc = imageProxySrc(url);
     return (
       <>
         <button
@@ -140,9 +145,9 @@ export function MediaAttachment({ message, kind, outbound }: MediaAttachmentProp
           className="block max-w-full cursor-zoom-in"
           aria-label="Open full size image"
         >
-          {/* eslint-disable-next-line @next/next/no-img-element -- remote, arbitrary-host bridge URLs */}
+          {/* eslint-disable-next-line @next/next/no-img-element -- proxied bridge media */}
           <img
-            src={url}
+            src={proxiedSrc}
             alt={message.message_body || "Image attachment"}
             onError={() => setBroken(true)}
             className="max-h-72 w-auto max-w-full rounded-lg bg-zinc-100 object-contain"
@@ -150,7 +155,7 @@ export function MediaAttachment({ message, kind, outbound }: MediaAttachmentProp
         </button>
         {lightboxOpen && (
           <ImageLightbox
-            url={url}
+            url={proxiedSrc}
             alt={message.message_body || "Image attachment"}
             onClose={() => setLightboxOpen(false)}
           />

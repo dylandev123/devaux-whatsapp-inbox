@@ -148,10 +148,15 @@ export function Inbox() {
     // ascending order+limit always returns the same oldest slice. Reversed
     // back to ascending afterwards since every consumer (groupConversations'
     // lastMessage tracking, MessageThread's render order) assumes oldest-first.
+    // Group-sender identity fields are pulled as lightweight JSON-path
+    // selects (raw->key->>participant etc.) rather than selecting the whole
+    // `raw` column — `raw` is the full Baileys payload, including inline
+    // base64 media thumbnails on some rows, and fetching that for all 500
+    // messages on every 5s poll would badly bloat this request.
     const { data, error: fetchError } = await supabase
       .from("whatsapp_messages")
       .select(
-        "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp"
+        "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp, sender_participant:raw->key->>participant, sender_participant_pn:raw->key->>participantPn, sender_push_name:raw->>pushName"
       )
       .eq("business_slug", businessSlug)
       .order("timestamp", { ascending: false })
