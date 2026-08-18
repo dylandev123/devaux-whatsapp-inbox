@@ -142,19 +142,25 @@ export function Inbox() {
   }, []);
 
   const loadMessages = useCallback(async (businessSlug: string) => {
+    // Ordered newest-first so `limit(500)` caps to the most recent 500
+    // messages instead of the oldest 500 — a business past that many total
+    // messages would otherwise never see new messages appear, since an
+    // ascending order+limit always returns the same oldest slice. Reversed
+    // back to ascending afterwards since every consumer (groupConversations'
+    // lastMessage tracking, MessageThread's render order) assumes oldest-first.
     const { data, error: fetchError } = await supabase
       .from("whatsapp_messages")
       .select(
         "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp"
       )
       .eq("business_slug", businessSlug)
-      .order("timestamp", { ascending: true })
+      .order("timestamp", { ascending: false })
       .limit(500);
     if (fetchError) {
       setError(logAndDescribeError("loadMessages", fetchError));
       return;
     }
-    setMessages(data ?? []);
+    setMessages((data ?? []).slice().reverse());
   }, []);
 
   useEffect(() => {
