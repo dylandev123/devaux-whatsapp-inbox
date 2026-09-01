@@ -1,8 +1,8 @@
 "use client";
 
-import { businessColor, businessLabel, Conversation, resolveRecipientNumber } from "@/lib/whatsapp";
+import { businessColor, businessLabel, Conversation, resolveConversationPhone, resolveRecipientNumber } from "@/lib/whatsapp";
 import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
-import { formatPhoneDisplay, resolveDisplayPhone, telHref } from "@/lib/phone";
+import { formatPhoneDisplay, telHref } from "@/lib/phone";
 import { CONVERSATION_STATUSES, ConversationStatusValue } from "@/lib/conversationStatus";
 import { MessageBubble } from "./MessageBubble";
 import { ReplyBox } from "./ReplyBox";
@@ -51,7 +51,7 @@ export function MessageThread({
       })
     : "Select a conversation";
   const { phone: dialablePhone, isLid } = conversation
-    ? resolveDisplayPhone(conversation.contactNumber, conversation.chatId)
+    ? resolveConversationPhone(conversation.contactNumber, conversation.chatId, conversation.messages)
     : { phone: null, isLid: false };
   const formattedPhone = formatPhoneDisplay(dialablePhone);
 

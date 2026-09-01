@@ -29,9 +29,16 @@ import { CreateBookingModal } from "./CreateBookingModal";
 
 interface CustomerPanelProps {
   phoneNumber: string;
-  // True when `phoneNumber` is actually a WhatsApp @lid privacy id rather
-  // than a real, dialable phone number — see lib/phone.ts.
+  // True when no real, dialable phone number could be resolved for this
+  // contact — see resolveConversationPhone() in lib/whatsapp.ts.
   isLid?: boolean;
+  // The real number to show/dial, when one is known. Distinct from
+  // `customer.phone_number`: for a WhatsApp @lid privacy-mode contact,
+  // that DB column holds the lid id itself (whatever the bridge wrote),
+  // not a dialable number — this is resolved separately, at display time,
+  // from senderPn/participantPn metadata on the conversation's messages.
+  // Null exactly when isLid is true.
+  displayPhone: string | null;
   businessSlug: string | null;
   onClose: () => void;
 }
@@ -102,7 +109,7 @@ function BookingCard({ booking }: { booking: CustomerBooking }) {
   );
 }
 
-export function CustomerPanel({ phoneNumber, isLid = false, businessSlug, onClose }: CustomerPanelProps) {
+export function CustomerPanel({ phoneNumber, isLid = false, displayPhone, businessSlug, onClose }: CustomerPanelProps) {
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [stats, setStats] = useState<CustomerBusinessStat[]>([]);
   const [timeline, setTimeline] = useState<CustomerTimelineMessage[]>([]);
@@ -319,8 +326,11 @@ export function CustomerPanel({ phoneNumber, isLid = false, businessSlug, onClos
                 {isLid ? (
                   <span className="text-zinc-400">No phone number on file</span>
                 ) : (
-                  <a href={telHref(customer.phone_number)} className="text-zinc-700 hover:text-emerald-600 hover:underline">
-                    {formatPhoneDisplay(customer.phone_number) ?? customer.phone_number}
+                  <a
+                    href={telHref(displayPhone ?? customer.phone_number)}
+                    className="text-zinc-700 hover:text-emerald-600 hover:underline"
+                  >
+                    {formatPhoneDisplay(displayPhone ?? customer.phone_number) ?? displayPhone ?? customer.phone_number}
                   </a>
                 )}
               </p>

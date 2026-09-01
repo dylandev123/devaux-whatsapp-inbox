@@ -8,13 +8,18 @@ import { createMiddlewareClient } from "@/lib/supabase/middleware";
 // /api/whatsapp/send is authenticated-only (any staff member sends
 // messages from the inbox). Every other /api/whatsapp/* route — status, qr,
 // restart, businesses/reload, session/*/start — is only ever called from the
-// admin UI, so it requires the admin role too.
+// admin UI, so it requires the admin role too. /api/analysis is
+// authenticated-only, like /api/whatsapp/send — the AI analysis dashboard is
+// available to any staff member, not just admins. /api/ai-settings is
+// admin-only — it's the only place the OpenAI key is written, and its GET
+// response (a masked preview) is still more than a non-admin should see.
 const ADMIN_API_PREFIXES = [
   "/api/whatsapp/status",
   "/api/whatsapp/qr",
   "/api/whatsapp/restart",
   "/api/whatsapp/businesses",
   "/api/whatsapp/session",
+  "/api/ai-settings",
 ];
 
 export async function middleware(request: NextRequest) {
@@ -50,5 +55,13 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/", "/contacts", "/admin/:path*", "/api/whatsapp/:path*"],
+  matcher: [
+    "/",
+    "/contacts",
+    "/analysis",
+    "/admin/:path*",
+    "/api/whatsapp/:path*",
+    "/api/analysis/:path*",
+    "/api/ai-settings/:path*",
+  ],
 };

@@ -1,4 +1,4 @@
-import { formatPhoneDisplay, parseWhatsappJid } from "@/lib/phone";
+import { DisplayPhoneResult, formatPhoneDisplay, parseWhatsappJid, resolveDisplayPhone } from "@/lib/phone";
 
 // Seed-data fallback only — once supabase/migrations/20260623000300_business_management.sql
 // is run, the real source of truth is the `whatsapp_businesses` table, loaded
@@ -102,6 +102,17 @@ export interface WhatsappMessage {
   sender_participant?: string | null;
   sender_participant_pn?: string | null;
   sender_push_name?: string | null;
+  // The real MSISDN Baileys reports on an inbound 1:1 message's key
+  // (`senderPn`) when the chat's JID is a WhatsApp "@lid" privacy id —
+  // contact_number itself only ever stores that lid form, never this. Null
+  // for outbound messages and for messages from a real (non-lid) phone JID,
+  // where contact_number is already dialable. See resolveConversationPhone().
+  sender_pn?: string | null;
+  // Present only when this row has no plain-text message_body but the
+  // underlying WhatsApp event still carries user-facing text: an emoji
+  // reaction, or a "message deleted" event. See resolveBubbleText().
+  reaction_text?: string | null;
+  protocol_type?: string | null;
 }
 
 export interface WhatsappSession {
@@ -149,6 +160,52 @@ export function resolveGroupSenderName(message: WhatsappMessage): string | null 
     return formatPhoneDisplay(parsed.digits);
   }
   return "Unknown participant";
+}
+
+// Real phone number for a 1:1 conversation whose contact uses WhatsApp's
+// "@lid" privacy mode. A lid JID is a stable opaque id WhatsApp assigns
+// instead of the phone number — not a phone number itself — and
+// contact_number (and the customers.phone_number dedupe key derived from
+// it) only ever stores that lid form for these contacts; deliberately left
+// alone here since chat_id/threading and the customer record's identity
+// both depend on it staying exactly what the bridge wrote. Baileys does
+// still report the real MSISDN as `key.senderPn` on every inbound message
+// from that contact, though, so this recovers it for *display* only by
+// scanning the conversation's own messages. Falls back to
+// resolveDisplayPhone's existing behavior (phone: null, isLid: true) if no
+// message in the conversation has ever carried a senderPn — e.g. an @lid
+// conversation with only outbound messages so far.
+export function resolveConversationPhone(
+  contactNumber: string | null | undefined,
+  chatId: string | null | undefined,
+  messages: WhatsappMessage[]
+): DisplayPhoneResult {
+  const direct = resolveDisplayPhone(contactNumber, chatId);
+  if (!direct.isLid) return direct;
+
+  const senderPn = messages.find((m) => m.sender_pn)?.sender_pn;
+  const parsed = parseWhatsappJid(senderPn);
+  if (parsed.kind === "phone" && parsed.digits) {
+    return { phone: parsed.digits, isLid: false };
+  }
+  return direct;
+}
+
+// Text to show in a message bubble when message_body is empty. Most rows
+// with no body and no media are WhatsApp protocol-level events with no
+// user-facing text at all (history sync, key distribution, etc.) — those
+// correctly fall through to null/"—". Two real exceptions Baileys reports
+// with actual user-facing content the bridge doesn't copy into message_body:
+// an emoji reaction (reactionMessage.text) and a "deleted for everyone"
+// event (protocolMessage.type === "REVOKE"). Both are read from lightweight
+// JSON-path selects (reaction_text/protocol_type), not the full `raw`
+// column — see the loadMessages comment in Inbox.tsx for why that matters.
+export function resolveBubbleText(message: WhatsappMessage): string | null {
+  const body = message.message_body?.trim();
+  if (body) return body;
+  if (message.reaction_text) return `Reacted ${message.reaction_text}`;
+  if (message.protocol_type === "REVOKE") return "This message was deleted";
+  return null;
 }
 
 const SYSTEM_CHAT_IDS = new Set(["status@broadcast", "broadcast"]);

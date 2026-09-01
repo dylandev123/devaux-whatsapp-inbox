@@ -51,6 +51,12 @@ export function Sidebar({
         >
           Contacts
         </Link>
+        <Link
+          href="/analysis"
+          className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-left text-sm text-zinc-500 hover:border-zinc-300 hover:text-zinc-700"
+        >
+          AI Analysis
+        </Link>
       </div>
       <nav className="flex-1 overflow-y-auto py-2">
         {businesses.map((business) => {

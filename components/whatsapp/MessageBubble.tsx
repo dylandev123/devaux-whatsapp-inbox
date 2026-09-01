@@ -1,7 +1,7 @@
 "use client";
 
 import { classifyMedia } from "@/lib/media";
-import { isOutbound, resolveGroupSenderName, WhatsappMessage } from "@/lib/whatsapp";
+import { isOutbound, resolveBubbleText, resolveGroupSenderName, WhatsappMessage } from "@/lib/whatsapp";
 import { MediaAttachment } from "./MediaAttachment";
 
 interface MessageBubbleProps {
@@ -23,7 +23,7 @@ function formatTime(value: string) {
 export function MessageBubble({ message, accentClassName }: MessageBubbleProps) {
   const outbound = isOutbound(message.direction);
   const mediaKind = classifyMedia(message);
-  const caption = message.message_body?.trim();
+  const caption = resolveBubbleText(message);
   const senderName = resolveGroupSenderName(message);
 
   return (

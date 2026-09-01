@@ -8,12 +8,12 @@ import {
   groupConversations,
   isSessionConnected,
   matchesSearch,
+  resolveConversationPhone,
   resolveRecipientNumber,
   setBusinessDirectory,
   WhatsappMessage,
   WhatsappSession,
 } from "@/lib/whatsapp";
-import { resolveDisplayPhone } from "@/lib/phone";
 import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
 import { fetchContactDirectory } from "@/lib/customers";
 import { ContactNameInfo } from "@/lib/contactName";
@@ -148,15 +148,17 @@ export function Inbox() {
     // ascending order+limit always returns the same oldest slice. Reversed
     // back to ascending afterwards since every consumer (groupConversations'
     // lastMessage tracking, MessageThread's render order) assumes oldest-first.
-    // Group-sender identity fields are pulled as lightweight JSON-path
-    // selects (raw->key->>participant etc.) rather than selecting the whole
-    // `raw` column — `raw` is the full Baileys payload, including inline
-    // base64 media thumbnails on some rows, and fetching that for all 500
-    // messages on every 5s poll would badly bloat this request.
+    // Group-sender identity, the real @lid phone number, and bubble-text
+    // fallbacks (reaction/deleted-message text) are all pulled as
+    // lightweight JSON-path selects (raw->key->>participant etc.) rather
+    // than selecting the whole `raw` column — `raw` is the full Baileys
+    // payload, including inline base64 media thumbnails on some rows, and
+    // fetching that for all 500 messages on every 5s poll would badly bloat
+    // this request.
     const { data, error: fetchError } = await supabase
       .from("whatsapp_messages")
       .select(
-        "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp, sender_participant:raw->key->>participant, sender_participant_pn:raw->key->>participantPn, sender_push_name:raw->>pushName"
+        "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp, sender_participant:raw->key->>participant, sender_participant_pn:raw->key->>participantPn, sender_push_name:raw->>pushName, sender_pn:raw->key->>senderPn, reaction_text:raw->message->reactionMessage->>text, protocol_type:raw->message->protocolMessage->>type"
       )
       .eq("business_slug", businessSlug)
       .order("timestamp", { ascending: false })
@@ -201,6 +203,26 @@ export function Inbox() {
     const interval = setInterval(() => loadConversationStatuses(selectedBusinessSlug), POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [selectedBusinessSlug, loadConversationStatuses]);
+
+  // One-time deep-link support for links like /?business=X&chat=Y (used by
+  // the AI analysis dashboard's "Open conversation" links). Reads
+  // window.location directly rather than next/navigation's useSearchParams,
+  // which would require wrapping this client component in a Suspense
+  // boundary — this only ever needs to run once, after mount, so a plain
+  // effect is simpler. Takes priority over both localStorage and
+  // auto-select-first-connected (jumpToConversation -> selectBusiness sets
+  // hasAutoSelectedRef, so that effect won't override it below). Cleans the
+  // query string afterward so a later refresh doesn't keep re-triggering it.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const business = params.get("business");
+    const chat = params.get("chat");
+    if (!business || !chat) return;
+    jumpToConversation(business, chat);
+    window.history.replaceState({}, "", window.location.pathname);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // If a business was restored from localStorage but no longer exists in the
   // active business list (deactivated, or it was a stale value from a
@@ -317,12 +339,19 @@ export function Inbox() {
   const customerPhoneNumber = selectedConversation
     ? resolveRecipientNumber(selectedConversation.contactNumber, selectedConversation.chatId)
     : null;
-  // CustomerPanel's "phone" row needs to know whether that resolved number is
-  // an actual dialable phone or just a WhatsApp @lid privacy id, so it can
-  // show an honest "no phone number" state instead of the raw id.
-  const customerIsLid = selectedConversation
-    ? resolveDisplayPhone(selectedConversation.contactNumber, selectedConversation.chatId).isLid
-    : false;
+  // CustomerPanel's "phone" row needs the *real* number when this contact
+  // uses WhatsApp's @lid privacy mode — contact_number/chat_id alone only
+  // ever carry the opaque lid id, but resolveConversationPhone recovers the
+  // actual MSISDN from senderPn on the conversation's own messages when
+  // one's available (customers.phone_number, used for the lookup key above,
+  // is deliberately left as whatever the bridge wrote — this is display-only).
+  const { phone: customerDisplayPhone, isLid: customerIsLid } = selectedConversation
+    ? resolveConversationPhone(
+        selectedConversation.contactNumber,
+        selectedConversation.chatId,
+        selectedConversation.messages
+      )
+    : { phone: null, isLid: false };
 
   function selectBusiness(slug: string) {
     hasAutoSelectedRef.current = true;
@@ -427,6 +456,7 @@ export function Inbox() {
         <CustomerPanel
           phoneNumber={customerPhoneNumber}
           isLid={customerIsLid}
+          displayPhone={customerDisplayPhone}
           businessSlug={selectedBusinessSlug}
           onClose={() => setShowProfile(false)}
         />
