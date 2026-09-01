@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { AnalysisRange } from "@/lib/analysis";
 import { analyzeConversation, listConversations } from "@/lib/server/analysisEngine";
 import { getAiSettings } from "@/lib/server/aiSettings";
 
 // Any authenticated staff member may trigger analysis (see middleware.ts —
 // this path requires login but not the admin role, same as the main inbox).
 // Read-only: this only ever reads whatsapp_messages/customers and writes
-// conversation_analysis — never whatsapp_messages/whatsapp_sessions, and
-// never anything sent back to WhatsApp.
+// conversation_analysis/customer_ai_profile — never whatsapp_messages/
+// whatsapp_sessions, and never anything sent back to WhatsApp.
 
 // Bulk runs are capped per call so one request can't run indefinitely or
 // blow through a serverless timeout on a business with a large backlog —
@@ -18,6 +19,8 @@ const BULK_BATCH_LIMIT = 15;
 interface RunPayload {
   businessSlug?: string;
   chatId?: string;
+  since?: string;
+  until?: string;
 }
 
 function supabaseAdmin() {
@@ -25,6 +28,21 @@ function supabaseAdmin() {
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !serviceKey) return null;
   return createClient(url, serviceKey);
+}
+
+function parseRange(since?: string, until?: string): AnalysisRange | null {
+  if (!since || !until) return null;
+  const sinceMs = Date.parse(since);
+  const untilMs = Date.parse(until);
+  if (Number.isNaN(sinceMs) || Number.isNaN(untilMs) || sinceMs >= untilMs) return null;
+  // Never let a caller-supplied `until` reach into the future — a custom
+  // range with a bad end date shouldn't silently include messages that
+  // haven't happened yet relative to "now".
+  const now = Date.now();
+  return {
+    since: new Date(sinceMs).toISOString(),
+    until: new Date(Math.min(untilMs, now)).toISOString(),
+  };
 }
 
 export async function POST(request: Request) {
@@ -54,14 +72,21 @@ export async function POST(request: Request) {
   if (!businessSlug) {
     return NextResponse.json({ error: "businessSlug is required" }, { status: 400 });
   }
+  const range = parseRange(payload.since, payload.until);
+  if (!range) {
+    return NextResponse.json({ error: "A valid since/until range is required" }, { status: 400 });
+  }
 
   // Single conversation: manual (re-)analysis, always runs regardless of
-  // staleness.
+  // staleness, against whatever messages fall in `range`.
   if (chatId) {
     try {
-      const result = await analyzeConversation(businessSlug, chatId);
+      const result = await analyzeConversation(businessSlug, chatId, range);
       if (result.status === "error") {
         return NextResponse.json({ error: result.error ?? "Analysis failed" }, { status: 502 });
+      }
+      if (result.status === "skipped") {
+        return NextResponse.json({ analyzed: 0, skipped: 1, failed: 0, message: result.error });
       }
       return NextResponse.json({ analyzed: 1, skipped: 0, failed: 0 });
     } catch (err) {
@@ -72,11 +97,11 @@ export async function POST(request: Request) {
     }
   }
 
-  // Bulk: every conversation for this business that's new or has messages
-  // newer than its last stored analysis.
+  // Bulk: every conversation for this business with a message in `range`
+  // that's new or has messages newer than its last stored analysis.
   try {
     const [conversations, { data: existingRows, error: existingError }] = await Promise.all([
-      listConversations(businessSlug),
+      listConversations(businessSlug, range),
       supabase
         .from("conversation_analysis")
         .select("chat_id, message_count, last_message_at")
@@ -98,9 +123,9 @@ export async function POST(request: Request) {
     let analyzed = 0;
     let failed = 0;
     for (const conversation of batch) {
-      const result = await analyzeConversation(businessSlug, conversation.chatId);
+      const result = await analyzeConversation(businessSlug, conversation.chatId, range);
       if (result.status === "ok") analyzed += 1;
-      else failed += 1;
+      else if (result.status === "error") failed += 1;
     }
 
     return NextResponse.json({
