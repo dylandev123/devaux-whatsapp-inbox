@@ -208,11 +208,19 @@ export function resolveBubbleText(message: WhatsappMessage): string | null {
   return null;
 }
 
-const SYSTEM_CHAT_IDS = new Set(["status@broadcast", "broadcast"]);
-
+// Status updates, WhatsApp Channels ("@newsletter"), and broadcast lists
+// aren't conversations with a contact — they're one-way/system noise that
+// should never reach the inbox. Delegates the actual JID classification to
+// parseWhatsappJid() (lib/phone.ts) so "what counts as broadcast/newsletter"
+// stays defined in exactly one place; "broadcast" (no @ suffix) is kept as
+// a literal fallback for any malformed chat_id that predates JID-based
+// classification. Groups ("@g.us") and 1:1 chats (phone/@lid) are
+// deliberately NOT filtered here.
 export function isSystemChatId(chatId: string): boolean {
-  const normalized = chatId.toLowerCase();
-  return SYSTEM_CHAT_IDS.has(normalized) || normalized.endsWith("@broadcast");
+  const normalized = chatId.trim().toLowerCase();
+  if (normalized === "broadcast") return true;
+  const kind = parseWhatsappJid(chatId).kind;
+  return kind === "broadcast" || kind === "newsletter";
 }
 
 export function filterCustomerMessages(messages: WhatsappMessage[]): WhatsappMessage[] {

@@ -11,9 +11,14 @@ export const CONVERSATION_STATUSES: ConversationStatusValue[] = ["Active", "Arch
 // Inbox-level filter, layered on top of ConversationStatusValue: "Unread" is
 // derived client-side from conversation_reads (see lib/reads.ts) rather than
 // stored in conversation_status, since read state is per-staff-member and
-// status is shared across the whole team.
-export type InboxFilterValue = ConversationStatusValue | "All" | "Unread";
-export const INBOX_FILTERS: InboxFilterValue[] = ["All", "Active", "Unread", "Archived", "Spam"];
+// status is shared across the whole team. "Hidden" is the same idea applied
+// to the `hidden` column added by
+// supabase/migrations/20260902000000_conversation_hidden.sql: independent of
+// Active/Archived/Spam (a hidden conversation keeps whatever status it
+// already had), shared across the whole team, and excluded from every other
+// filter — see fetchHiddenChatIds()/setConversationHidden() below.
+export type InboxFilterValue = ConversationStatusValue | "All" | "Unread" | "Hidden";
+export const INBOX_FILTERS: InboxFilterValue[] = ["All", "Active", "Unread", "Archived", "Spam", "Hidden"];
 
 export interface ConversationStatusRow {
   business_slug: string;
@@ -51,5 +56,39 @@ export async function setConversationStatus(
     );
   if (error) {
     throw new Error(logAndDescribeError("setConversationStatus", error));
+  }
+}
+
+// App-only hide: never touches whatsapp_messages, so a hidden conversation's
+// data stays exactly where it is in Supabase/WhatsApp — this only controls
+// whether the inbox shows it. Same upsert-partial-columns idiom as
+// setConversationStatus() above: omitting `status` from the payload leaves
+// an existing row's status untouched on conflict, and a brand-new row falls
+// back to conversation_status's own `status default 'Active'`.
+export async function fetchHiddenChatIds(businessSlug: string): Promise<Set<string>> {
+  const { data, error } = await supabase
+    .from("conversation_status")
+    .select("chat_id")
+    .eq("business_slug", businessSlug)
+    .eq("hidden", true);
+  if (error) {
+    throw new Error(logAndDescribeError("fetchHiddenChatIds", error));
+  }
+  return new Set((data ?? []).map((row) => row.chat_id as string));
+}
+
+export async function setConversationHidden(
+  businessSlug: string,
+  chatId: string,
+  hidden: boolean
+): Promise<void> {
+  const { error } = await supabase
+    .from("conversation_status")
+    .upsert(
+      { business_slug: businessSlug, chat_id: chatId, hidden },
+      { onConflict: "business_slug,chat_id" }
+    );
+  if (error) {
+    throw new Error(logAndDescribeError("setConversationHidden", error));
   }
 }

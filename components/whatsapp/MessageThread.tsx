@@ -18,6 +18,8 @@ interface MessageThreadProps {
   contactDirectory: Map<string, ContactNameInfo>;
   status: ConversationStatusValue;
   onStatusChange: (status: ConversationStatusValue) => void;
+  isHidden: boolean;
+  onToggleHidden: () => void;
 }
 
 function initial(label: string): string {
@@ -35,6 +37,8 @@ export function MessageThread({
   contactDirectory,
   status,
   onStatusChange,
+  isHidden,
+  onToggleHidden,
 }: MessageThreadProps) {
   const color = businessColor(businessSlug ?? "");
   const businessName = businessSlug ? businessLabel(businessSlug) : null;
@@ -111,6 +115,15 @@ export function MessageThread({
               </option>
             ))}
           </select>
+        )}
+        {conversation && (
+          <button
+            type="button"
+            onClick={onToggleHidden}
+            className="flex-shrink-0 cursor-pointer rounded-md px-3 py-2 text-xs font-medium text-zinc-500 hover:bg-zinc-100"
+          >
+            {isHidden ? "Unhide" : "Hide"}
+          </button>
         )}
         {conversation && (
           <button

@@ -13,6 +13,31 @@ that already exist. The name-display and dedupe logic on the frontend side
 is already done (see `lib/contactName.ts`, and the
 `whatsapp_messages_dedupe_idx` unique index).
 
+## Status update (2026-09-02, checked live against Supabase)
+
+- **§1 dedupe (`whatsapp_message_id`): done on the bridge side.** Confirmed
+  13,280/13,280 `whatsapp_messages` rows now have `whatsapp_message_id` set.
+  Nothing further needed here.
+- **§2 saved/device contact name (`business_contact_name`): still not
+  implemented.** Confirmed 0/13,280 message rows and 0/70 `customers` rows
+  have `business_contact_name` set. Five sampled `raw` payloads (the full
+  Baileys message JSON) contain only `key`, `status`, `message`, `pushName`,
+  `broadcast`, `verifiedBizName`, `messageTimestamp` — **no `contacts.upsert`
+  / `contacts.set` data reaches Supabase at all**, under any field name. The
+  bridge either isn't listening for those Baileys contact-store events, or
+  isn't persisting anything from them. This is the root cause of "saved
+  WhatsApp/device names don't display" — it's not a frontend bug; the
+  frontend resolver chain (`lib/contactName.ts` → `resolveContactName()`)
+  is verified correct and simply has nothing to read yet. §2 below is still
+  the accurate spec for fixing this.
+- Incidental finding, not a substitute for §2: `raw.verifiedBizName` *is*
+  already present on some rows (WhatsApp's own "this sender is a verified
+  Business account" name — e.g. a customer who is themselves a verified
+  WhatsApp Business). That's a different concept from a phone's saved
+  contact-list entry (it's WhatsApp-verified, not phone-book-saved, and is
+  only ever set for senders who are verified businesses) — don't substitute
+  it for `contact.name` in §2.
+
 ## 1. Import last 2 days of history on link/relink
 
 ### Trigger

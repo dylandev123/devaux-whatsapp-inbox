@@ -20,7 +20,9 @@ import { ContactNameInfo } from "@/lib/contactName";
 import {
   ConversationStatusValue,
   fetchConversationStatuses,
+  fetchHiddenChatIds,
   InboxFilterValue,
+  setConversationHidden,
   setConversationStatus,
 } from "@/lib/conversationStatus";
 import {
@@ -82,6 +84,7 @@ export function Inbox() {
   const [conversationStatuses, setConversationStatuses] = useState<Map<string, ConversationStatusValue>>(
     new Map()
   );
+  const [hiddenChatIds, setHiddenChatIds] = useState<Set<string>>(new Set());
   const [statusFilter, setStatusFilter] = useState<InboxFilterValue>("Active");
   const pendingChatIdRef = useRef<string | null>(null);
   // Auto-select-first-connected is only allowed to run once per session,
@@ -126,6 +129,16 @@ export function Inbox() {
       // Non-critical: if conversation_status hasn't been migrated yet,
       // every conversation just behaves as "Active" (the default anyway).
       logAndDescribeError("loadConversationStatuses", err);
+    }
+  }, []);
+
+  const loadHiddenChatIds = useCallback(async (businessSlug: string) => {
+    try {
+      setHiddenChatIds(await fetchHiddenChatIds(businessSlug));
+    } catch (err) {
+      // Non-critical: if the `hidden` column hasn't been migrated yet,
+      // every conversation just behaves as not-hidden (the default anyway).
+      logAndDescribeError("loadHiddenChatIds", err);
     }
   }, []);
 
@@ -203,6 +216,16 @@ export function Inbox() {
     const interval = setInterval(() => loadConversationStatuses(selectedBusinessSlug), POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [selectedBusinessSlug, loadConversationStatuses]);
+
+  useEffect(() => {
+    if (!selectedBusinessSlug) {
+      setHiddenChatIds(new Set());
+      return;
+    }
+    loadHiddenChatIds(selectedBusinessSlug);
+    const interval = setInterval(() => loadHiddenChatIds(selectedBusinessSlug), POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [selectedBusinessSlug, loadHiddenChatIds]);
 
   // One-time deep-link support for links like /?business=X&chat=Y (used by
   // the AI analysis dashboard's "Open conversation" links). Reads
@@ -292,12 +315,19 @@ export function Inbox() {
       conversations
         .filter((c) => matchesSearch(c, search))
         .filter((c) => {
+          // Hidden is independent of Active/Archived/Spam (see
+          // supabase/migrations/20260902000000_conversation_hidden.sql): a
+          // hidden conversation is excluded from every other filter, and the
+          // "Hidden" filter shows only hidden ones, regardless of status.
+          const isHidden = hiddenChatIds.has(c.chatId);
+          if (statusFilter === "Hidden") return isHidden;
+          if (isHidden) return false;
           if (statusFilter === "All") return true;
           if (statusFilter === "Unread") return (chatUnreadCounts[c.chatId] ?? 0) > 0;
           const status = conversationStatuses.get(c.chatId) ?? "Active";
           return status === statusFilter;
         }),
-    [conversations, search, statusFilter, conversationStatuses, chatUnreadCounts]
+    [conversations, search, statusFilter, conversationStatuses, chatUnreadCounts, hiddenChatIds]
   );
   const selectedConversation = useMemo(
     () => conversations.find((c) => c.chatId === selectedChatId) ?? null,
@@ -371,6 +401,26 @@ export function Inbox() {
     } catch (err) {
       setError(logAndDescribeError("handleStatusChange", err));
       loadConversationStatuses(selectedBusinessSlug);
+    }
+  }
+
+  async function handleHiddenChange(chatId: string, hidden: boolean) {
+    if (!selectedBusinessSlug) return;
+    // Optimistic, same pattern as handleStatusChange above.
+    setHiddenChatIds((prev) => {
+      const next = new Set(prev);
+      if (hidden) next.add(chatId);
+      else next.delete(chatId);
+      return next;
+    });
+    if (hidden && statusFilter !== "Hidden" && chatId === selectedChatId) {
+      setSelectedChatId(null);
+    }
+    try {
+      await setConversationHidden(selectedBusinessSlug, chatId, hidden);
+    } catch (err) {
+      setError(logAndDescribeError("handleHiddenChange", err));
+      loadHiddenChatIds(selectedBusinessSlug);
     }
   }
 
@@ -451,6 +501,10 @@ export function Inbox() {
         contactDirectory={contactDirectory}
         status={selectedChatId ? conversationStatuses.get(selectedChatId) ?? "Active" : "Active"}
         onStatusChange={(status) => selectedChatId && handleStatusChange(selectedChatId, status)}
+        isHidden={selectedChatId ? hiddenChatIds.has(selectedChatId) : false}
+        onToggleHidden={() =>
+          selectedChatId && handleHiddenChange(selectedChatId, !hiddenChatIds.has(selectedChatId))
+        }
       />
       {showProfile && customerPhoneNumber && (
         <CustomerPanel

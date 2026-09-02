@@ -5,13 +5,17 @@ export function telHref(phoneNumber: string): string {
   return `tel:+${phoneNumber.replace(/[^0-9]/g, "")}`;
 }
 
-export type WhatsappJidKind = "phone" | "lid" | "group" | "broadcast" | "unknown";
+export type WhatsappJidKind = "phone" | "lid" | "group" | "broadcast" | "newsletter" | "unknown";
 
 // Classifies a WhatsApp JID (chat_id) by its suffix. "@lid" is WhatsApp's
 // privacy-mode linked id — a stable opaque identifier, not a real MSISDN —
 // used instead of a phone number when a contact has phone-number privacy
 // enabled. The digits in a @lid JID must never be presented as a phone
-// number: they don't correspond to anything dialable.
+// number: they don't correspond to anything dialable. "@newsletter" is a
+// WhatsApp Channel — one-way broadcast content, not a conversation with a
+// contact — distinct from "@broadcast" (status updates / broadcast lists),
+// but both are non-conversation noise that the inbox filters out (see
+// isSystemChatId() in lib/whatsapp.ts).
 export function parseWhatsappJid(chatId: string | null | undefined): {
   digits: string | null;
   kind: WhatsappJidKind;
@@ -20,6 +24,7 @@ export function parseWhatsappJid(chatId: string | null | undefined): {
   if (!id) return { digits: null, kind: "unknown" };
   const lower = id.toLowerCase();
   if (lower === "status@broadcast" || lower.endsWith("@broadcast")) return { digits: null, kind: "broadcast" };
+  if (lower.endsWith("@newsletter")) return { digits: null, kind: "newsletter" };
   if (lower.endsWith("@g.us")) return { digits: null, kind: "group" };
   const lidMatch = id.match(/^(\d+)@lid$/i);
   if (lidMatch) return { digits: lidMatch[1], kind: "lid" };
