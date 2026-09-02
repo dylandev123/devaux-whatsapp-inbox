@@ -1,7 +1,7 @@
 "use client";
 
 import { businessColor, businessLabel, Conversation, resolveConversationPhone, resolveRecipientNumber } from "@/lib/whatsapp";
-import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
+import { ContactNameInfo, resolveContactName, resolveSecondaryWhatsappLabel } from "@/lib/contactName";
 import { formatPhoneDisplay, telHref } from "@/lib/phone";
 import { CONVERSATION_STATUSES, ConversationStatusValue } from "@/lib/conversationStatus";
 import { MessageBubble } from "./MessageBubble";
@@ -42,14 +42,16 @@ export function MessageThread({
     ? resolveRecipientNumber(conversation.contactNumber, conversation.chatId)
     : null;
   const directoryEntry = contactDirectory.get(phoneNumber ?? "");
-  const displayName = conversation
-    ? resolveContactName({
+  const nameInfo = conversation
+    ? {
         ...directoryEntry,
         businessContactName: directoryEntry?.businessContactName ?? conversation.businessContactName,
         whatsappName: directoryEntry?.whatsappName ?? conversation.contactName,
         phoneNumber,
-      })
-    : "Select a conversation";
+      }
+    : null;
+  const displayName = nameInfo ? resolveContactName(nameInfo) : "Select a conversation";
+  const secondaryWhatsappName = nameInfo ? resolveSecondaryWhatsappLabel(nameInfo) : null;
   const { phone: dialablePhone, isLid } = conversation
     ? resolveConversationPhone(conversation.contactNumber, conversation.chatId, conversation.messages)
     : { phone: null, isLid: false };
@@ -79,17 +81,22 @@ export function MessageThread({
             </p>
           )}
           <h2 className="truncate text-sm font-semibold text-zinc-900">{displayName}</h2>
-          {formattedPhone && dialablePhone && (
-            <a
-              href={telHref(dialablePhone)}
-              className="truncate text-xs text-zinc-500 hover:text-emerald-600 hover:underline"
-            >
-              {formattedPhone}
-            </a>
-          )}
-          {!formattedPhone && isLid && (
-            <p className="truncate text-xs text-zinc-400">No phone number on file</p>
-          )}
+          <div className="flex items-center gap-1.5">
+            {formattedPhone && dialablePhone && (
+              <a
+                href={telHref(dialablePhone)}
+                className="truncate text-xs text-zinc-500 hover:text-emerald-600 hover:underline"
+              >
+                {formattedPhone}
+              </a>
+            )}
+            {!formattedPhone && isLid && (
+              <p className="truncate text-xs text-zinc-400">No phone number on file</p>
+            )}
+            {secondaryWhatsappName && (
+              <p className="truncate text-xs text-zinc-400">· WhatsApp: {secondaryWhatsappName}</p>
+            )}
+          </div>
         </div>
         {conversation && (
           <select

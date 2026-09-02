@@ -2,7 +2,7 @@
 
 import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
 import { businessColor, Conversation, isOutbound, resolveRecipientNumber } from "@/lib/whatsapp";
-import { ContactNameInfo, resolveContactName } from "@/lib/contactName";
+import { ContactNameInfo, resolveContactName, resolveSecondaryWhatsappLabel } from "@/lib/contactName";
 import { INBOX_FILTERS, InboxFilterValue, ConversationStatusValue } from "@/lib/conversationStatus";
 import { formatPhoneDisplay, resolveDisplayPhone } from "@/lib/phone";
 
@@ -108,12 +108,14 @@ export function ConversationList({
         {conversations.map((conversation) => {
           const phoneNumber = resolveRecipientNumber(conversation.contactNumber, conversation.chatId);
           const directoryEntry = contactDirectory.get(phoneNumber);
-          const displayName = resolveContactName({
+          const nameInfo = {
             ...directoryEntry,
             businessContactName: directoryEntry?.businessContactName ?? conversation.businessContactName,
             whatsappName: directoryEntry?.whatsappName ?? conversation.contactName,
             phoneNumber,
-          });
+          };
+          const displayName = resolveContactName(nameInfo);
+          const secondaryWhatsappName = resolveSecondaryWhatsappLabel(nameInfo);
           const formattedPhone = formatPhoneDisplay(
             resolveDisplayPhone(conversation.contactNumber, conversation.chatId).phone
           );
@@ -152,6 +154,9 @@ export function ConversationList({
                 <div className="flex items-center gap-1.5">
                   {formattedPhone && (
                     <p className="truncate text-xs text-zinc-400">{formattedPhone}</p>
+                  )}
+                  {secondaryWhatsappName && (
+                    <p className="truncate text-xs text-zinc-400">· WhatsApp: {secondaryWhatsappName}</p>
                   )}
                   {statusFilter === "All" && status !== "Active" && (
                     <span className="flex-shrink-0 rounded-full bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500">
