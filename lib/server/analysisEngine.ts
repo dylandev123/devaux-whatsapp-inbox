@@ -38,6 +38,7 @@ import {
   AnalysisUrgency,
   ExtractedDetails,
   OrderStatus,
+  WorkflowStatus,
 } from "@/lib/analysis";
 import {
   WhatsappMessage,
@@ -312,7 +313,7 @@ export async function analyzeConversation(
       .maybeSingle(),
     supabase
       .from("conversation_analysis")
-      .select("category, summary, order_status")
+      .select("category, summary, order_status, workflow_status, last_message_at")
       .eq("business_slug", businessSlug)
       .eq("chat_id", chatId)
       .maybeSingle(),
@@ -339,6 +340,26 @@ export async function analyzeConversation(
   // no status yet; a later re-analysis (even one that changes the category
   // away from "Order placed") keeps whatever staff already set it to.
   const existingOrderStatus = (priorAnalysisRow?.order_status as OrderStatus | null | undefined) ?? null;
+
+  // Done/Active workflow status (see
+  // supabase/migrations/20260902010000_conversation_workflow_status.sql).
+  // Auto-resurface, authoritative version: resurfaceDoneWithNewActivity()
+  // (lib/analysis.ts) does the same thing client-side by comparing against
+  // *live* whatsapp_messages, but that signal disappears the moment this
+  // function updates last_message_at — so a Done conversation that gets
+  // caught by a bulk "Analyze new/updated" run before anyone reopens the
+  // dashboard needs this function to flip it back to Active itself, or it
+  // would stay hidden forever despite genuinely new messages having just
+  // been incorporated. Only flips when this run's messages actually extend
+  // past what the last analysis already reflected — re-analyzing a Done
+  // conversation over a wide/overlapping range that contains no messages
+  // newer than last time must not silently reopen it.
+  const existingWorkflowStatus = (priorAnalysisRow?.workflow_status as WorkflowStatus | null | undefined) ?? "Active";
+  const priorLastMessageAt = priorAnalysisRow?.last_message_at ?? null;
+  const hasNewMessagesSincePriorAnalysis =
+    !priorLastMessageAt || new Date(last.timestamp).getTime() > new Date(priorLastMessageAt).getTime();
+  const workflowStatus: WorkflowStatus =
+    existingWorkflowStatus === "Done" && hasNewMessagesSincePriorAnalysis ? "Active" : existingWorkflowStatus;
 
   const baseRow = {
     business_slug: businessSlug,
@@ -395,6 +416,7 @@ export async function analyzeConversation(
         ...baseRow,
         ...analysisFields,
         order_status: orderStatus,
+        workflow_status: workflowStatus,
         model,
         status: "ok",
         error_message: null,
@@ -432,6 +454,7 @@ export async function analyzeConversation(
         next_action: null,
         confidence: null,
         order_status: existingOrderStatus,
+        workflow_status: workflowStatus,
         model,
         status: "error",
         error_message: message,

@@ -6,8 +6,10 @@ import {
   businessLabel,
   filterCustomerMessages,
   groupConversations,
+  historyWindowCutoffIso,
   isSessionConnected,
   matchesSearch,
+  mergeMessages,
   resolveConversationPhone,
   resolveRecipientNumber,
   setBusinessDirectory,
@@ -41,6 +43,25 @@ import { CustomerSearch } from "@/components/customers/CustomerSearch";
 
 const POLL_INTERVAL_MS = 5000;
 const SELECTED_BUSINESS_STORAGE_KEY = "devaux:selectedBusinessSlug";
+
+// Shared by both the polled window (whole business, newest-first) and
+// "scroll up for older messages" pagination (one conversation at a time) —
+// see loadMessages()/loadOlderMessages() below. Skips the whole `raw`
+// column deliberately (see the comment on loadMessages further down).
+const MESSAGE_SELECT =
+  "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp, sender_participant:raw->key->>participant, sender_participant_pn:raw->key->>participantPn, sender_push_name:raw->>pushName, sender_pn:raw->key->>senderPn, reaction_text:raw->message->reactionMessage->>text, protocol_type:raw->message->protocolMessage->>type";
+
+// Business-wide poll cap — bounded well above what MESSAGE_HISTORY_WINDOW_DAYS
+// (7 days) needs for typical traffic, while still never fetching the whole
+// table. If a single business ever exceeds this many messages within 7
+// days, its oldest conversations in that window fall back to being reached
+// via "scroll up for older messages" (loadOlderMessages) instead of showing
+// up in the list immediately — same tradeoff the old flat 500 cap already
+// made, just against a much larger, date-bounded ceiling.
+const MESSAGE_POLL_LIMIT = 1500;
+
+// Page size for "scroll up for older messages" pagination, per conversation.
+const OLDER_MESSAGES_PAGE_SIZE = 100;
 
 function readPersistedBusinessSlug(): string | null {
   if (typeof window === "undefined") return null;
@@ -86,6 +107,11 @@ export function Inbox() {
   );
   const [hiddenChatIds, setHiddenChatIds] = useState<Set<string>>(new Set());
   const [statusFilter, setStatusFilter] = useState<InboxFilterValue>("Active");
+  // "Scroll up for older messages" pagination state — see loadOlderMessages
+  // below. Per-chat so switching conversations doesn't block pagination in
+  // whichever one is currently open.
+  const [olderLoadingChatId, setOlderLoadingChatId] = useState<string | null>(null);
+  const [olderExhaustedChatIds, setOlderExhaustedChatIds] = useState<Set<string>>(new Set());
   const pendingChatIdRef = useRef<string | null>(null);
   // Auto-select-first-connected is only allowed to run once per session,
   // regardless of how many times `sessions` re-polls — otherwise a stale
@@ -155,32 +181,75 @@ export function Inbox() {
   }, []);
 
   const loadMessages = useCallback(async (businessSlug: string) => {
-    // Ordered newest-first so `limit(500)` caps to the most recent 500
-    // messages instead of the oldest 500 — a business past that many total
-    // messages would otherwise never see new messages appear, since an
-    // ascending order+limit always returns the same oldest slice. Reversed
-    // back to ascending afterwards since every consumer (groupConversations'
-    // lastMessage tracking, MessageThread's render order) assumes oldest-first.
-    // Group-sender identity, the real @lid phone number, and bubble-text
-    // fallbacks (reaction/deleted-message text) are all pulled as
-    // lightweight JSON-path selects (raw->key->>participant etc.) rather
-    // than selecting the whole `raw` column — `raw` is the full Baileys
-    // payload, including inline base64 media thumbnails on some rows, and
-    // fetching that for all 500 messages on every 5s poll would badly bloat
-    // this request.
+    // Ordered newest-first so `limit(MESSAGE_POLL_LIMIT)` caps to the most
+    // recent messages instead of the oldest — a business past that many
+    // total messages would otherwise never see new messages appear, since
+    // an ascending order+limit always returns the same oldest slice.
+    // Bounded to the last MESSAGE_HISTORY_WINDOW_DAYS on top of that, so the
+    // conversation list surfaces at least a week of activity rather than
+    // whatever a high-traffic business's most recent N messages happen to
+    // span. Reversed back to ascending afterwards since every consumer
+    // (groupConversations' lastMessage tracking, MessageThread's render
+    // order) assumes oldest-first. Group-sender identity, the real @lid
+    // phone number, and bubble-text fallbacks (reaction/deleted-message
+    // text) are all pulled as lightweight JSON-path selects rather than
+    // selecting the whole `raw` column — `raw` is the full Baileys payload,
+    // including inline base64 media thumbnails on some rows, and fetching
+    // that on every 5s poll would badly bloat this request.
     const { data, error: fetchError } = await supabase
       .from("whatsapp_messages")
-      .select(
-        "id, business_slug, chat_id, contact_name, contact_number, business_contact_name, direction, message_body, message_type, media_url, created_at, timestamp, sender_participant:raw->key->>participant, sender_participant_pn:raw->key->>participantPn, sender_push_name:raw->>pushName, sender_pn:raw->key->>senderPn, reaction_text:raw->message->reactionMessage->>text, protocol_type:raw->message->protocolMessage->>type"
-      )
+      .select(MESSAGE_SELECT)
       .eq("business_slug", businessSlug)
+      .gte("timestamp", historyWindowCutoffIso())
       .order("timestamp", { ascending: false })
-      .limit(500);
+      .limit(MESSAGE_POLL_LIMIT);
     if (fetchError) {
       setError(logAndDescribeError("loadMessages", fetchError));
       return;
     }
-    setMessages((data ?? []).slice().reverse());
+    // Merge rather than replace: a plain replace here would wipe out any
+    // older history "scroll up for older messages" (loadOlderMessages
+    // below) had already loaded, since that history falls outside this
+    // query's own window/limit. See mergeMessages' comment in lib/whatsapp.ts.
+    setMessages((prev) => mergeMessages(prev, (data ?? []).slice().reverse()));
+  }, []);
+
+  // "Scroll up for older messages" pagination for the currently open
+  // conversation — the poll above only ever covers the last
+  // MESSAGE_HISTORY_WINDOW_DAYS/MESSAGE_POLL_LIMIT window, business-wide;
+  // this fetches one older page for a single chat, further back within the
+  // same 7-day floor, and merges it in (see mergeMessages). A chat that's
+  // already reached the 7-day floor (or simply has no more messages) stops
+  // being queried on every subsequent scroll.
+  const loadOlderMessages = useCallback(async (businessSlug: string, chatId: string, before: string) => {
+    setOlderLoadingChatId(chatId);
+    try {
+      const { data, error: fetchError } = await supabase
+        .from("whatsapp_messages")
+        .select(MESSAGE_SELECT)
+        .eq("business_slug", businessSlug)
+        .eq("chat_id", chatId)
+        .lt("timestamp", before)
+        .gte("timestamp", historyWindowCutoffIso())
+        .order("timestamp", { ascending: false })
+        .limit(OLDER_MESSAGES_PAGE_SIZE);
+      if (fetchError) {
+        setError(logAndDescribeError("loadOlderMessages", fetchError));
+        return;
+      }
+      const rows = data ?? [];
+      if (rows.length < OLDER_MESSAGES_PAGE_SIZE) {
+        // Fewer than a full page means we've hit either the real start of
+        // this conversation or the 7-day floor — either way, nothing more
+        // to fetch for this chat.
+        setOlderExhaustedChatIds((prev) => new Set(prev).add(chatId));
+      }
+      if (rows.length > 0) {
+        setMessages((prev) => mergeMessages(prev, rows.slice().reverse()));
+      }
+    } finally {
+      setOlderLoadingChatId((prev) => (prev === chatId ? null : prev));
+    }
   }, []);
 
   useEffect(() => {
@@ -286,8 +355,15 @@ export function Inbox() {
   }, [selectedBusinessSlug]);
 
   useEffect(() => {
+    // Reset on every business switch (including to none) — loadMessages now
+    // merges into whatever's already in `messages` (see mergeMessages) so
+    // pagination survives the 5s poll, which means a stale previous
+    // business's messages must be cleared explicitly here rather than
+    // relying on the old plain-replace behavior to do it implicitly.
+    setMessages([]);
+    setOlderLoadingChatId(null);
+    setOlderExhaustedChatIds(new Set());
     if (!selectedBusinessSlug) {
-      setMessages([]);
       setMessagesLoading(false);
       return;
     }
@@ -424,6 +500,15 @@ export function Inbox() {
     }
   }
 
+  function handleLoadOlderMessages() {
+    if (!selectedBusinessSlug || !selectedConversation) return;
+    const chatId = selectedConversation.chatId;
+    if (olderLoadingChatId || olderExhaustedChatIds.has(chatId)) return;
+    const oldest = selectedConversation.messages[0]?.timestamp;
+    if (!oldest) return;
+    loadOlderMessages(selectedBusinessSlug, chatId, oldest);
+  }
+
   function jumpToConversation(businessSlug: string, chatId: string) {
     setShowCustomerSearch(false);
     if (businessSlug === selectedBusinessSlug) {
@@ -505,6 +590,9 @@ export function Inbox() {
         onToggleHidden={() =>
           selectedChatId && handleHiddenChange(selectedChatId, !hiddenChatIds.has(selectedChatId))
         }
+        onLoadOlderMessages={handleLoadOlderMessages}
+        loadingOlderMessages={Boolean(selectedChatId) && olderLoadingChatId === selectedChatId}
+        hasMoreOlderMessages={Boolean(selectedChatId) && !olderExhaustedChatIds.has(selectedChatId ?? "")}
       />
       {showProfile && customerPhoneNumber && (
         <CustomerPanel

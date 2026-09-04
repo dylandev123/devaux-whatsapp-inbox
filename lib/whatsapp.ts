@@ -131,6 +131,35 @@ export interface Conversation {
   messages: WhatsappMessage[];
 }
 
+// How far back the inbox loads/paginates conversation history — see
+// loadMessages()/loadOlderMessages() in components/whatsapp/Inbox.tsx. A
+// single shared constant so the initial/polled window and "scroll up for
+// older messages" pagination can never drift out of sync with each other.
+export const MESSAGE_HISTORY_WINDOW_DAYS = 7;
+
+export function historyWindowCutoffIso(): string {
+  return new Date(Date.now() - MESSAGE_HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+}
+
+// Merges a freshly-fetched batch of messages into whatever's already in
+// state rather than replacing it outright. Needed because of two
+// overlapping data sources into the same flat `messages` array: the 5s poll
+// (bounded to the last MESSAGE_HISTORY_WINDOW_DAYS, business-wide) and
+// "scroll up for older messages" pagination (bounded the same way, but
+// per-conversation and further back). A plain replace on every poll tick
+// would silently discard whatever pagination had loaded, since paginated
+// history falls outside the poll's own window. Newer data wins for a given
+// id (covers a row's fields changing); the result stays sorted oldest-first
+// like every existing consumer (groupConversations, MessageThread's render
+// order) already assumes.
+export function mergeMessages(existing: WhatsappMessage[], incoming: WhatsappMessage[]): WhatsappMessage[] {
+  const byId = new Map(existing.map((m) => [m.id, m]));
+  for (const m of incoming) byId.set(m.id, m);
+  return Array.from(byId.values()).sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+}
+
 export function isOutbound(direction: string | null | undefined): boolean {
   return (direction ?? "").toLowerCase().includes("out");
 }

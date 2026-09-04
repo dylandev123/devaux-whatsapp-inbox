@@ -20,11 +20,20 @@ interface MessageThreadProps {
   onStatusChange: (status: ConversationStatusValue) => void;
   isHidden: boolean;
   onToggleHidden: () => void;
+  onLoadOlderMessages: () => void;
+  loadingOlderMessages: boolean;
+  hasMoreOlderMessages: boolean;
 }
 
 function initial(label: string): string {
   return label.trim().charAt(0).toUpperCase() || "?";
 }
+
+// Fires "load an older page" once the user has scrolled near the top of the
+// message list — mirrors the same near-threshold pattern rather than
+// requiring an exact scrollTop === 0, so it also catches momentum/rubber-band
+// scrolling on mobile that can overshoot past 0.
+const LOAD_OLDER_SCROLL_THRESHOLD_PX = 80;
 
 export function MessageThread({
   conversation,
@@ -39,6 +48,9 @@ export function MessageThread({
   onStatusChange,
   isHidden,
   onToggleHidden,
+  onLoadOlderMessages,
+  loadingOlderMessages,
+  hasMoreOlderMessages,
 }: MessageThreadProps) {
   const color = businessColor(businessSlug ?? "");
   const businessName = businessSlug ? businessLabel(businessSlug) : null;
@@ -139,9 +151,20 @@ export function MessageThread({
         )}
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-4 sm:px-5">
+      <div
+        className="flex-1 overflow-y-auto px-3 py-4 sm:px-5"
+        onScroll={(e) => {
+          if (!hasMoreOlderMessages || loadingOlderMessages) return;
+          if (e.currentTarget.scrollTop <= LOAD_OLDER_SCROLL_THRESHOLD_PX) {
+            onLoadOlderMessages();
+          }
+        }}
+      >
         {!conversation && (
           <p className="text-sm text-zinc-500">Select a conversation to view messages.</p>
+        )}
+        {conversation && loadingOlderMessages && (
+          <p className="pb-2 text-center text-xs text-zinc-400">Loading earlier messages…</p>
         )}
         <div className="flex flex-col gap-2">
           {conversation?.messages.map((message) => (

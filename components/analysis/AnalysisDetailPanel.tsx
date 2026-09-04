@@ -11,6 +11,8 @@ interface AnalysisDetailPanelProps {
   onClose: () => void;
   onReanalyze?: () => void;
   reanalyzing?: boolean;
+  onToggleWorkflow?: () => void;
+  updatingWorkflow?: boolean;
 }
 
 function formatDateTime(value: string): string {
@@ -36,7 +38,14 @@ function urgencyBadge(urgency: ConversationAnalysis["urgency"]) {
 // customer AI profile, which is fetched on demand (see fetchProfileFor) so
 // this component works the same regardless of which list opened it,
 // without either caller needing to pre-load a whole business's profiles.
-export function AnalysisDetailPanel({ analysis, onClose, onReanalyze, reanalyzing }: AnalysisDetailPanelProps) {
+export function AnalysisDetailPanel({
+  analysis,
+  onClose,
+  onReanalyze,
+  reanalyzing,
+  onToggleWorkflow,
+  updatingWorkflow,
+}: AnalysisDetailPanelProps) {
   const [profile, setProfile] = useState<CustomerAiProfile | null>(null);
   const [profileLoading, setProfileLoading] = useState(true);
   const [profileError, setProfileError] = useState<string | null>(null);
@@ -111,6 +120,13 @@ export function AnalysisDetailPanel({ analysis, onClose, onReanalyze, reanalyzin
                 Action needed
               </span>
             )}
+            <span
+              className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                analysis.workflow_status === "Done" ? "bg-zinc-100 text-zinc-600" : "bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {analysis.workflow_status}
+            </span>
             {analysis.confidence !== null && (
               <span className="text-xs text-zinc-400">{Math.round(analysis.confidence * 100)}% confidence</span>
             )}
@@ -175,16 +191,28 @@ export function AnalysisDetailPanel({ analysis, onClose, onReanalyze, reanalyzin
           >
             Open conversation ↗
           </Link>
-          {onReanalyze && (
-            <button
-              type="button"
-              onClick={onReanalyze}
-              disabled={reanalyzing}
-              className="cursor-pointer rounded-md border border-zinc-200 px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-50 disabled:cursor-default disabled:opacity-50"
-            >
-              {reanalyzing ? "Re-analyzing…" : "Re-analyze"}
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {onToggleWorkflow && (
+              <button
+                type="button"
+                onClick={onToggleWorkflow}
+                disabled={updatingWorkflow}
+                className="cursor-pointer rounded-md border border-zinc-200 px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-50 disabled:cursor-default disabled:opacity-50"
+              >
+                {analysis.workflow_status === "Done" ? "Reopen" : "Mark done"}
+              </button>
+            )}
+            {onReanalyze && (
+              <button
+                type="button"
+                onClick={onReanalyze}
+                disabled={reanalyzing}
+                className="cursor-pointer rounded-md border border-zinc-200 px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-50 disabled:cursor-default disabled:opacity-50"
+              >
+                {reanalyzing ? "Re-analyzing…" : "Re-analyze"}
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>

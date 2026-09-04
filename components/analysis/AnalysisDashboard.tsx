@@ -11,11 +11,16 @@ import {
   RANGE_PRESETS,
   RangePreset,
   resolvePresetRange,
+  resurfaceDoneWithNewActivity,
   runAnalysis,
   runBusinessAnalysis,
+  updateWorkflowStatus,
+  WORKFLOW_STATUSES,
+  WorkflowStatus,
 } from "@/lib/analysis";
 import { fetchActiveBusinessesOrFallback, WhatsappBusinessRow } from "@/lib/businesses";
 import { businessColor, setBusinessDirectory } from "@/lib/whatsapp";
+import { logAndDescribeError } from "@/lib/errors";
 import { ProfileMenu } from "@/components/auth/ProfileMenu";
 import { AnalysisDetailPanel } from "./AnalysisDetailPanel";
 import { OrdersQueue } from "./OrdersQueue";
@@ -63,9 +68,12 @@ export function AnalysisDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>("All");
   const [needsActionOnly, setNeedsActionOnly] = useState(false);
+  const [workflowFilter, setWorkflowFilter] = useState<WorkflowStatus>("Active");
+  const [newActivityIds, setNewActivityIds] = useState<Set<string>>(new Set());
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkMessage, setBulkMessage] = useState<string | null>(null);
   const [reanalyzingChatId, setReanalyzingChatId] = useState<string | null>(null);
+  const [updatingWorkflowId, setUpdatingWorkflowId] = useState<string | null>(null);
   const [detailRow, setDetailRow] = useState<ConversationAnalysis | null>(null);
 
   // Which messages get analyzed — applies to both "Analyze new/updated" and
@@ -95,8 +103,23 @@ export function AnalysisDashboard() {
     setError(null);
     try {
       const rows = await fetchAnalysesForBusiness(businessSlug);
-      setAnalyses(rows);
-      return rows;
+      // Any Done conversation with messages newer than its cached analysis
+      // moves back to Active automatically — see resurfaceDoneWithNewActivity.
+      // Non-critical: if it fails (e.g. offline), the list still loads with
+      // whatever workflow_status was already stored.
+      let effectiveRows = rows;
+      try {
+        const { updated, newActivityIds: resurfaced } = await resurfaceDoneWithNewActivity(rows);
+        if (updated.length > 0) {
+          const updatedById = new Map(updated.map((r) => [r.id, r]));
+          effectiveRows = rows.map((r) => updatedById.get(r.id) ?? r);
+        }
+        setNewActivityIds(resurfaced);
+      } catch (err) {
+        logAndDescribeError("resurfaceDoneWithNewActivity", err);
+      }
+      setAnalyses(effectiveRows);
+      return effectiveRows;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load analysis results");
       return [];
@@ -113,6 +136,8 @@ export function AnalysisDashboard() {
     if (!selectedBusinessSlug) return;
     setCategoryFilter("All");
     setNeedsActionOnly(false);
+    setWorkflowFilter("Active");
+    setNewActivityIds(new Set());
     setBulkMessage(null);
     loadAnalyses(selectedBusinessSlug);
   }, [selectedBusinessSlug, loadAnalyses]);
@@ -125,13 +150,22 @@ export function AnalysisDashboard() {
     return counts;
   }, [analyses]);
 
+  const workflowCounts = useMemo(() => {
+    const counts = new Map<WorkflowStatus, number>();
+    for (const row of analyses) {
+      counts.set(row.workflow_status, (counts.get(row.workflow_status) ?? 0) + 1);
+    }
+    return counts;
+  }, [analyses]);
+
   const filteredRows = useMemo(() => {
     return analyses.filter((row) => {
+      if (row.workflow_status !== workflowFilter) return false;
       if (categoryFilter !== "All" && row.category !== categoryFilter) return false;
       if (needsActionOnly && !row.needs_action) return false;
       return true;
     });
-  }, [analyses, categoryFilter, needsActionOnly]);
+  }, [analyses, categoryFilter, needsActionOnly, workflowFilter]);
 
   async function handleBulkRun() {
     if (!selectedBusinessSlug || !range) return;
@@ -184,6 +218,31 @@ export function AnalysisDashboard() {
       setError(err instanceof Error ? err.message : "Failed to re-analyze conversation");
     } finally {
       setReanalyzingChatId(null);
+    }
+  }
+
+  async function handleToggleWorkflow(row: ConversationAnalysis) {
+    const nextStatus: WorkflowStatus = row.workflow_status === "Done" ? "Active" : "Done";
+    setUpdatingWorkflowId(row.id);
+    setError(null);
+    // Optimistic, same pattern as handleStatusChange elsewhere in this app.
+    setAnalyses((prev) => prev.map((r) => (r.id === row.id ? { ...r, workflow_status: nextStatus } : r)));
+    setNewActivityIds((prev) => {
+      if (!prev.has(row.id)) return prev;
+      const next = new Set(prev);
+      next.delete(row.id);
+      return next;
+    });
+    if (row.chat_id === detailRow?.chat_id) {
+      setDetailRow((prev) => (prev ? { ...prev, workflow_status: nextStatus } : prev));
+    }
+    try {
+      await updateWorkflowStatus(row.id, nextStatus);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update status");
+      if (selectedBusinessSlug) loadAnalyses(selectedBusinessSlug);
+    } finally {
+      setUpdatingWorkflowId(null);
     }
   }
 
@@ -288,6 +347,22 @@ export function AnalysisDashboard() {
               {!range && <span className="text-xs text-red-600">Invalid date range.</span>}
             </div>
 
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              {WORKFLOW_STATUSES.map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setWorkflowFilter(value)}
+                  aria-pressed={workflowFilter === value}
+                  className={`cursor-pointer rounded-full px-3 py-1.5 text-sm font-medium ${
+                    workflowFilter === value ? "bg-zinc-900 text-white" : "bg-white text-zinc-600 hover:bg-zinc-100"
+                  }`}
+                >
+                  {value} ({workflowCounts.get(value) ?? 0})
+                </button>
+              ))}
+            </div>
+
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2">
                 <button
@@ -352,20 +427,21 @@ export function AnalysisDashboard() {
                     <th className="w-24 px-4 py-3 font-medium">Action</th>
                     <th className="w-20 px-4 py-3 font-medium">Confidence</th>
                     <th className="w-28 px-4 py-3 font-medium">Analyzed</th>
+                    <th className="w-28 px-4 py-3 font-medium">Status</th>
                     <th className="w-40 px-4 py-3 font-medium">Conversation</th>
                   </tr>
                 </thead>
                 <tbody>
                   {loading && (
                     <tr>
-                      <td colSpan={9} className="px-4 py-6 text-center text-sm text-zinc-500">
+                      <td colSpan={10} className="px-4 py-6 text-center text-sm text-zinc-500">
                         Loading…
                       </td>
                     </tr>
                   )}
                   {!loading && filteredRows.length === 0 && (
                     <tr>
-                      <td colSpan={9} className="px-4 py-6 text-center text-sm text-zinc-500">
+                      <td colSpan={10} className="px-4 py-6 text-center text-sm text-zinc-500">
                         {analyses.length === 0
                           ? "No conversations analyzed yet for this business — click \"Analyze new/updated\" to get started."
                           : "No conversations match this filter."}
@@ -421,6 +497,27 @@ export function AnalysisDashboard() {
                         </td>
                         <td className="px-4 py-3 text-zinc-500">{new Date(row.analyzed_at).toLocaleDateString([], { month: "short", day: "numeric" })}</td>
                         <td className="px-4 py-3">
+                          <div className="flex flex-col items-start gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleWorkflow(row)}
+                              disabled={updatingWorkflowId === row.id}
+                              className={`cursor-pointer rounded-full border px-2 py-0.5 text-xs font-medium disabled:cursor-default disabled:opacity-50 ${
+                                row.workflow_status === "Done"
+                                  ? "border-zinc-200 bg-zinc-100 text-zinc-600 hover:bg-zinc-200"
+                                  : "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                              }`}
+                            >
+                              {row.workflow_status === "Done" ? "Done — Reopen" : "Mark done"}
+                            </button>
+                            {newActivityIds.has(row.id) && (
+                              <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                                New activity
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <Link
                               href={`/?business=${encodeURIComponent(row.business_slug)}&chat=${encodeURIComponent(row.chat_id)}`}
@@ -453,6 +550,8 @@ export function AnalysisDashboard() {
           onClose={() => setDetailRow(null)}
           onReanalyze={() => handleReanalyze(detailRow.business_slug, detailRow.chat_id)}
           reanalyzing={reanalyzingChatId === detailRow.chat_id}
+          onToggleWorkflow={() => handleToggleWorkflow(detailRow)}
+          updatingWorkflow={updatingWorkflowId === detailRow.id}
         />
       )}
     </div>
