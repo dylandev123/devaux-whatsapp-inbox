@@ -10,6 +10,7 @@ import {
 import { reloadBusinesses, startSession } from "@/lib/admin/whatsappAdmin";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
 import { COLOR_PALETTE } from "@/lib/whatsapp";
+import { startVisiblePolling } from "@/lib/visiblePolling";
 
 const POLL_INTERVAL_MS = 5000;
 const COLOR_NAMES = Object.keys(COLOR_PALETTE);
@@ -66,8 +67,7 @@ export function BusinessManagementPanel() {
 
   useEffect(() => {
     loadBusinesses();
-    const interval = setInterval(loadBusinesses, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(loadBusinesses, POLL_INTERVAL_MS);
   }, [loadBusinesses]);
 
   // Seed a draft for any newly-seen row, but never clobber an in-progress edit.

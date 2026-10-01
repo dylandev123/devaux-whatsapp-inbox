@@ -35,12 +35,16 @@ import {
   UnreadCount,
 } from "@/lib/reads";
 import { logAndDescribeError } from "@/lib/errors";
+import { startVisiblePolling } from "@/lib/visiblePolling";
 import { Sidebar } from "@/components/whatsapp/Sidebar";
 import { ConversationList } from "@/components/whatsapp/ConversationList";
 import { MessageThread } from "@/components/whatsapp/MessageThread";
 import { CustomerPanel } from "@/components/customers/CustomerPanel";
 import { CustomerSearch } from "@/components/customers/CustomerSearch";
+import { ManageChats } from "@/components/whatsapp/ManageChats";
 
+// Every poller below goes through startVisiblePolling (lib/visiblePolling.ts):
+// paused while the tab is hidden, refreshed immediately on return.
 const POLL_INTERVAL_MS = 5000;
 const SELECTED_BUSINESS_STORAGE_KEY = "devaux:selectedBusinessSlug";
 
@@ -100,6 +104,7 @@ export function Inbox() {
   const [error, setError] = useState<string | null>(null);
   const [showProfile, setShowProfile] = useState(false);
   const [showCustomerSearch, setShowCustomerSearch] = useState(false);
+  const [showManageChats, setShowManageChats] = useState(false);
   const [unreadCounts, setUnreadCounts] = useState<UnreadCount[]>([]);
   const [contactDirectory, setContactDirectory] = useState<Map<string, ContactNameInfo>>(new Map());
   const [conversationStatuses, setConversationStatuses] = useState<Map<string, ConversationStatusValue>>(
@@ -254,26 +259,22 @@ export function Inbox() {
 
   useEffect(() => {
     loadBusinesses();
-    const interval = setInterval(loadBusinesses, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(loadBusinesses, POLL_INTERVAL_MS);
   }, [loadBusinesses]);
 
   useEffect(() => {
     loadSessions();
-    const interval = setInterval(loadSessions, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(loadSessions, POLL_INTERVAL_MS);
   }, [loadSessions]);
 
   useEffect(() => {
     loadUnreadCounts();
-    const interval = setInterval(loadUnreadCounts, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(loadUnreadCounts, POLL_INTERVAL_MS);
   }, [loadUnreadCounts]);
 
   useEffect(() => {
     loadContactDirectory();
-    const interval = setInterval(loadContactDirectory, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(loadContactDirectory, POLL_INTERVAL_MS);
   }, [loadContactDirectory]);
 
   useEffect(() => {
@@ -282,8 +283,7 @@ export function Inbox() {
       return;
     }
     loadConversationStatuses(selectedBusinessSlug);
-    const interval = setInterval(() => loadConversationStatuses(selectedBusinessSlug), POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(() => loadConversationStatuses(selectedBusinessSlug), POLL_INTERVAL_MS);
   }, [selectedBusinessSlug, loadConversationStatuses]);
 
   useEffect(() => {
@@ -292,8 +292,7 @@ export function Inbox() {
       return;
     }
     loadHiddenChatIds(selectedBusinessSlug);
-    const interval = setInterval(() => loadHiddenChatIds(selectedBusinessSlug), POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(() => loadHiddenChatIds(selectedBusinessSlug), POLL_INTERVAL_MS);
   }, [selectedBusinessSlug, loadHiddenChatIds]);
 
   // One-time deep-link support for links like /?business=X&chat=Y (used by
@@ -352,6 +351,7 @@ export function Inbox() {
     }
     setSearch("");
     setShowProfile(false);
+    setShowManageChats(false);
   }, [selectedBusinessSlug]);
 
   useEffect(() => {
@@ -369,8 +369,7 @@ export function Inbox() {
     }
     setMessagesLoading(true);
     loadMessages(selectedBusinessSlug).finally(() => setMessagesLoading(false));
-    const interval = setInterval(() => loadMessages(selectedBusinessSlug), POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(() => loadMessages(selectedBusinessSlug), POLL_INTERVAL_MS);
   }, [selectedBusinessSlug, loadMessages]);
 
   // Every conversation for the selected business is shown — including ones
@@ -574,6 +573,7 @@ export function Inbox() {
         statusByChatId={conversationStatuses}
         statusFilter={statusFilter}
         onStatusFilterChange={setStatusFilter}
+        onOpenManageChats={() => setShowManageChats(true)}
       />
       <MessageThread
         conversation={selectedConversation}
@@ -601,6 +601,17 @@ export function Inbox() {
           displayPhone={customerDisplayPhone}
           businessSlug={selectedBusinessSlug}
           onClose={() => setShowProfile(false)}
+        />
+      )}
+      {showManageChats && selectedBusinessSlug && (
+        <ManageChats
+          businessSlug={selectedBusinessSlug}
+          businessLabel={businessLabel(selectedBusinessSlug)}
+          loadedConversations={conversations}
+          hiddenChatIds={hiddenChatIds}
+          contactDirectory={contactDirectory}
+          onToggleHidden={handleHiddenChange}
+          onClose={() => setShowManageChats(false)}
         />
       )}
       {showCustomerSearch && (

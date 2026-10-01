@@ -10,6 +10,7 @@ import {
   fetchQr,
   restartSession,
 } from "@/lib/admin/whatsappAdmin";
+import { startVisiblePolling } from "@/lib/visiblePolling";
 import { QrPanel } from "./QrPanel";
 
 const POLL_INTERVAL_MS = 5000;
@@ -77,11 +78,10 @@ export function BusinessesAdminPanel() {
   useEffect(() => {
     loadStatus();
     loadSupabaseSessions();
-    const interval = setInterval(() => {
+    return startVisiblePolling(() => {
       loadStatus();
       loadSupabaseSessions();
     }, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
   }, [loadStatus, loadSupabaseSessions]);
 
   const rows: BusinessRow[] = useMemo(() => {
@@ -120,8 +120,7 @@ export function BusinessesAdminPanel() {
   useEffect(() => {
     if (!qrTarget || qrTargetConnected) return;
     loadQr(qrTarget);
-    const interval = setInterval(() => loadQr(qrTarget), QR_POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return startVisiblePolling(() => loadQr(qrTarget), QR_POLL_INTERVAL_MS);
   }, [qrTarget, qrTargetConnected, loadQr]);
 
   function handleOpenQr(slug: string) {

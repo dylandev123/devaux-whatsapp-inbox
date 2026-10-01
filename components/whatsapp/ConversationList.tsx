@@ -23,6 +23,7 @@ interface ConversationListProps {
   statusByChatId: Map<string, ConversationStatusValue>;
   statusFilter: InboxFilterValue;
   onStatusFilterChange: (value: InboxFilterValue) => void;
+  onOpenManageChats: () => void;
 }
 
 function formatTime(value: string) {
@@ -57,6 +58,7 @@ export function ConversationList({
   statusByChatId,
   statusFilter,
   onStatusFilterChange,
+  onOpenManageChats,
 }: ConversationListProps) {
   const color = businessColor(selectedBusinessSlug ?? "");
 
@@ -75,6 +77,16 @@ export function ConversationList({
         <h2 className="flex-1 truncate text-sm font-semibold text-zinc-900">
           {businessLabel || "Conversations"}
         </h2>
+        {hasBusiness && (
+          <button
+            type="button"
+            onClick={onOpenManageChats}
+            title="Choose which chats appear in this inbox"
+            className="flex-shrink-0 cursor-pointer rounded-md border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-600 hover:border-zinc-300 hover:text-zinc-800"
+          >
+            Manage chats
+          </button>
+        )}
         <select
           value={statusFilter}
           onChange={(e) => onStatusFilterChange(e.target.value as InboxFilterValue)}
