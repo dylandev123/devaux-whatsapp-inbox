@@ -20,6 +20,7 @@ const ADMIN_API_PREFIXES = [
   "/api/whatsapp/businesses",
   "/api/whatsapp/session",
   "/api/ai-settings",
+  "/api/scheduled-messages",
 ];
 
 export async function middleware(request: NextRequest) {
@@ -32,7 +33,9 @@ export async function middleware(request: NextRequest) {
 
   const isApi = pathname.startsWith("/api/");
   const needsAdmin =
-    pathname.startsWith("/admin") || ADMIN_API_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+    pathname.startsWith("/admin") ||
+    pathname.startsWith("/schedules") ||
+    ADMIN_API_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 
   if (!user) {
     if (isApi) {
@@ -60,8 +63,10 @@ export const config = {
     "/contacts",
     "/analysis",
     "/admin/:path*",
+    "/schedules",
     "/api/whatsapp/:path*",
     "/api/analysis/:path*",
     "/api/ai-settings/:path*",
+    "/api/scheduled-messages/:path*",
   ],
 };

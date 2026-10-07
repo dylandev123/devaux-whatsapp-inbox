@@ -60,6 +60,15 @@ export function ProfileMenu() {
                 Admin
               </Link>
             )}
+            {profile?.role === "admin" && (
+              <Link
+                href="/schedules"
+                onClick={() => setOpen(false)}
+                className="block px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+              >
+                Scheduled messages
+              </Link>
+            )}
             <button
               type="button"
               onClick={() => supabase.auth.signOut()}
