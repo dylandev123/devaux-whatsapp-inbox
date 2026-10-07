@@ -31,6 +31,7 @@ import { createClient } from "@supabase/supabase-js";
 import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
 import { resolveContactName } from "@/lib/contactName";
 import { getAiSettings } from "@/lib/server/aiSettings";
+import { fetchLatestOrder, LatestOrder, syncCustomerOrder } from "@/lib/server/customerOrders";
 import {
   ANALYSIS_CATEGORIES,
   AnalysisCategory,
@@ -128,6 +129,7 @@ interface ModelOutput {
   next_action: string | null;
   confidence: number | null;
   customer_profile: CustomerProfileFacts;
+  new_order: boolean;
 }
 
 function mediaNote(message: WhatsappMessage): string | null {
@@ -150,7 +152,8 @@ function formatTranscript(messages: WhatsappMessage[]): string {
 function formatPriorContext(
   businessSlug: string,
   priorAnalysis: { category: string; summary: string } | null,
-  priorProfile: CustomerProfileFacts | null
+  priorProfile: CustomerProfileFacts | null,
+  latestOrder: LatestOrder | null
 ): string {
   const parts: string[] = [`Business: ${businessLabel(businessSlug)}`];
 
@@ -160,6 +163,15 @@ function formatPriorContext(
     );
   } else {
     parts.push("This conversation has not been analyzed before.");
+  }
+
+  if (latestOrder) {
+    const products = latestOrder.details?.products_services?.join(", ") || "unspecified";
+    parts.push(
+      `Most recently recorded order for this conversation (order #${latestOrder.order_seq}, recorded after messages up to ${
+        latestOrder.source_last_message_at ?? latestOrder.source_message_at ?? "unknown"
+      }): ${products}. ${latestOrder.summary}`
+    );
   }
 
   const profileLines = priorProfile
@@ -196,6 +208,8 @@ Classify the conversation into exactly one of these categories:
 
 You also maintain a lightweight, ongoing memory of stable facts about this customer — preferences, the kinds of things they typically order/book, addresses they've given, how they usually pay, anything important staff should remember, and their most recent apparent intent. This is a soft, evolving summary, never verified data — carry forward facts from the background that still hold, add anything new and durable the new messages reveal, and drop anything the new messages explicitly contradict. Do not invent facts that aren't actually stated or clearly implied. Leave a field null if nothing is known for it.
 
+"new_order" is only meaningful when category is "Order placed", otherwise false. Set it true ONLY if the NEW messages place an additional order that is distinct from the "Most recently recorded order" in the background (different products, a different delivery date, or the customer explicitly saying they want another/new order). Set it false if the new messages merely confirm, clarify, pay for, adjust or chase the same order, or if no recorded order is listed. When new_order is true, "extracted" and "summary" must describe that new order only.
+
 Respond with ONLY a single JSON object and nothing else — no prose, no markdown code fences. Match this shape exactly:
 {
   "category": "<one of the exact category strings above>",
@@ -212,6 +226,7 @@ Respond with ONLY a single JSON object and nothing else — no prose, no markdow
   "needs_action": true or false,
   "next_action": "<short string staff should do next>" or null,
   "confidence": <number between 0 and 1>,
+  "new_order": true or false,
   "customer_profile": {
     "preferences": "<string>" or null,
     "common_orders": "<string>" or null,
@@ -252,6 +267,7 @@ function parseModelOutput(raw: string): ModelOutput {
     needs_action: Boolean(parsed.needs_action),
     next_action: typeof parsed.next_action === "string" ? parsed.next_action.trim() || null : null,
     confidence,
+    new_order: parsed.category === "Order placed" && parsed.new_order === true,
     customer_profile: {
       preferences: cleanProfileField(rawProfile.preferences),
       common_orders: cleanProfileField(rawProfile.common_orders),
@@ -305,7 +321,7 @@ export async function analyzeConversation(
     messages.slice().reverse().find((m) => m.business_contact_name)?.business_contact_name ?? null;
 
   const customerKey = resolveRecipientNumber(contactNumber, chatId);
-  const [{ data: customerRow }, { data: priorAnalysisRow }, { data: priorProfileRow }] = await Promise.all([
+  const [{ data: customerRow }, { data: priorAnalysisRow }, { data: priorProfileRow }, latestOrder] = await Promise.all([
     supabase
       .from("customers")
       .select("first_name, last_name, whatsapp_name, business_contact_name")
@@ -313,7 +329,7 @@ export async function analyzeConversation(
       .maybeSingle(),
     supabase
       .from("conversation_analysis")
-      .select("category, summary, order_status, workflow_status, last_message_at")
+      .select("id, category, summary, order_status, workflow_status, last_message_at")
       .eq("business_slug", businessSlug)
       .eq("chat_id", chatId)
       .maybeSingle(),
@@ -323,6 +339,11 @@ export async function analyzeConversation(
       .eq("business_slug", businessSlug)
       .eq("contact_number", customerKey)
       .maybeSingle(),
+    // Non-fatal: if customer_orders isn't migrated yet, analysis still runs.
+    fetchLatestOrder(supabase, businessSlug, chatId).catch((err) => {
+      console.error("fetchLatestOrder failed", err);
+      return null;
+    }),
   ]);
 
   const customerName = resolveContactName({
@@ -384,7 +405,8 @@ export async function analyzeConversation(
     const priorContext = formatPriorContext(
       businessSlug,
       priorAnalysisRow ?? null,
-      (priorProfileRow as CustomerProfileFacts | null) ?? null
+      (priorProfileRow as CustomerProfileFacts | null) ?? null,
+      latestOrder
     );
     const input = `${priorContext}\n\nNew messages (${range.since} to ${range.until}):\n${formatTranscript(messages)}`;
 
@@ -404,19 +426,52 @@ export async function analyzeConversation(
     }
 
     const parsed = parseModelOutput(response.output_text);
-    const { customer_profile: profile, ...analysisFields } = parsed;
+    const { customer_profile: profile, new_order: modelSaysNewOrder, ...analysisFields } = parsed;
 
     // Initialize the order workflow status the first time this conversation
     // becomes an order; otherwise leave whatever staff already set.
-    const orderStatus: OrderStatus | null =
+    let orderStatus: OrderStatus | null =
       existingOrderStatus ?? (analysisFields.category === "Order placed" ? "Needs adding" : null);
+    let resolvedWorkflowStatus = workflowStatus;
+
+    // Persist the order into the permanent history BEFORE the analysis upsert
+    // (the status-sync trigger on conversation_analysis targets the newest
+    // customer_orders row, so that row must already exist). Failure is
+    // non-fatal and logged: a missing/unmigrated table must not block
+    // analysis, and the next re-analysis of this conversation retries it.
+    if (analysisFields.category === "Order placed") {
+      try {
+        const { createdNew } = await syncCustomerOrder(supabase, {
+          businessSlug,
+          chatId,
+          contactNumber: customerKey,
+          customerName,
+          analysisId: priorAnalysisRow?.id,
+          summary: analysisFields.summary,
+          extracted: analysisFields.extracted,
+          confidence: analysisFields.confidence,
+          initialStatus: "Needs adding",
+          lastMessageAt: last.timestamp,
+          modelSaysNewOrder,
+          latest: latestOrder,
+        });
+        // A genuinely new order re-enters the Orders Queue as a fresh item
+        // instead of inheriting the previous order's Completed/Done state.
+        if (createdNew && latestOrder) {
+          orderStatus = "Needs adding";
+          resolvedWorkflowStatus = "Active";
+        }
+      } catch (orderErr) {
+        console.error("syncCustomerOrder failed", orderErr);
+      }
+    }
 
     const { error: upsertError } = await supabase.from("conversation_analysis").upsert(
       {
         ...baseRow,
         ...analysisFields,
         order_status: orderStatus,
-        workflow_status: workflowStatus,
+        workflow_status: resolvedWorkflowStatus,
         model,
         status: "ok",
         error_message: null,

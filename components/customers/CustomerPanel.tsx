@@ -26,6 +26,7 @@ import { classifyMedia, mediaPreviewLabel } from "@/lib/media";
 import { resolveContactName } from "@/lib/contactName";
 import { formatPhoneDisplay, telHref } from "@/lib/phone";
 import { CreateBookingModal } from "./CreateBookingModal";
+import { OrderHistory } from "./OrderHistory";
 
 interface CustomerPanelProps {
   phoneNumber: string;
@@ -462,6 +463,9 @@ export function CustomerPanel({ phoneNumber, isLid = false, displayPhone, busine
                 {saving ? "Saving…" : "Save"}
               </button>
             </section>
+
+            {/* Permanent order history (customer_orders) */}
+            {businessSlug && <OrderHistory businessSlug={businessSlug} contactNumber={phoneNumber} />}
 
             {/* Bookings */}
             <section className="flex flex-col gap-2">

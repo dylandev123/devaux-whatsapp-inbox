@@ -1,9 +1,11 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { WhatsappBusinessRow } from "@/lib/businesses";
 import { businessColor, businessLabel, isSessionConnected, WhatsappSession } from "@/lib/whatsapp";
 import { ProfileMenu } from "@/components/auth/ProfileMenu";
+import { fetchCurrentProfile } from "@/lib/profile";
 
 interface SidebarProps {
   businesses: WhatsappBusinessRow[];
@@ -24,6 +26,19 @@ export function Sidebar({
   unreadCounts,
   visible,
 }: SidebarProps) {
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    let active = true;
+    fetchCurrentProfile()
+      .then((p) => {
+        if (active) setIsAdmin(p?.role === "admin");
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const sessionBySlug = new Map(sessions.map((s) => [s.business_slug, s]));
 
   return (
@@ -51,6 +66,14 @@ export function Sidebar({
         >
           Contacts
         </Link>
+        {isAdmin && (
+          <Link
+            href="/admin"
+            className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-left text-sm text-zinc-500 hover:border-zinc-300 hover:text-zinc-700"
+          >
+            Admin
+          </Link>
+        )}
         <Link
           href="/analysis"
           className="w-full rounded-md border border-zinc-200 bg-white px-3 py-2 text-left text-sm text-zinc-500 hover:border-zinc-300 hover:text-zinc-700"

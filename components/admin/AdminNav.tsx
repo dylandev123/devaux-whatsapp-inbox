@@ -6,13 +6,19 @@ import { usePathname } from "next/navigation";
 const LINKS = [
   { href: "/admin/businesses", label: "Businesses" },
   { href: "/admin/ai-settings", label: "AI Settings" },
-  { href: "/schedules", label: "Schedules" },
+  { href: "/schedules", label: "Scheduled Messages" },
 ];
 
 export function AdminNav() {
   const pathname = usePathname();
   return (
-    <nav className="flex gap-2">
+    <nav className="flex flex-wrap items-center gap-2">
+      <Link
+        href="/"
+        className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100"
+      >
+        ← Back to Chats
+      </Link>
       {LINKS.map((link) => {
         const active = pathname === link.href;
         return (
