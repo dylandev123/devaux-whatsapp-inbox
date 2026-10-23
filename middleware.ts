@@ -13,6 +13,10 @@ import { createMiddlewareClient } from "@/lib/supabase/middleware";
 // available to any staff member, not just admins. /api/ai-settings is
 // admin-only — it's the only place the OpenAI key is written, and its GET
 // response (a masked preview) is still more than a non-admin should see.
+// /api/ai-agent is admin-only (AI agent settings, knowledge, escalations).
+// The bridge's own AI agent endpoints live under /api/bridge/ai-agent, which
+// is deliberately NOT in the matcher: they're called server-to-server and
+// authenticate with AI_AGENT_BRIDGE_SECRET instead of a user session.
 const ADMIN_API_PREFIXES = [
   "/api/whatsapp/status",
   "/api/whatsapp/qr",
@@ -20,6 +24,7 @@ const ADMIN_API_PREFIXES = [
   "/api/whatsapp/businesses",
   "/api/whatsapp/session",
   "/api/ai-settings",
+  "/api/ai-agent",
   "/api/scheduled-messages",
 ];
 
@@ -67,6 +72,7 @@ export const config = {
     "/api/whatsapp/:path*",
     "/api/analysis/:path*",
     "/api/ai-settings/:path*",
+    "/api/ai-agent/:path*",
     "/api/scheduled-messages/:path*",
   ],
 };
