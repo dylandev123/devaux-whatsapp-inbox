@@ -7,6 +7,7 @@
 import {
   AgentSettings,
   buildStaffNotice,
+  type PriorNotice,
   canSendToCustomers,
   EscalationPriority,
   extractRefCodes,
@@ -127,6 +128,31 @@ export async function createOrAppendEscalation(
     if (error.code !== "23505") throw new Error(error.message);
   }
   throw new Error("Could not open or append an escalation");
+}
+
+/** Every staff_notice already created for an escalation, whatever its status. */
+export async function priorStaffNotices(businessSlug: string, escalationId: string): Promise<PriorNotice[]> {
+  const { data, error } = await agentDb()
+    .from("ai_agent_outbox")
+    .select("status, error")
+    .eq("business_slug", businessSlug)
+    .eq("escalation_id", escalationId)
+    .eq("kind", "staff_notice");
+  if (error) throw new Error(error.message);
+  return (data ?? []) as PriorNotice[];
+}
+
+/** The escalation as first recorded, for a first notice sent on a later message. */
+export function originalEscalationInput(
+  escalation: EscalationRow,
+  current: Pick<EscalateInput, "customerMessage" | "draftReply" | "orderRequest" | "reasons">
+): Pick<EscalateInput, "customerMessage" | "draftReply" | "orderRequest" | "reasons"> {
+  return {
+    customerMessage: escalation.customer_message ?? current.customerMessage,
+    draftReply: escalation.proposed_reply ?? current.draftReply,
+    orderRequest: current.orderRequest ?? (escalation.context.order_request as OrderRequestDraft | null | undefined) ?? null,
+    reasons: escalation.reason_codes.length ? escalation.reason_codes : current.reasons,
+  };
 }
 
 export function staffNoticeFor(

@@ -29,6 +29,7 @@ import {
   requiredConfidence,
   resolveDecision,
   Resolution,
+  needsFirstNotice,
   staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
@@ -49,6 +50,8 @@ import { agentDb, audit, KnowledgeRow, loadActiveKnowledge, loadSettings } from 
 import {
   canSend,
   createOrAppendEscalation,
+  originalEscalationInput,
+  priorStaffNotices,
   findOpenEscalation,
   processStaffGroupMessage,
   setConversationControl,
@@ -550,21 +553,32 @@ async function handleCustomerMessage(
     // The staff notice is the only thing Observe mode may send (when its
     // staff_notices_enabled flag is on). A follow-up on an already-open
     // escalation updates the record but never posts a second notice in Observe.
-    const skip = staffNoticeSkipReason(settings, followUp);
+    // An open escalation whose notice never went out (e.g. notices were off
+    // when it opened) is still owed its first notice, in the original format.
+    const prior = followUp ? await priorStaffNotices(input.businessSlug, escalation.id) : [];
+    const skip = staffNoticeSkipReason(settings, followUp, prior);
+    const firstNotice = !followUp || needsFirstNotice(followUp, prior);
     if (!skip && settings.staff_group_jid) {
       outbox.push({
         businessSlug: input.businessSlug,
         chatId: input.chatId,
         kind: "staff_notice",
         toJid: settings.staff_group_jid,
-        body: staffNoticeFor(escalation, escalateInput, followUp, settings.mode !== "assisted"),
-        dedupeKey: `${eventId}:staff_notice`,
+        body: staffNoticeFor(
+          escalation,
+          firstNotice && followUp ? originalEscalationInput(escalation, escalateInput) : escalateInput,
+          !firstNotice,
+          settings.mode !== "assisted"
+        ),
+        // A late first notice is keyed per escalation (and attempt number) so two
+        // concurrent messages cannot both queue it.
+        dedupeKey: followUp ? `escalation:${escalation.id}:staff_notice:${prior.length}` : `${eventId}:staff_notice`,
         escalationId: escalation.id,
       });
     } else if (skip) {
       reasons.push(`staff_notice_skipped_${skip}`);
       // First notice for this escalation never went out: say why in the admin UI.
-      if (!followUp) {
+      if (firstNotice) {
         await agentDb()
           .from("ai_agent_escalations")
           .update({ context: { ...escalation.context, notice_skipped: skip } })

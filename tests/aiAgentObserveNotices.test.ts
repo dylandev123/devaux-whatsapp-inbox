@@ -14,6 +14,8 @@ import {
   canSendToCustomers,
   isCustomerBoundKind,
   matchStaffReply,
+  needsFirstNotice,
+  priorNoticeHold,
   outboxAllowed,
   staffNoticeSkipReason,
 } from "../lib/aiAgent/engine.ts";
@@ -98,8 +100,14 @@ test("Assisted mode is unchanged: every kind allowed, notices need only a group"
 
 // ── Duplicate prevention ────────────────────────────────────────────────────
 
-test("Observe: a follow-up on an open escalation never posts a second notice", () => {
+test("Observe: a follow-up with unknown notice history stays suppressed", () => {
   assert.equal(staffNoticeSkipReason(settings(), true), "notice_already_open");
+});
+
+test("Observe: a follow-up never posts a second notice once one was delivered", () => {
+  const prior = [{ status: "sent", error: null }];
+  assert.equal(staffNoticeSkipReason(settings(), true, prior), "notice_already_sent");
+  assert.equal(needsFirstNotice(true, prior), false);
 });
 
 test("Assisted keeps its follow-up notices", () => {
@@ -165,4 +173,74 @@ test("the Observe notice says nothing is sent to the customer", () => {
   assert.doesNotMatch(observe, /exact text to send the customer/);
   const assisted = buildStaffNotice(base);
   assert.match(assisted, /exact text to send the customer/);
+});
+
+// ── Regression: escalation opened while notices were off ────────────────────
+//
+// Order message escalates with staff_notices_enabled=false (no notice row at
+// all). Notices are then enabled; the next message is a follow-up on the open
+// escalation and must send the escalation's first notice.
+
+test("regression: notices enabled after an escalation opened → next message sends its first notice", () => {
+  const off = settings({ staff_notices_enabled: false });
+  assert.equal(staffNoticeSkipReason(off, false, []), "staff_notices_disabled"); // first message
+  const on = settings();
+  assert.equal(staffNoticeSkipReason(on, true, []), null);
+  assert.equal(needsFirstNotice(true, []), true);
+  // Rendered as the original escalation (same ref), not a "Follow-up".
+  const text = buildStaffNotice({
+    refCode: "AAAAA",
+    priority: "high",
+    customerLabel: "Jane",
+    reasons: ["order_request"],
+    customerMessage: "I want 2 bags",
+    draftReply: null,
+    orderRequest: null,
+    followUp: !needsFirstNotice(true, []),
+    observeOnly: true,
+  });
+  assert.match(text, /AI escalation #AAAAA/);
+  assert.doesNotMatch(text, /Follow-up/);
+  assert.match(text, /nothing is sent to the customer/);
+});
+
+test("regression: that first notice goes only to the staff group, never the customer", () => {
+  const on = settings();
+  assert.equal(outboxAllowed(on, { kind: "staff_notice", toJid: GROUP }), true);
+  assert.equal(outboxAllowed(on, { kind: "staff_notice", toJid: CUSTOMER }), false);
+  assert.equal(outboxAllowed(on, { kind: "holding_reply", toJid: CUSTOMER }), false);
+  assert.equal(outboxAllowed(on, { kind: "customer_reply", toJid: CUSTOMER }), false);
+});
+
+test("once that notice is pending or in flight, the next message does not queue another", () => {
+  for (const status of ["pending", "dispatched"]) {
+    assert.equal(staffNoticeSkipReason(settings(), true, [{ status, error: null }]), "notice_in_flight", status);
+  }
+});
+
+test("provably-unsent prior notices may be re-sent; ambiguous or unknown ones never", () => {
+  const ok = ["staff_notices_disabled", "observe_mode", "bridge_send_disabled", "agent_disabled", "not_sent: socket closed"];
+  for (const error of ok) {
+    assert.equal(priorNoticeHold([{ status: "failed", error }]), null, error);
+  }
+  const held = ["held_after_unknown_send", "session_disconnected", "something_new: ???", ""];
+  for (const error of held) {
+    assert.equal(priorNoticeHold([{ status: "failed", error }]), "notice_send_unconfirmed", error);
+  }
+  assert.equal(priorNoticeHold([{ status: "failed", error: null }]), "notice_send_unconfirmed");
+  assert.equal(priorNoticeHold([{ status: "mystery", error: null }]), "notice_send_unconfirmed");
+  // A delivered notice wins over any earlier blocked one.
+  assert.equal(
+    priorNoticeHold([{ status: "failed", error: "observe_mode" }, { status: "sent", error: null }]),
+    "notice_already_sent"
+  );
+});
+
+test("a failed-then-blocked notice does not stop the first notice after notices are enabled", () => {
+  const prior = [{ status: "failed", error: "staff_notices_disabled" }];
+  assert.equal(staffNoticeSkipReason(settings(), true, prior), null);
+});
+
+test("Assisted follow-ups are unchanged", () => {
+  assert.equal(staffNoticeSkipReason(settings({ mode: "assisted" }), true, [{ status: "sent", error: null }]), null);
 });

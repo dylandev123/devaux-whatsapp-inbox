@@ -1,4 +1,4 @@
-// The AI agent's decision rules — pure functions, no I/O, no imports, so the
+// The AI agent's decision rules — pure functions, no I/O (only the pure outboxStatus helpers), so the
 // whole policy is unit-testable (tests/aiAgentEngine.test.ts) and identical in
 // the live path, the test console and the bridge contract. The server
 // orchestrator (lib/server/aiAgent/decide.ts) loads data, calls the model, and
@@ -9,6 +9,8 @@
 // exceptions, order approval, prompt injection, unverified facts, unsafe
 // commitments) always escalate. The autonomy slider only moves the confidence
 // bar for otherwise-clean REPLY/ASK proposals — it can never bypass them.
+
+import { BLOCK_REASONS, failureReason } from "./outboxStatus.ts";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -163,12 +165,61 @@ export function outboxAllowed(settings: AgentSettings | null, item: { kind: stri
   return item.kind === "staff_notice" && canSendStaffNotice(settings) && item.toJid === settings.staff_group_jid;
 }
 
-/** Why an escalation's notice was not sent, or null when it should be. */
-export function staffNoticeSkipReason(settings: AgentSettings | null, followUp: boolean): string | null {
+/** A staff_notice outbox row already created for an escalation (any status). */
+export interface PriorNotice {
+  status: string;
+  error: string | null;
+}
+
+/** Failure codes that mean "nothing reached WhatsApp" and no ambiguity remains. */
+function provablyNotSent(n: PriorNotice): boolean {
+  if (n.status !== "failed") return false;
+  const code = failureReason(n.error);
+  if (!code) return false;
+  // held_after_unknown_send is a block, but it follows an ambiguous send.
+  if (code === "held_after_unknown_send") return false;
+  return code === "not_sent" || BLOCK_REASONS.has(code);
+}
+
+/**
+ * Why a follow-up on an open escalation must not post another notice, or null
+ * when no notice was ever delivered or could still be delivered. Anything
+ * pending, in flight, delivered, unresolved, or failed without proof it was
+ * not sent holds the escalation: a possibly-delivered message is never retried.
+ */
+export function priorNoticeHold(prior: PriorNotice[]): string | null {
+  if (prior.some((n) => n.status === "sent")) return "notice_already_sent";
+  if (prior.some((n) => n.status === "pending" || n.status === "dispatched")) return "notice_in_flight";
+  if (prior.some((n) => !provablyNotSent(n))) return "notice_send_unconfirmed";
+  return null;
+}
+
+/**
+ * True when the escalation still needs its FIRST notice: it is not a brand-new
+ * escalation but no notice has gone out, nor can one still go out.
+ */
+export function needsFirstNotice(followUp: boolean, prior: PriorNotice[] | undefined): boolean {
+  return followUp && prior !== undefined && priorNoticeHold(prior) === null;
+}
+
+/**
+ * Why an escalation's notice was not sent, or null when it should be.
+ * `prior` is the escalation's existing staff_notice rows; omitting it on a
+ * follow-up is treated as "unknown" and suppresses the Observe notice.
+ */
+export function staffNoticeSkipReason(
+  settings: AgentSettings | null,
+  followUp: boolean,
+  prior?: PriorNotice[]
+): string | null {
   if (!settings?.staff_group_jid) return "no_staff_group";
   if (!canSendStaffNotice(settings)) return "staff_notices_disabled";
-  // Observe mode posts one notice per escalation; later messages only update the record.
-  if (followUp && settings.mode !== "assisted") return "notice_already_open";
+  // Observe posts one notice per escalation, but an open escalation whose
+  // notice never went out (e.g. notices were off) still gets its first one.
+  if (followUp && settings.mode !== "assisted") {
+    if (prior === undefined) return "notice_already_open";
+    return priorNoticeHold(prior);
+  }
   return null;
 }
 
