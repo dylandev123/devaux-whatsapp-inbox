@@ -30,6 +30,13 @@ import {
 } from "@/lib/aiAgent/engine";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
 import {
+  ChatIdentity,
+  combineRules,
+  isLidJid,
+  resolveChatIdentity,
+  verifiedPhoneDigits,
+} from "@/lib/aiAgent/identity";
+import {
   latestManualStaffMessageAt,
   loadCustomerContext,
   loadOpenOrderRequest,
@@ -102,6 +109,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   // an echoed staff notice must never be read as a staff answer, and an echoed
   // AI reply must never look like a human taking over.
   if ((isStaffGroup || input.fromMe) && (await isAgentEcho(input.businessSlug, input.chatId, input.whatsappMessageId, input.text))) {
+    await recordIgnored(input, isStaffGroup ? "staff_group" : "staff_outbound", "agent_echo", settings);
     return ignored("agent_echo");
   }
   const kind = isStaffGroup ? "staff_group" : input.fromMe ? "staff_outbound" : "customer_inbound";
@@ -168,6 +176,26 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
     // Fail closed: nothing is sent; the event row records what went wrong.
     return { eventId, status: "error", decision: null, reasons: ["internal_error"], outbox: [] };
   }
+}
+
+// An enabled business's message that was dropped before a decision: leave an
+// 'ignored' event so Activity shows it arrived and why nothing happened.
+// Best effort; disabled/unknown businesses are still never written.
+async function recordIgnored(input: BridgeMessageInput, kind: string, reason: string, settings: AgentSettings): Promise<void> {
+  const { error } = await agentDb().from("ai_agent_events").insert({
+    business_slug: input.businessSlug,
+    chat_id: input.chatId,
+    whatsapp_message_id: input.whatsappMessageId,
+    kind: "ignored",
+    status: "done",
+    message_excerpt: input.text.slice(0, 500) || null,
+    decision: "NO_REPLY",
+    reason_codes: [reason, `source_${kind}`],
+    mode: settings.mode,
+    autonomy: settings.autonomy,
+    finished_at: new Date().toISOString(),
+  });
+  if (error && error.code !== "23505") console.error("[aiAgent] recordIgnored", error.message);
 }
 
 interface Outcome {
@@ -264,15 +292,46 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
   return { decision: "HUMAN", reasons: ["staff_message"], outbox: [] };
 }
 
-async function loadGateData(businessSlug: string, chatId: string, settings: AgentSettings | null) {
+// Every JID that provably belongs to this contact (see lib/aiAgent/identity.ts):
+// the incoming chat_id, its verified phone JID and any @lid chats WhatsApp
+// reported the same phone for. Stored history is best-effort (messages are
+// purged after 7 days); a failed lookup just leaves the chat_id on its own,
+// which can only narrow, never widen, who is allowed.
+async function loadIdentity(businessSlug: string, chatId: string, contactNumber: string | null): Promise<ChatIdentity> {
   const db = agentDb();
-  const [rule, conversation, staffActiveAt] = await Promise.all([
-    db
-      .from("ai_agent_contact_rules")
-      .select("rule")
+  let storedPhone: string | null = null;
+  if (isLidJid(chatId) && !verifiedPhoneDigits(chatId, contactNumber)) {
+    const { data } = await db
+      .from("whatsapp_messages")
+      .select("contact_number")
       .eq("business_slug", businessSlug)
       .eq("chat_id", chatId)
-      .maybeSingle(),
+      .not("contact_number", "is", null)
+      .order("timestamp", { ascending: false })
+      .limit(50);
+    storedPhone =
+      (data ?? []).map((r) => verifiedPhoneDigits(chatId, r.contact_number)).find((p): p is string => Boolean(p)) ?? null;
+  }
+  const phone = verifiedPhoneDigits(chatId, contactNumber) ?? storedPhone;
+  let lidChats: string[] = [];
+  if (phone) {
+    const { data } = await db
+      .from("whatsapp_messages")
+      .select("chat_id")
+      .eq("business_slug", businessSlug)
+      .eq("contact_number", phone)
+      .like("chat_id", "%@lid")
+      .limit(200);
+    lidChats = [...new Set((data ?? []).map((r) => r.chat_id as string))];
+  }
+  return resolveChatIdentity(chatId, contactNumber, { storedPhone, lidChats });
+}
+
+async function loadGateData(businessSlug: string, chatId: string, contactNumber: string | null, settings: AgentSettings | null) {
+  const db = agentDb();
+  const identity = await loadIdentity(businessSlug, chatId, contactNumber);
+  const [rules, conversation, staffActiveAt] = await Promise.all([
+    db.from("ai_agent_contact_rules").select("chat_id, rule").eq("business_slug", businessSlug).in("chat_id", identity.chatIds),
     db
       .from("ai_agent_conversations")
       .select("control, human_until")
@@ -281,8 +340,13 @@ async function loadGateData(businessSlug: string, chatId: string, settings: Agen
       .maybeSingle(),
     latestManualStaffMessageAt(businessSlug, chatId, settings?.auto_takeover_minutes ?? 0),
   ]);
+  const matched = (rules.data ?? []) as { chat_id: string; rule: ContactRule }[];
+  const contactRule = combineRules(matched);
   return {
-    contactRule: (rule.data?.rule as ContactRule | undefined) ?? null,
+    contactRule,
+    unresolvedLid: identity.unresolvedLid,
+    // Rule found only under another identity of the same contact (phone <-> @lid).
+    matchedViaAlias: contactRule !== null && !matched.some((r) => r.chat_id === chatId && r.rule === contactRule),
     conversation: (conversation.data as ConversationControl | null) ?? null,
     staffActiveAt,
   };
@@ -303,6 +367,8 @@ async function autoRepliesLastHour(businessSlug: string, chatId: string): Promis
 
 interface Pipeline {
   gate: GateResult;
+  /** Diagnostic reason codes about how the contact was identified. */
+  identityNotes: string[];
   safeguards: string[];
   resolution: Resolution | null;
   proposal: ModelProposal | null;
@@ -330,9 +396,9 @@ async function runPipeline(args: {
   forceGatePass: boolean;
 }): Promise<Pipeline> {
   const { businessSlug, chatId, settings } = args;
-  const gateData = chatId
-    ? await loadGateData(businessSlug, chatId, settings)
-    : { contactRule: null, conversation: null, staffActiveAt: null };
+  const { matchedViaAlias, ...gateData } = chatId
+    ? await loadGateData(businessSlug, chatId, args.contactNumber, settings)
+    : { contactRule: null, unresolvedLid: false, matchedViaAlias: false, conversation: null, staffActiveAt: null };
   const gate = evaluateGate({
     businessSlug,
     chatId: chatId ?? "test-console@s.whatsapp.net",
@@ -346,6 +412,7 @@ async function runPipeline(args: {
 
   const empty: Pipeline = {
     gate,
+    identityNotes: matchedViaAlias ? ["contact_matched_via_linked_identity"] : [],
     safeguards: [],
     resolution: null,
     proposal: null,
@@ -397,6 +464,7 @@ async function runPipeline(args: {
 
   return {
     gate,
+    identityNotes: empty.identityNotes,
     safeguards,
     resolution,
     proposal: modelResult.proposal,
@@ -431,7 +499,7 @@ async function handleCustomerMessage(
   }
 
   const r = p.resolution;
-  const reasons = p.gate.pass ? r!.reasons : p.gate.reasons;
+  const reasons = [...(p.gate.pass ? r!.reasons : p.gate.reasons), ...p.identityNotes];
   const decision: AgentDecision = p.gate.pass ? r!.decision : "ESCALATE";
   const common = {
     confidence: r?.confidence ?? null,

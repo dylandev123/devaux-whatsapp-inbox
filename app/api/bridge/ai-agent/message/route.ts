@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { jsonError, readJson, verifyBridgeSecret } from "@/lib/server/aiAgent/auth";
+import { audit, parseBusinessSlug } from "@/lib/server/aiAgent/db";
 import { processBridgeMessage } from "@/lib/server/aiAgent/decide";
 
 // Bridge → app (server-to-server). Contract: docs/ai-agent-bridge-contract.md.
@@ -55,6 +56,15 @@ export async function POST(request: Request) {
     return NextResponse.json(result);
   } catch (err) {
     console.error("[bridge/ai-agent/message]", err);
+    // Failures before an event row exists would otherwise leave Activity empty.
+    // Ids and the error text only: no message body, no credentials.
+    const slug = parseBusinessSlug(businessSlug);
+    if (slug) {
+      await audit(slug, "bridge", null, "bridge.message_failed", { type: "message", id: whatsappMessageId }, {
+        chat_id: chatId,
+        error: (err instanceof Error ? err.message : "Unknown error").slice(0, 300),
+      }).catch(() => {});
+    }
     // Fail closed — the bridge sends nothing on a non-2xx.
     return jsonError("AI agent failed to process the message", 500);
   }

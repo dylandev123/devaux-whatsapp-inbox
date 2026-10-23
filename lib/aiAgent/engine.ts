@@ -137,6 +137,8 @@ export interface GateInput {
   hasMedia: boolean;
   settings: AgentSettings | null;
   contactRule: ContactRule | null;
+  /** An @lid chat with no verified phone number (see lib/aiAgent/identity.ts); diagnostic only, never grants access. */
+  unresolvedLid?: boolean;
   conversation: ConversationControl | null;
   /** Newest manual (non-agent) staff message in this chat, if any. */
   staffActiveAt: string | null;
@@ -163,7 +165,9 @@ export function evaluateGate(input: GateInput): GateResult {
   if (input.contactRule === "exclude") return stop("NO_REPLY", "contact_excluded");
   if (settings.contact_scope === "none") return stop("NO_REPLY", "contact_not_permitted");
   if (settings.contact_scope === "selected" && input.contactRule !== "allow") {
-    return stop("NO_REPLY", "contact_not_permitted");
+    return input.unresolvedLid
+      ? { pass: false, decision: "NO_REPLY", reasons: ["contact_not_permitted", "unresolved_lid_identity"] }
+      : stop("NO_REPLY", "contact_not_permitted");
   }
 
   if (isHumanControlActive(input.conversation, input.now)) return stop("HUMAN", "human_takeover");

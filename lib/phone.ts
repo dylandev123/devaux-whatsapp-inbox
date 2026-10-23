@@ -53,6 +53,12 @@ export function resolveDisplayPhone(
   chatId: string | null | undefined
 ): DisplayPhoneResult {
   const cleanedContact = contactNumber?.trim() || null;
+  // The bridge stores the @lid's own digits as contact_number when WhatsApp
+  // reported no phone; that is not a phone number.
+  const lidDigits = parseWhatsappJid(chatId);
+  const isLidEcho =
+    lidDigits.kind === "lid" && Boolean(cleanedContact) && cleanedContact!.replace(/[^0-9]/g, "") === lidDigits.digits;
+  if (isLidEcho) return { phone: null, isLid: true };
   if (cleanedContact && !cleanedContact.includes("@")) {
     return { phone: cleanedContact, isLid: false };
   }

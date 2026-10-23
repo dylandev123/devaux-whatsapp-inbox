@@ -1,9 +1,25 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { aiAgentApi, AuditView, EventView, OutboxView } from "@/lib/aiAgent/client";
+import { ActivityDiagnostics, aiAgentApi, AuditView, EventView, OutboxView } from "@/lib/aiAgent/client";
 import { failureReason, OutboxState, outboxState, UNRESOLVED_AFTER_MS } from "@/lib/aiAgent/outboxStatus";
 import { Badge, Card, formatWhen, Notice } from "@/components/admin/aiAgent/ui";
+
+// Plain-language meaning of the gate/diagnostic reason codes shown under each decision.
+const REASON_HELP: Record<string, string> = {
+  contact_not_permitted: "Contact not allowed (not on the allowed list)",
+  contact_excluded: "Contact is excluded",
+  unresolved_lid_identity: "Unresolved @lid identity: WhatsApp gave no phone number, so only a rule on this exact @lid ID can match",
+  contact_matched_via_linked_identity: "Allowed via the contact's other verified ID (phone ↔ @lid)",
+  agent_echo: "Skipped: the agent's own message echoed back",
+  business_mismatch: "Business mismatch",
+  agent_disabled: "Agent is switched off for this business",
+  human_takeover: "A human has taken over this chat",
+  staff_recently_active: "Skipped: staff replied recently",
+  group_chat: "Skipped: group chat",
+  outbound_message: "Skipped: message sent by the business",
+  internal_error: "Processing failed",
+};
 
 const STATE_ORDER: OutboxState[] = ["unresolved", "failed", "pending", "dispatched", "blocked", "sent"];
 
@@ -12,6 +28,7 @@ export function ActivityPanel({ businessSlug }: { businessSlug: string }) {
   const [outbox, setOutbox] = useState<OutboxView[]>([]);
   const [loadedAt, setLoadedAt] = useState(() => new Date());
   const [auditRows, setAuditRows] = useState<AuditView[]>([]);
+  const [diag, setDiag] = useState<ActivityDiagnostics | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -21,6 +38,7 @@ export function ActivityPanel({ businessSlug }: { businessSlug: string }) {
       setOutbox(data.outbox);
       setLoadedAt(new Date());
       setAuditRows(data.audit);
+      setDiag(data.diagnostics ?? null);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load activity");
@@ -37,6 +55,7 @@ export function ActivityPanel({ businessSlug }: { businessSlug: string }) {
 
   return (
     <div className="flex flex-col gap-6">
+      {diag && <DiagnosticsCard diag={diag} />}
       <Card title="Outbox" subtitle="Every message the agent asked the bridge to send (newest first). Nothing here is ever retried automatically.">
         <button type="button" onClick={load} className="mb-2 cursor-pointer text-xs text-zinc-500 hover:text-zinc-900">
           Refresh
@@ -114,7 +133,9 @@ export function ActivityPanel({ businessSlug }: { businessSlug: string }) {
                 </div>
                 {e.message_excerpt && <p className="mt-1 truncate text-zinc-700">“{e.message_excerpt}”</p>}
                 {e.proposed_reply && <p className="mt-0.5 truncate text-xs text-zinc-500">↳ {e.proposed_reply}</p>}
-                <p className="mt-0.5 text-xs text-zinc-400">{e.reason_codes.join(", ")}</p>
+                <p className="mt-0.5 text-xs text-zinc-400">
+                  {e.reason_codes.map((c) => (REASON_HELP[c] ? `${REASON_HELP[c]} (${c})` : c)).join(" · ")}
+                </p>
                 {e.error && <p className="mt-0.5 text-xs text-red-600">{e.error}</p>}
               </li>
             ))}
@@ -134,6 +155,9 @@ export function ActivityPanel({ businessSlug }: { businessSlug: string }) {
                   by {a.actor_kind}
                   {a.target_id && ` · ${a.target_type} ${a.target_id}`}
                 </span>
+                {a.action === "bridge.message_failed" && typeof a.details?.error === "string" && (
+                  <span className="text-xs text-red-600">{a.details.error}</span>
+                )}
               </li>
             ))}
           </ul>
@@ -141,5 +165,54 @@ export function ActivityPanel({ businessSlug }: { businessSlug: string }) {
       </Card>
       {error && <Notice tone="error">{error}</Notice>}
     </div>
+  );
+}
+
+// Where a test message would stop. Flags and counts only; no secrets or message bodies.
+function DiagnosticsCard({ diag }: { diag: ActivityDiagnostics }) {
+  const lines: { tone: "ok" | "warn" | "error"; text: string }[] = [
+    diag.bridgeSecretConfigured
+      ? { tone: "ok", text: "App: bridge secret is configured" }
+      : { tone: "error", text: "App: AI_AGENT_BRIDGE_SECRET is not set, so every bridge call is rejected (503)" },
+    diag.enabled
+      ? { tone: "ok", text: `Agent ON · ${diag.mode} mode · contacts: ${diag.contactScope}` }
+      : { tone: "warn", text: "Agent is OFF for this business: messages are ignored and nothing is recorded" },
+    diag.eventsLast24h > 0
+      ? { tone: "ok", text: `${diag.eventsLast24h} message(s) reached the agent in the last 24h (latest ${formatWhen(diag.lastEventAt)})` }
+      : { tone: "warn", text: "No message has reached the agent in the last 24h. If you sent a test, the bridge did not forward it: check AGENT_ENABLED, AI_AGENT_URL and AI_AGENT_BRIDGE_SECRET on the bridge, and its '[agent]' log lines." },
+  ];
+  if (diag.bridgeFailuresLast24h > 0) {
+    lines.push({ tone: "error", text: `${diag.bridgeFailuresLast24h} message(s) failed inside the app in the last 24h; see the audit trail below for the error.` });
+  }
+  if (diag.enabled && diag.contactScope === "selected" && !diag.contacts.some((c) => c.rule === "allow")) {
+    lines.push({ tone: "warn", text: "Contacts is 'selected' but nobody is allowed yet." });
+  }
+  return (
+    <Card title="Diagnostics" subtitle="Where a message would stop. Contains no credentials.">
+      <div className="flex flex-col gap-1.5">
+        {lines.map((l) => (
+          <Notice key={l.text} tone={l.tone}>
+            {l.text}
+          </Notice>
+        ))}
+        {diag.contacts.length > 0 && (
+          <ul className="mt-1 divide-y divide-zinc-100 rounded-md border border-zinc-200 text-sm">
+            {diag.contacts.map((c) => (
+              <li key={c.chatId} className="flex flex-wrap items-center gap-2 px-3 py-1.5">
+                <Badge value={c.rule === "allow" ? "allowed" : "excluded"} />
+                <span className="text-zinc-800">{c.name || (c.phone && !c.isLid ? `+${c.phone}` : c.chatId)}</span>
+                <span className="text-xs text-zinc-400">
+                  {c.isLid
+                    ? c.phone
+                      ? `@lid ID · verified phone +${c.phone}`
+                      : "@lid ID · phone number unresolved (matches only this exact @lid)"
+                    : "phone ID"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </Card>
   );
 }

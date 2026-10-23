@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { groupLabel, matchesChatSearch, normalizeContactInput, sortByRecent } from "@/lib/aiAgent/chatDirectory";
+import { chatPhoneDigits, groupLabel, matchesChatSearch, normalizeContactInput, sortByRecent } from "@/lib/aiAgent/chatDirectory";
+import { combineRules, phoneJidFor } from "@/lib/aiAgent/identity";
 import { jsonError, requireAdmin } from "@/lib/server/aiAgent/auth";
 import { loadBusinessChats } from "@/lib/server/aiAgent/chats";
 import { agentDb, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
@@ -58,10 +59,16 @@ export async function GET(request: Request) {
     const results = matched.slice(0, LIMIT).map((c) => ({
       chatId: c.chatId,
       name: c.name,
-      number: c.chatId.endsWith("@lid") ? c.number : c.number ?? c.chatId.split("@")[0],
+      // chatPhoneDigits never returns an @lid's own digits as a phone number.
+      number: chatPhoneDigits(c) || null,
       isLid: c.chatId.toLowerCase().endsWith("@lid"),
       lastMessageAt: c.lastMessageAt,
-      rule: ruleByChat.get(c.chatId) ?? null,
+      // An @lid chat is also covered by a rule on its verified phone JID (same logic as the live gate).
+      rule: combineRules(
+        [c.chatId, chatPhoneDigits(c) ? phoneJidFor(chatPhoneDigits(c)) : ""]
+          .map((id) => ({ chat_id: id, rule: ruleByChat.get(id) }))
+          .filter((r): r is { chat_id: string; rule: "allow" | "exclude" } => Boolean(r.rule))
+      ),
     }));
 
     // A typed number that isn't in the results can be added manually.

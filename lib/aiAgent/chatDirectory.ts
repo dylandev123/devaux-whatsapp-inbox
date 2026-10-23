@@ -76,7 +76,9 @@ export function normalizeGroupJid(raw: string): string | null {
 /** Real dialable digits for a chat (never the opaque @lid digits). */
 export function chatPhoneDigits(chat: Pick<DirectoryChat, "chatId" | "number">): string {
   const fromNumber = digitsOf(chat.number);
-  if (fromNumber) return fromNumber;
+  // The bridge falls back to the @lid's own digits when WhatsApp gave no phone.
+  const lid = chat.chatId.match(LID_JID);
+  if (fromNumber && !(lid && lid[1] === fromNumber)) return fromNumber;
   const phone = chat.chatId.match(PHONE_JID);
   return phone ? phone[1] : "";
 }
@@ -134,7 +136,7 @@ export function aliasChatIds(digits: string, knownChats: DirectoryChat[]): strin
   const ids = new Set<string>([`${digits}@s.whatsapp.net`]);
   for (const c of knownChats) {
     if (c.chatId.endsWith("@g.us")) continue;
-    if (digitsOf(c.number) === digits) ids.add(c.chatId);
+    if (digitsOf(c.number) === digits && chatPhoneDigits(c) === digits) ids.add(c.chatId);
   }
   return [...ids];
 }

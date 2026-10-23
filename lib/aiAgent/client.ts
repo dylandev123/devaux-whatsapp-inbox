@@ -156,7 +156,20 @@ export interface AuditView {
   action: string;
   target_type: string | null;
   target_id: string | null;
+  details?: Record<string, unknown> | null;
   created_at: string;
+}
+
+export interface ActivityDiagnostics {
+  bridgeSecretConfigured: boolean;
+  enabled: boolean;
+  mode: string | null;
+  contactScope: string | null;
+  staffGroupConfigured: boolean;
+  eventsLast24h: number;
+  lastEventAt: string | null;
+  bridgeFailuresLast24h: number;
+  contacts: { chatId: string; name: string | null; rule: "allow" | "exclude"; isLid: boolean; phone: string | null }[];
 }
 
 export interface LearningCandidate {
@@ -256,7 +269,7 @@ export const aiAgentApi = {
     api<{ ok: true }>("/api/ai-agent/conversations", send("POST", { businessSlug: b, chatId, action, minutes })),
 
   listActivity: (b: string) =>
-    api<{ events: EventView[]; outbox: OutboxView[]; audit: AuditView[] }>(`/api/ai-agent/activity${q(b)}`),
+    api<{ events: EventView[]; outbox: OutboxView[]; audit: AuditView[]; diagnostics: ActivityDiagnostics }>(`/api/ai-agent/activity${q(b)}`),
 
   listLearning: (b: string) => api<{ candidates: LearningCandidate[] }>(`/api/ai-agent/learning${q(b)}`),
   reviewLearning: (
