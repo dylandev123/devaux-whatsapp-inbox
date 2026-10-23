@@ -18,6 +18,16 @@ import {
   priorityFor,
   StaffCommand,
 } from "@/lib/aiAgent/engine";
+import { type CustomerMode } from "@/lib/aiAgent/customerMode";
+import {
+  contextFromSnapshot,
+  diffSnapshots,
+  nextSnapshot,
+  ORDER_CHANGE_KINDS,
+  type RequestSnapshot,
+  snapshotFromContext,
+  EMPTY_SNAPSHOT,
+} from "@/lib/aiAgent/escalationUpdates";
 import { ActorKind, agentDb, audit, newRefCode } from "@/lib/server/aiAgent/db";
 import { loadIdentity } from "@/lib/server/aiAgent/identity";
 import { recordResolvedIssue } from "@/lib/server/aiAgent/memory";
@@ -46,10 +56,18 @@ export interface EscalationRow {
   resolved_at: string | null;
   created_at: string;
   updated_at: string;
+  /** How many staff notices (first notice + updates) were queued for this escalation. */
+  notified_seq: number;
+  /** The request exactly as the latest notice showed it: the baseline for "what changed". */
+  notified_snapshot: unknown;
+  last_notified_at: string | null;
 }
 
 export const ESCALATION_COLUMNS =
-  "id, ref_code, business_slug, chat_id, contact_number, customer_name, priority, status, reason, reason_codes, customer_message, ai_summary, proposed_reply, context, notice_message_id, staff_answer, answered_by, answered_via, answered_at, resolved_at, created_at, updated_at";
+  "id, ref_code, business_slug, chat_id, contact_number, customer_name, priority, status, reason, reason_codes, customer_message, ai_summary, proposed_reply, context, notice_message_id, staff_answer, answered_by, answered_via, answered_at, resolved_at, created_at, updated_at, notified_seq, notified_snapshot, last_notified_at";
+
+/** A staff-answered escalation still counts as "the same issue" for an order change this long after the answer. */
+export const REOPEN_WINDOW_MS = 24 * 60 * 60_000;
 
 /** Customer-facing sends (and staff-group feedback) need Assisted mode — necessary, not sufficient: see planCustomerSend(). */
 export function canSend(settings: AgentSettings | null): boolean {
@@ -63,6 +81,33 @@ export async function findOpenEscalation(businessSlug: string, chatId: string): 
     .eq("business_slug", businessSlug)
     .eq("chat_id", chatId)
     .in("status", ["open", "notified"])
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as EscalationRow | null) ?? null;
+}
+
+export async function loadEscalation(businessSlug: string, id: string): Promise<EscalationRow | null> {
+  const { data, error } = await agentDb()
+    .from("ai_agent_escalations")
+    .select(ESCALATION_COLUMNS)
+    .eq("business_slug", businessSlug)
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as EscalationRow | null) ?? null;
+}
+
+/** The chat's most recent escalation staff answered (but did not close) within the reopen window. */
+export async function findRecentAnsweredEscalation(businessSlug: string, chatId: string, now: Date = new Date()): Promise<EscalationRow | null> {
+  const { data, error } = await agentDb()
+    .from("ai_agent_escalations")
+    .select(ESCALATION_COLUMNS)
+    .eq("business_slug", businessSlug)
+    .eq("chat_id", chatId)
+    .eq("status", "answered")
+    .gte("answered_at", new Date(now.getTime() - REOPEN_WINDOW_MS).toISOString())
+    .order("answered_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) throw new Error(error.message);
   return (data as EscalationRow | null) ?? null;
@@ -83,48 +128,106 @@ export interface EscalateInput {
   /** Verified-history lines (lib/aiAgent/memory.ts) kept on the escalation for the staff notice. */
   history?: string[];
   eventId: string | null;
+  /** The turn's individual customer messages (a batch is several); defaults to customerMessage as one. */
+  segments?: string[];
+}
+
+export interface EscalationWrite {
+  escalation: EscalationRow;
+  /** The turn joined an existing escalation (open, or a recently answered one that was reopened). */
+  followUp: boolean;
+  /** The picture of the request before this turn, and after it. */
+  previous: RequestSnapshot;
+  current: RequestSnapshot;
+  /** An escalation staff had already answered was reopened because the customer changed the order. */
+  reopened: boolean;
 }
 
 const MAX_RECORDED_UPDATES = 20;
+// Each lost race (another turn wrote the escalation first) costs one more read-merge-write round.
+const MAX_WRITE_ATTEMPTS = 8;
 
-/** Opens an escalation, or appends to the conversation's open one. */
-export async function createOrAppendEscalation(
-  input: EscalateInput
-): Promise<{ escalation: EscalationRow; followUp: boolean }> {
+function turnFacts(input: EscalateInput) {
+  return {
+    segments: input.segments ?? [input.customerMessage],
+    orderRequest: input.orderRequest,
+    cancellation: input.reasons.includes("cancellation"),
+    modelIntent: input.intent ?? null,
+  };
+}
+
+/**
+ * Opens an escalation, or appends to the conversation's open one. When the chat has none open but staff
+ * answered one recently and the customer now CHANGES that order (adds, removes, re-quantifies, relocates,
+ * cancels), the answered escalation is reopened instead — staff see the change against the same reference.
+ * Anything else (a new question, a new subject) opens a new escalation.
+ */
+export async function createOrAppendEscalation(input: EscalateInput): Promise<EscalationWrite> {
   const db = agentDb();
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt += 1) {
     const existing = await findOpenEscalation(input.businessSlug, input.chatId);
-    if (existing) {
-      const reasonCodes = Array.from(new Set([...existing.reason_codes, ...input.reasons]));
-      const customerMessage = appendCustomerMessage(existing.customer_message, input.customerMessage);
+    const answered = existing ? null : await findRecentAnsweredEscalation(input.businessSlug, input.chatId);
+    const anchorPrev = answered ? snapshotFromContext(answered.context) : null;
+    const anchorNext = anchorPrev ? nextSnapshot(anchorPrev, turnFacts(input)) : null;
+    const reopen =
+      answered && anchorPrev && anchorNext && diffSnapshots(anchorPrev, anchorNext).some((c) => ORDER_CHANGE_KINDS.includes(c.kind))
+        ? answered
+        : null;
+    const target = existing ?? reopen;
+    if (target) {
+      const previous = snapshotFromContext(target.context);
+      const current = nextSnapshot(previous, turnFacts(input));
+      const reasonCodes = Array.from(new Set([...target.reason_codes, ...input.reasons]));
+      const customerMessage = appendCustomerMessage(target.customer_message, input.customerMessage);
       // Every follow-up that adds something new is logged on the escalation, so
       // an update is never lost even when no second notice is posted (Observe).
       // A re-processed batch adds nothing new and is not logged twice.
-      const updates = Array.isArray(existing.context.updates) ? (existing.context.updates as unknown[]) : [];
-      const isNew = customerMessage !== existing.customer_message;
+      const updates = Array.isArray(target.context.updates) ? (target.context.updates as unknown[]) : [];
+      const isNew = customerMessage !== target.customer_message;
       const nextUpdates = isNew
         ? [...updates, { at: new Date().toISOString(), text: input.customerMessage.slice(0, 300) }].slice(-MAX_RECORDED_UPDATES)
         : updates;
+      const snapshotContext = contextFromSnapshot(current);
+      let priority = priorityFor(reasonCodes, target.priority);
+      // A withdrawal after staff already acted needs eyes soon.
+      if (current.cancelled && !previous.cancelled && target.answered_at && priority === "normal") priority = "high";
       const { data, error } = await db
         .from("ai_agent_escalations")
         .update({
           customer_message: customerMessage,
           reason_codes: reasonCodes,
-          priority: priorityFor(reasonCodes, existing.priority),
+          priority,
+          // Back to "waiting for staff": a reopened escalation is unanswered again.
+          ...(reopen ? { status: reopen.notice_message_id ? "notified" : "open" } : {}),
           context: {
-            ...existing.context,
-            order_request: input.orderRequest ?? existing.context.order_request ?? null,
-            intent: input.intent ?? existing.context.intent ?? null,
-            history: input.history?.length ? input.history : existing.context.history ?? [],
+            ...target.context,
+            ...snapshotContext,
+            order_request: snapshotContext.order_request ?? input.orderRequest ?? target.context.order_request ?? null,
+            intent: input.intent ?? target.context.intent ?? null,
+            history: input.history?.length ? input.history : target.context.history ?? [],
             updates: nextUpdates,
+            ...(reopen ? { reopened_at: new Date().toISOString() } : {}),
           },
         })
-        .eq("id", existing.id)
+        .eq("id", target.id)
+        // Optimistic concurrency: the merge above was computed from this exact version of the row. If
+        // anything wrote it since (another customer turn, a notice ack, a staff action) nothing is
+        // updated and the loop re-reads — a concurrent turn's questions and messages are never overwritten.
+        .eq("updated_at", target.updated_at)
         .select(ESCALATION_COLUMNS)
-        .single();
-      if (error) throw new Error(error.message);
-      return { escalation: data as EscalationRow, followUp: true };
+        .maybeSingle();
+      if (error) {
+        // 23505: another open escalation appeared while reopening this one — loop and join it instead.
+        if (reopen && error.code === "23505") continue;
+        throw new Error(error.message);
+      }
+      // Lost a race (resolved or answered concurrently): decide again from the new state.
+      if (!data) continue;
+      return { escalation: data as EscalationRow, followUp: true, previous, current, reopened: Boolean(reopen) };
     }
+
+    const current = nextSnapshot(EMPTY_SNAPSHOT, turnFacts(input));
+    const snapshotContext = contextFromSnapshot(current);
 
     const { data, error } = await db
       .from("ai_agent_escalations")
@@ -140,17 +243,60 @@ export async function createOrAppendEscalation(
         customer_message: input.customerMessage.slice(0, 4000),
         ai_summary: input.summary,
         proposed_reply: input.draftReply,
-        context: { order_request: input.orderRequest, intent: input.intent ?? null, history: input.history ?? [] },
+        context: {
+          ...snapshotContext,
+          order_request: snapshotContext.order_request ?? input.orderRequest,
+          intent: input.intent ?? null,
+          history: input.history ?? [],
+        },
         source_event_id: input.eventId,
       })
       .select(ESCALATION_COLUMNS)
       .single();
-    if (!error) return { escalation: data as EscalationRow, followUp: false };
+    if (!error) return { escalation: data as EscalationRow, followUp: false, previous: EMPTY_SNAPSHOT, current, reopened: false };
     // 23505 on ai_agent_escalations_one_open_idx: a concurrent message opened
     // one first — loop once and append to it instead.
     if (error.code !== "23505") throw new Error(error.message);
   }
   throw new Error("Could not open or append an escalation");
+}
+
+export type NoticePost =
+  | { outcome: "queued"; outboxId: string; seq: number }
+  | { outcome: "stale" | "duplicate" | "closed"; outboxId: null; seq: number | null };
+
+/**
+ * Queues ONE staff notice for an escalation and records what it showed, atomically
+ * (post_ai_agent_escalation_notice). `expectedSeq` is the escalation's notified_seq as read: if another
+ * worker posted in between the result is "stale" and nothing is written. The dedupe key is derived from
+ * the sequence number, so a redelivered batch can never post the same notice twice.
+ */
+export async function postEscalationNotice(input: {
+  escalation: EscalationRow;
+  snapshot: RequestSnapshot;
+  toJid: string;
+  body: string;
+  eventId: string | null;
+  dispatchNow: boolean;
+}): Promise<NoticePost> {
+  const e = input.escalation;
+  const { data, error } = await agentDb().rpc("post_ai_agent_escalation_notice", {
+    p_business_slug: e.business_slug,
+    p_escalation_id: e.id,
+    p_expected_seq: e.notified_seq,
+    p_snapshot: input.snapshot,
+    p_chat_id: e.chat_id,
+    p_to_jid: input.toJid,
+    p_body: input.body,
+    p_dedupe_key: `escalation:${e.id}:notice:${e.notified_seq + 1}`,
+    p_event_id: input.eventId,
+    p_status: input.dispatchNow ? "dispatched" : "pending",
+  });
+  if (error) throw new Error(error.message);
+  const row = (Array.isArray(data) ? data[0] : data) as { outbox_id: string | null; seq: number | null; outcome: string } | undefined;
+  if (!row) throw new Error("post_ai_agent_escalation_notice returned nothing");
+  if (row.outcome === "queued" && row.outbox_id) return { outcome: "queued", outboxId: row.outbox_id, seq: Number(row.seq) };
+  return { outcome: row.outcome as "stale" | "duplicate" | "closed", outboxId: null, seq: row.seq === null ? null : Number(row.seq) };
 }
 
 /** Every staff_notice already created for an escalation, whatever its status. */
@@ -234,6 +380,32 @@ export async function setConversationControl(input: {
     type: "conversation",
     id: input.chatId,
   }, { reason: input.reason, human_until: humanUntil });
+}
+
+/** Sets one customer's handling mode; null returns them to the business default. Never touches takeover state. */
+export async function setCustomerMode(input: {
+  businessSlug: string;
+  chatId: string;
+  mode: CustomerMode | null;
+  actorKind: ActorKind;
+  actorId: string | null;
+}): Promise<void> {
+  const { error } = await agentDb()
+    .from("ai_agent_conversations")
+    .upsert(
+      {
+        business_slug: input.businessSlug,
+        chat_id: input.chatId,
+        customer_mode: input.mode,
+        customer_mode_changed_by: input.actorKind === "admin" ? input.actorId : null,
+        customer_mode_changed_at: new Date().toISOString(),
+      },
+      { onConflict: "business_slug,chat_id" }
+    );
+  if (error) throw new Error(error.message);
+  await audit(input.businessSlug, input.actorKind, input.actorId, "conversation.customer_mode", { type: "conversation", id: input.chatId }, {
+    mode: input.mode ?? "default",
+  });
 }
 
 // ── Resolved issues → long-term memory ───────────────────────────────────────

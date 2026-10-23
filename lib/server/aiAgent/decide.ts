@@ -28,9 +28,21 @@ import {
   requiredConfidence,
   resolveDecision,
   Resolution,
-  needsFirstNotice,
+  priorNoticeHold,
   staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
+import { type CustomerMode, customerModeAllowsKind, effectiveCustomerMode, modeAdjustedDecision } from "@/lib/aiAgent/customerMode";
+import {
+  buildStaffUpdate,
+  diffSnapshots,
+  groundOrderDraft,
+  isCancellation,
+  isTrivialTurn,
+  isUrgentChange,
+  parseSnapshot,
+  type RequestSnapshot,
+  snapshotFromContext,
+} from "@/lib/aiAgent/escalationUpdates";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
 import {
   BATCHED_DECISION,
@@ -64,9 +76,15 @@ import { saveCustomerFacts } from "@/lib/server/aiAgent/memory";
 import {
   canSend,
   createOrAppendEscalation,
-  originalEscalationInput,
-  priorStaffNotices,
+  type EscalateInput,
+  type EscalationRow,
+  type EscalationWrite,
   findOpenEscalation,
+  findRecentAnsweredEscalation,
+  loadEscalation,
+  originalEscalationInput,
+  postEscalationNotice,
+  priorStaffNotices,
   setConversationControl,
   staffNoticeFor,
 } from "@/lib/server/aiAgent/escalations";
@@ -77,7 +95,9 @@ import {
   enqueue,
   isAgentEcho,
   OutboxInsert,
+  type OutboxRow,
   outboxForEvent,
+  outboxRowById,
   toBridgeItem,
 } from "@/lib/server/aiAgent/outbox";
 
@@ -185,6 +205,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
           contactNumber: input.contactNumber,
           settings,
           dedupeBase: eventId,
+          dispatchNow: true,
         }
       );
     }
@@ -194,10 +215,14 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
     // customer-bound item, even if a handler regresses.
     const allowed = outcome.outbox.filter((o) => outboxAllowed(settings, o));
     if (allowed.length !== outcome.outbox.length) outcome.reasons = [...outcome.reasons, "outbox_blocked_by_mode"];
-    const rows = await enqueue(
-      allowed.map((o) => ({ ...o, eventId })),
-      true
-    );
+    const rows = [
+      ...(await enqueue(
+        allowed.map((o) => ({ ...o, eventId })),
+        true
+      )),
+      // Staff notices posted by handleCustomerTurn through post_ai_agent_escalation_notice are already 'dispatched'.
+      ...(outcome.queued ?? []),
+    ];
     await finishEvent(eventId, startedAt, outcome);
     // A message waiting in a batch has no decision yet: the batch's worker
     // decides it, and the response is "nothing to send" (no bridge change).
@@ -272,6 +297,8 @@ interface Outcome {
   error?: string | null;
   /** The message was queued into this batch; a worker decides it later. */
   batched?: { batchId: string };
+  /** Outbox rows already created inside the turn (staff notices), returned to the bridge as they are. */
+  queued?: OutboxRow[];
 }
 
 async function claimEvent(
@@ -388,6 +415,10 @@ interface Pipeline {
   memory: MemoryBrief | null;
   openOrder: OpenOrderRequest | null;
   hasOpenEscalation: boolean;
+  /** This customer's effective handling mode (their own setting, else the business default). */
+  customerMode: CustomerMode;
+  /** Every message of the turn is a thank-you / hello / ok: nothing for staff or the AI to act on. */
+  trivialTurn: boolean;
 }
 
 /**
@@ -403,6 +434,8 @@ async function runPipeline(args: {
   contactNumber: string | null;
   text: string;
   transcript?: string;
+  /** The turn's individual customer messages (defaults to `text` as one). */
+  segments?: string[];
   hasMedia: boolean;
   /** The turn's own messages: left out of the "recent conversation" slice. */
   excludeMessageIds: string[];
@@ -423,6 +456,8 @@ async function runPipeline(args: {
     ...gateData,
     now: new Date(),
   });
+  const customerMode = effectiveCustomerMode(settings, gateData.conversation);
+  const trivialTurn = !args.hasMedia && isTrivialTurn(args.segments ?? [args.text]);
 
   const empty: Pipeline = {
     gate,
@@ -439,6 +474,8 @@ async function runPipeline(args: {
     memory: null,
     openOrder: null,
     hasOpenEscalation: false,
+    customerMode,
+    trivialTurn,
   };
   if (!gate.pass && !args.forceGatePass) return empty;
   if (!args.text.trim()) return empty;
@@ -454,6 +491,10 @@ async function runPipeline(args: {
   ]);
 
   const safeguards = detectSafeguards(args.text);
+  // The request the customer is building: the collected order request, else what the escalation they
+  // are following up on already holds (so the model returns a CUMULATIVE request, not a fragment).
+  const anchor = openEscalation ?? (chatId ? await findRecentAnsweredEscalation(businessSlug, chatId) : null);
+  const anchorOrder = (anchor?.context.order_request ?? null) as OrderRequestDraft | null;
   const priorOrder: OrderRequestDraft | null = openOrder
     ? {
         items: openOrder.items ?? [],
@@ -461,16 +502,18 @@ async function runPipeline(args: {
         delivery_preference: openOrder.delivery_preference,
         notes: openOrder.notes,
       }
-    : null;
+    : anchorOrder && anchorOrder.items
+      ? { ...anchorOrder }
+      : null;
 
   // "Same as last time" is resolved from VERIFIED orders (lib/aiAgent/memory.ts).
   // When the answer is a question or a hand-off the model has nothing to add.
   const repeat = context?.memory.repeat;
   const repeatDecided = repeat?.kind === "ambiguous" || repeat?.kind === "no_history" || repeat?.kind === "unclear";
 
-  // Injection attempts never reach the model; an open escalation means staff
-  // own the conversation, so there is nothing for the model to draft.
-  const skipModel = safeguards.includes("prompt_injection") || Boolean(openEscalation) || repeatDecided;
+  // Injection attempts and thank-yous never reach the model. With an open escalation staff own the
+  // conversation: the model still runs, but only to extract what the customer added or changed.
+  const skipModel = safeguards.includes("prompt_injection") || trivialTurn || repeatDecided;
   const modelResult = skipModel
     ? { proposal: null, model: null, error: null }
     : await proposeReply({
@@ -479,12 +522,21 @@ async function runPipeline(args: {
         knowledge,
         context,
         pendingOrder: priorOrder,
+        openEscalation: Boolean(openEscalation),
       });
+
+  // The model may only restate what the customer actually wrote: ungrounded products, quantities,
+  // addresses and times are dropped before anything is merged, stored or shown to staff.
+  let proposal = modelResult.proposal;
+  if (proposal?.order_request) {
+    const customerWords = [args.text, ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? [])];
+    proposal = { ...proposal, order_request: groundOrderDraft(proposal.order_request, priorOrder, customerWords) };
+  }
 
   const resolution = resolveDecision({
     autonomy: settings?.autonomy ?? 0,
     safeguardCodes: safeguards,
-    proposal: modelResult.proposal,
+    proposal,
     activeKnowledge: knowledge.map((k) => ({ id: k.id, content: k.content })),
     priorOrderRequest: priorOrder,
     autoRepliesLastHour: recentReplies,
@@ -499,7 +551,7 @@ async function runPipeline(args: {
     identity,
     safeguards,
     resolution,
-    proposal: modelResult.proposal,
+    proposal,
     model: modelResult.model,
     modelError: modelResult.error,
     knowledge,
@@ -508,6 +560,8 @@ async function runPipeline(args: {
     memory: context?.memory ?? null,
     openOrder,
     hasOpenEscalation: Boolean(openEscalation),
+    customerMode,
+    trivialTurn,
   };
 }
 
@@ -518,6 +572,8 @@ interface TurnContext {
   settings: AgentSettings;
   /** Prefix of every outbox dedupe key: the event id (single message) or `batch:<id>` (batched turn). */
   dedupeBase: string;
+  /** The live path hands notices to the bridge in its own response; the batch worker leaves them 'pending'. */
+  dispatchNow: boolean;
 }
 
 /**
@@ -533,20 +589,34 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
     contactNumber: ctx.contactNumber,
     text: turn.text,
     transcript: turn.transcript,
+    segments: turn.segments,
     hasMedia: turn.hasMedia,
     excludeMessageIds: turn.whatsappMessageIds,
     settings,
     forceGatePass: false,
   });
-  const sendable = canSend(settings);
+  // Autonomous customer messages need BOTH the business (enabled + Assisted) and this customer (Auto-Reply).
+  const sendable = canSend(settings) && p.customerMode === "auto_reply";
 
   if (!p.gate.pass && p.gate.decision !== "ESCALATE") {
     return { decision: p.gate.decision, reasons: p.gate.reasons, outbox: [] };
   }
 
+  // "thanks", "ok", "hello": no staff update, no new escalation, and nothing sent while staff own the issue.
+  if (p.gate.pass && p.trivialTurn && (p.hasOpenEscalation || p.customerMode !== "auto_reply")) {
+    return { decision: "NO_REPLY", reasons: ["trivial_acknowledgement"], outbox: [] };
+  }
+
   const r = p.resolution;
   const reasons = [...(p.gate.pass ? r!.reasons : p.gate.reasons), ...p.identityNotes];
-  const decision: AgentDecision = p.gate.pass ? r!.decision : "ESCALATE";
+  const engineDecision: AgentDecision = p.gate.pass ? r!.decision : "ESCALATE";
+  // The customer's mode decides what the engine's decision becomes: Staff First turns a reply the AI
+  // would have sent into an escalation carrying it as a draft; Manual Only does nothing.
+  const adjusted = p.gate.pass
+    ? modeAdjustedDecision(p.customerMode, engineDecision as "REPLY" | "ASK" | "ESCALATE", {
+        noActionNeeded: p.proposal?.intent === "smalltalk" && p.safeguards.length === 0 && !r!.orderRequest,
+      })
+    : "ESCALATE";
   const common = {
     confidence: r?.confidence ?? null,
     proposedReply: r?.reply ?? r?.draftReply ?? null,
@@ -554,6 +624,11 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
     knowledgeIds: p.proposal?.knowledge_ids.filter((id) => p.knowledge.some((k) => k.id === id)) ?? [],
     error: p.modelError,
   };
+  if (adjusted === "NO_REPLY") {
+    return { ...common, decision: "NO_REPLY", reasons: [...reasons, `customer_mode_${p.customerMode}`, "no_staff_action_needed"], outbox: [] };
+  }
+  const decision: AgentDecision = adjusted;
+  if (decision === "ESCALATE" && engineDecision !== "ESCALATE") reasons.push("staff_first");
 
   // Long-term memory: only what the customer explicitly said, in their own
   // words (validated against the turn), and only when the admin enabled capture.
@@ -590,7 +665,7 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
 
   if (decision === "ESCALATE") {
     const customerMessage = turn.segments.join(CUSTOMER_MESSAGE_SEPARATOR) || "(media message without text)";
-    const escalateInput = {
+    const escalateInput: EscalateInput = {
       businessSlug,
       chatId,
       contactNumber: ctx.contactNumber,
@@ -598,14 +673,17 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
       reasons,
       priority: r?.priority ?? priorityFor(reasons),
       customerMessage,
-      draftReply: r?.draftReply ?? null,
+      segments: turn.segments,
+      // A reply the AI wanted to send (Staff First) is what staff see as the draft.
+      draftReply: (engineDecision !== "ESCALATE" ? r?.reply : null) ?? r?.draftReply ?? null,
       summary: p.proposal?.summary ?? null,
       intent: p.proposal?.intent ?? null,
       orderRequest: r?.orderRequest ?? null,
       history: p.history,
       eventId,
     };
-    const { escalation, followUp } = await createOrAppendEscalation(escalateInput);
+    const write = await createOrAppendEscalation(escalateInput);
+    const { escalation, followUp } = write;
     if (orderRequestId && r?.orderComplete) {
       await agentDb()
         .from("ai_agent_order_requests")
@@ -613,36 +691,20 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
         .eq("id", orderRequestId);
     }
 
+    if (write.reopened) reasons.push("escalation_reopened");
     const outbox: OutboxInsert[] = [];
-    // The staff notice is the only thing Observe mode may send (when its
-    // staff_notices_enabled flag is on). A follow-up on an already-open
-    // escalation updates the record but never posts a second notice in Observe.
-    // An open escalation whose notice never went out (e.g. notices were off
-    // when it opened) is still owed its first notice, in the original format.
-    const prior = followUp ? await priorStaffNotices(businessSlug, escalation.id) : [];
-    const skip = staffNoticeSkipReason(settings, followUp, prior);
-    const firstNotice = !followUp || needsFirstNotice(followUp, prior);
+    const queued: OutboxRow[] = [];
+    // Staff hear about it through ONE path for every case — a brand-new escalation, an open one whose
+    // notice never went out, and a change the customer made later (see notifyStaff).
+    const skip = staffNoticeSkipReason(settings);
     if (!skip && settings.staff_group_jid) {
-      outbox.push({
-        businessSlug,
-        chatId,
-        kind: "staff_notice",
-        toJid: settings.staff_group_jid,
-        body: staffNoticeFor(
-          escalation,
-          firstNotice && followUp ? originalEscalationInput(escalation, escalateInput) : escalateInput,
-          !firstNotice,
-          settings.mode !== "assisted"
-        ),
-        // A late first notice is keyed per escalation (and attempt number) so two
-        // concurrent messages cannot both queue it.
-        dedupeKey: followUp ? `escalation:${escalation.id}:staff_notice:${prior.length}` : `${ctx.dedupeBase}:staff_notice`,
-        escalationId: escalation.id,
-      });
+      const posted = await notifyStaff({ ctx, turn, write, escalateInput, eventId });
+      reasons.push(...posted.reasons);
+      if (posted.row) queued.push(posted.row);
     } else if (skip) {
       reasons.push(`staff_notice_skipped_${skip}`);
       // First notice for this escalation never went out: say why in the admin UI.
-      if (firstNotice) {
+      if (!followUp || priorNoticeHold(await priorStaffNotices(businessSlug, escalation.id)) === null) {
         await agentDb()
           .from("ai_agent_escalations")
           .update({ context: { ...escalation.context, notice_skipped: skip } })
@@ -665,7 +727,7 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
       type: "escalation",
       id: escalation.id,
     }, { ref_code: escalation.ref_code, reasons, messages: turn.messages.length });
-    return { ...common, decision, reasons, outbox, escalationId: escalation.id };
+    return { ...common, decision, reasons, outbox: outbox.filter((o) => customerModeAllowsKind(p.customerMode, o.kind)), queued, escalationId: escalation.id };
   }
 
   // REPLY / ASK
@@ -682,7 +744,86 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
           },
         ]
       : [];
-  return { ...common, decision, reasons, outbox };
+  return { ...common, decision, reasons, outbox: outbox.filter((o) => customerModeAllowsKind(p.customerMode, o.kind)) };
+}
+
+/**
+ * Tells the staff group about an escalation — the ONE place a staff notice is composed and queued.
+ *
+ *  - Nothing delivered, in flight or possibly delivered yet (a brand-new escalation, or an open one
+ *    whose first notice never went out / provably failed): post the FIRST notice, complete.
+ *  - Otherwise: post an UPDATE only when the customer's request changed since the last notice staff
+ *    were sent (diffSnapshots). Thank-yous, repeats and duplicates change nothing and post nothing.
+ *
+ * The notice and the "what staff have seen" snapshot are written together under a row lock
+ * (post_ai_agent_escalation_notice), so concurrent workers, redelivered batches and restarts can neither
+ * post twice nor drop a change; a lost race simply re-reads and decides again.
+ */
+async function notifyStaff(args: {
+  ctx: TurnContext;
+  turn: CustomerTurn;
+  write: EscalationWrite;
+  escalateInput: EscalateInput;
+  eventId: string | null;
+}): Promise<{ reasons: string[]; row: OutboxRow | null }> {
+  const { ctx, write, escalateInput } = args;
+  const { settings, businessSlug } = ctx;
+  const group = settings.staff_group_jid;
+  if (!group) return { reasons: ["staff_notice_skipped_no_staff_group"], row: null };
+  const observeOnly = settings.mode !== "assisted";
+
+  let escalation: EscalationRow = write.escalation;
+  let current: RequestSnapshot = write.current;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const prior = write.followUp || attempt > 0 ? await priorStaffNotices(businessSlug, escalation.id) : [];
+    const first = priorNoticeHold(prior) === null;
+
+    let body: string;
+    let urgent = false;
+    if (first) {
+      body = staffNoticeFor(escalation, write.followUp ? originalEscalationInput(escalation, escalateInput) : escalateInput, false, observeOnly);
+    } else {
+      const baseline = parseSnapshot(escalation.notified_snapshot) ?? write.previous;
+      const changes = diffSnapshots(baseline, current);
+      if (changes.length === 0) return { reasons: ["staff_update_not_material"], row: null };
+      urgent = isUrgentChange(changes);
+      body = buildStaffUpdate({
+        refCode: escalation.ref_code,
+        priority: escalation.priority,
+        customerLabel: [escalation.customer_name, escalation.contact_number].filter(Boolean).join(" · ") || escalation.chat_id,
+        current,
+        changes,
+        afterStaffReply: Boolean(escalation.answered_at),
+        observeOnly,
+      });
+    }
+
+    // Same last line of defence as every other item: only what the business's mode permits.
+    if (!outboxAllowed(settings, { kind: "staff_notice", toJid: group })) return { reasons: ["outbox_blocked_by_mode"], row: null };
+
+    const posted = await postEscalationNotice({
+      escalation,
+      snapshot: current,
+      toJid: group,
+      body,
+      eventId: args.eventId,
+      dispatchNow: ctx.dispatchNow,
+    });
+    if (posted.outcome === "queued") {
+      return {
+        reasons: [first ? "staff_notice_queued" : "staff_update_queued", ...(urgent ? ["staff_update_urgent"] : [])],
+        row: await outboxRowById(posted.outboxId),
+      };
+    }
+    if (posted.outcome === "duplicate") return { reasons: ["staff_notice_duplicate"], row: null };
+    if (posted.outcome === "closed") return { reasons: ["staff_notice_skipped_escalation_closed"], row: null };
+    // Stale: another worker posted first. Re-read what staff have now been told and decide again.
+    const fresh = await loadEscalation(businessSlug, escalation.id);
+    if (!fresh) return { reasons: ["staff_notice_skipped_escalation_closed"], row: null };
+    escalation = fresh;
+    current = snapshotFromContext(fresh.context);
+  }
+  return { reasons: ["staff_notice_contended"], row: null };
 }
 
 // ── Batching ─────────────────────────────────────────────────────────────────
@@ -717,7 +858,25 @@ async function handleBatchedCustomerMessage(input: BridgeMessageInput, settings:
     hasMedia: input.hasMedia,
     messageAt: input.timestamp,
   });
-  return { decision: "NO_REPLY", reasons: [BATCHED_REASON], outbox: [], batched: { batchId: queued.batchId } };
+  const reasons = [BATCHED_REASON];
+  // A cancellation must not wait out the quiet period when staff are already working on this customer:
+  // the batch becomes due now (the next sweep or cron run picks it up). Only the deadline moves — the
+  // message is processed by the same worker, in the same order, as any other.
+  if (isCancellation(input.text) && !queued.duplicate && (await staffAreWorkingOn(input.businessSlug, input.chatId))) {
+    const { error } = await agentDb()
+      .from("ai_agent_batches")
+      .update({ due_at: new Date().toISOString() })
+      .eq("id", queued.batchId)
+      .eq("status", "collecting");
+    if (error) console.error("[aiAgent] expedite batch", error.message);
+    else reasons.push("batch_expedited_cancellation");
+  }
+  return { decision: "NO_REPLY", reasons, outbox: [], batched: { batchId: queued.batchId } };
+}
+
+/** An open escalation, or one staff answered recently, exists for this chat. */
+async function staffAreWorkingOn(businessSlug: string, chatId: string): Promise<boolean> {
+  return Boolean((await findOpenEscalation(businessSlug, chatId)) ?? (await findRecentAnsweredEscalation(businessSlug, chatId)));
 }
 
 const RETRY_BACKOFF_SECONDS = 30;
@@ -778,6 +937,7 @@ async function processClaimedBatch(batch: BatchRow, worker: string): Promise<"do
       contactNumber: batch.contact_number,
       settings,
       dedupeBase: `batch:${batch.id}`,
+      dispatchNow: false,
     });
 
     // Same last line of defence as the live path: only kinds the business's
@@ -901,6 +1061,8 @@ export interface SimulationResult {
   wouldNotifyStaff: boolean;
   modelError: string | null;
   mode: string | null;
+  /** The customer's effective handling mode (their own, else the business default). */
+  customerMode: CustomerMode;
 }
 
 export async function simulateMessage(input: {
@@ -934,8 +1096,16 @@ export async function simulateMessage(input: {
   });
   const r = p.resolution;
   const live = p.gate.pass;
-  const decision: AgentDecision = r?.decision ?? (p.gate.pass ? "NO_REPLY" : p.gate.decision);
-  const sendable = canSend(settings);
+  const engineDecision: AgentDecision = r?.decision ?? (p.gate.pass ? "NO_REPLY" : p.gate.decision);
+  // Same adjustment as the live path: Staff First never sends, it hands the draft to staff.
+  const adjusted =
+    r && (engineDecision === "REPLY" || engineDecision === "ASK" || engineDecision === "ESCALATE")
+      ? modeAdjustedDecision(p.customerMode, engineDecision, {
+          noActionNeeded: p.proposal?.intent === "smalltalk" && p.safeguards.length === 0 && !r.orderRequest,
+        })
+      : engineDecision;
+  const decision: AgentDecision = adjusted;
+  const sendable = canSend(settings) && p.customerMode === "auto_reply";
 
   return {
     gate: p.gate.pass
@@ -957,5 +1127,6 @@ export async function simulateMessage(input: {
     wouldNotifyStaff: live && decision === "ESCALATE" && !p.hasOpenEscalation && canSendStaffNotice(settings),
     modelError: p.modelError,
     mode: settings?.mode ?? null,
+    customerMode: p.customerMode,
   };
 }

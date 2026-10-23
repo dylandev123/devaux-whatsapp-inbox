@@ -3,6 +3,7 @@
 // Supabase directly or decides anything (decisions live server-side in
 // lib/server/aiAgent/decide.ts + lib/aiAgent/engine.ts).
 
+import type { CustomerMode } from "@/lib/aiAgent/customerMode";
 import type { OutboxState, OutboxStatus } from "@/lib/aiAgent/outboxStatus";
 import type {
   AgentDecision,
@@ -41,6 +42,8 @@ export interface SettingsPatch {
   customerMemoryEnabled?: boolean;
   /** Phone numbers (or exact …@lid ids) allowed to send customer replies from the staff group. */
   staffAuthorizedSenders?: string[];
+  /** Handling mode of every customer without their own setting. */
+  defaultCustomerMode?: CustomerMode;
 }
 
 export interface ContactSearchResult {
@@ -117,7 +120,14 @@ export interface EscalationView {
     history?: string[];
     /** Customer messages added after the escalation opened (kept even when no second notice is posted). */
     updates?: { at: string; text: string }[];
+    /** What the customer asked, verbatim, and whether they withdrew the request. */
+    questions?: string[];
+    cancelled?: boolean;
+    /** Set when staff had already answered and the customer then changed the order. */
+    reopened_at?: string;
   };
+  /** How many staff notices (first notice + updates) were queued. */
+  notified_seq?: number;
   staff_answer: string | null;
   answered_via: string | null;
   answered_at: string | null;
@@ -174,6 +184,20 @@ export interface ConversationView {
   control_changed_at: string | null;
   last_decision: AgentDecision | null;
   last_event_at: string | null;
+  /** The customer's own handling mode; null = the business default. */
+  customer_mode: CustomerMode | null;
+}
+
+/** One customer's AI state, for the Inbox conversation view. */
+export interface CustomerAiState {
+  agentEnabled: boolean;
+  agentMode: AgentSettings["mode"];
+  customerMode: CustomerMode;
+  ownMode: CustomerMode | null;
+  defaultMode: CustomerMode;
+  control: "ai" | "human";
+  humanUntil: string | null;
+  openEscalation: { refCode: string; priority: EscalationPriority } | null;
 }
 
 export interface EventView {
@@ -328,6 +352,7 @@ export interface SimulationView {
   wouldNotifyStaff: boolean;
   modelError: string | null;
   mode: string | null;
+  customerMode?: CustomerMode;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -389,6 +414,11 @@ export const aiAgentApi = {
   listConversations: (b: string) => api<{ conversations: ConversationView[] }>(`/api/ai-agent/conversations${q(b)}`),
   setControl: (b: string, chatId: string, action: "takeover" | "resume", minutes?: number) =>
     api<{ ok: true }>("/api/ai-agent/conversations", send("POST", { businessSlug: b, chatId, action, minutes })),
+  getCustomerState: (b: string, chatId: string) =>
+    api<CustomerAiState>(`/api/ai-agent/conversations${q(b, `&chatId=${encodeURIComponent(chatId)}`)}`),
+  /** `mode: null` returns the customer to the business default. */
+  setCustomerMode: (b: string, chatId: string, mode: CustomerMode | null) =>
+    api<{ ok: true }>("/api/ai-agent/conversations", send("POST", { businessSlug: b, chatId, action: "set_mode", mode })),
 
   listActivity: (b: string) =>
     api<{ events: EventView[]; outbox: OutboxView[]; audit: AuditView[]; diagnostics: ActivityDiagnostics }>(`/api/ai-agent/activity${q(b)}`),

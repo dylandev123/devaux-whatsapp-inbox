@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { aiAgentApi, SettingsPatch, SettingsResponse } from "@/lib/aiAgent/client";
 import { requiredConfidence } from "@/lib/aiAgent/engine";
+import { CUSTOMER_MODE_HINT, CUSTOMER_MODE_LABEL, CUSTOMER_MODES, effectiveCustomerMode } from "@/lib/aiAgent/customerMode";
 import { StaffGroupPicker, StaffGroupValue } from "@/components/admin/aiAgent/StaffGroupPicker";
 import { Card, inputClass, Notice, primaryButton } from "@/components/admin/aiAgent/ui";
 
@@ -28,6 +29,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
   const [quiet, setQuiet] = useState(s.batch_quiet_seconds);
   const [maxWait, setMaxWait] = useState(s.batch_max_wait_seconds);
   const [memoryCapture, setMemoryCapture] = useState(s.customer_memory_enabled);
+  const [defaultCustomerMode, setDefaultCustomerMode] = useState(effectiveCustomerMode(s, null));
   const [senders, setSenders] = useState((s.staff_authorized_senders ?? []).join("\n"));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,6 +69,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
       batchQuietSeconds: quiet,
       batchMaxWaitSeconds: maxWait,
       customerMemoryEnabled: memoryCapture,
+      defaultCustomerMode,
       staffAuthorizedSenders: senders.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
     });
   }
@@ -120,6 +123,36 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
               </button>
             ))}
           </div>
+        </div>
+
+        <div className="rounded-md border border-zinc-200 p-3">
+          <label className="mb-1 block text-sm font-medium text-zinc-900">Default AI handling for customers</label>
+          <p className="mb-2 text-xs text-zinc-500">
+            Applies to every customer who has no mode of their own. Set a single customer&apos;s mode from their conversation in the Inbox.
+            It only narrows the settings above: Observe mode, contact scope, human takeover and the OFF switch always win.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {CUSTOMER_MODES.map((m) => (
+              <button
+                key={m}
+                type="button"
+                title={CUSTOMER_MODE_HINT[m]}
+                onClick={() => {
+                  if (m === "auto_reply" && defaultCustomerMode !== "auto_reply" && !window.confirm("Make AI Auto-Reply the default for every customer without their own mode?")) return;
+                  setDefaultCustomerMode(m);
+                }}
+                className={`cursor-pointer rounded-md border px-3 py-1.5 text-sm ${
+                  defaultCustomerMode === m ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-zinc-200 text-zinc-600"
+                }`}
+              >
+                {CUSTOMER_MODE_LABEL[m]}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs text-zinc-500">{CUSTOMER_MODE_HINT[defaultCustomerMode]}</p>
+          {defaultCustomerMode === "auto_reply" && (
+            <p className="mt-1 text-xs text-amber-700">Auto-Reply is the default: every customer without their own mode can be answered by the AI.</p>
+          )}
         </div>
 
         <div>

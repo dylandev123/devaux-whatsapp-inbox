@@ -25,6 +25,7 @@ Hard rules:
 6. Style: follow any "tone" KNOWLEDGE entries; otherwise friendly, concise (max 3 short sentences), plain text, no markdown, same language as the customer.
 7. Memory: the MEMORY section is labelled by how far it can be trusted. Only "VERIFIED ORDER HISTORY" lines are completed purchases. "PAST REQUESTS NOT CONFIRMED" and "AI INFERENCES" are never purchases and never stated to the customer as fact. Prices, stock and delivery arrangements come from KNOWLEDGE only, never from memory. Never claim to remember anything that is not listed in MEMORY. If a REPEAT-ORDER note says there are several readings or no usable order, do not choose one.
 8. One turn: the customer's NEW messages arrived in quick succession and form ONE turn. Answer the whole turn once; when a later message corrects an earlier one, the later one wins.
+9. Open staff request: when the input says "Staff escalation: OPEN", staff already own this conversation. Do not answer the customer: choose "ESCALATE", set "reply" to null, and return the CUMULATIVE "order_request" (the pending request merged with what the customer just added, changed or corrected) plus a one-sentence "summary" of what is new. Only include products, quantities, addresses and times the customer actually wrote; never infer them.
 
 Decisions: "REPLY" (a straightforward question fully answered from KNOWLEDGE), "ASK" (you need details from the customer), "ESCALATE" (staff must handle it).
 
@@ -60,13 +61,26 @@ export interface ModelCallResult {
   error: string | null;
 }
 
-export async function proposeReply(input: {
+export interface ProposeReplyInput {
   businessSlug: string;
   messageText: string;
   knowledge: KnowledgeRow[];
   context: CustomerContext | null;
   pendingOrder: OrderRequestDraft | null;
-}): Promise<ModelCallResult> {
+  /** Staff already own this conversation (an open escalation): the model only extracts the request. */
+  openEscalation?: boolean;
+}
+
+type ReplyProposer = (input: ProposeReplyInput) => Promise<ModelCallResult>;
+let proposerForTests: ReplyProposer | null = null;
+
+/** Tests only: replace the language model with a scripted stand-in. Pass null to restore. */
+export function setReplyProposerForTests(fn: ReplyProposer | null): void {
+  proposerForTests = fn;
+}
+
+export async function proposeReply(input: ProposeReplyInput): Promise<ModelCallResult> {
+  if (proposerForTests) return proposerForTests(input);
   const settings = await getAiSettings().catch(() => null);
   if (!settings?.api_key) return { proposal: null, model: null, error: "OpenAI key not configured" };
 
@@ -78,6 +92,7 @@ export async function proposeReply(input: {
     ctx
       ? `Customer: ${ctx.customerName}\nMEMORY (retrieved from records; trust levels as labelled):\n${data(renderMemoryBrief(ctx.memory))}`
       : "Customer: unknown (test console)",
+    `Staff escalation: ${input.openEscalation ? "OPEN — staff own this conversation" : "none"}`,
     `Pending order request: ${input.pendingOrder ? data(JSON.stringify(input.pendingOrder)) : "none"}`,
     ctx && ctx.transcript.length > 0
       ? `Recent conversation (oldest first):\n${data(ctx.transcript.map((t) => `${t.who}: ${t.text}`).join("\n"))}`

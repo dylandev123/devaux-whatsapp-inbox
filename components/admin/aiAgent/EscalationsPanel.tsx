@@ -156,7 +156,15 @@ function EscalationItem({
           ))}
         </div>
       )}
-      <p className={`mt-1 text-xs ${notice.tone}`}>Staff notice: {notice.text}</p>
+      <p className={`mt-1 text-xs ${notice.tone}`}>
+        Staff notice: {notice.text}
+        {e.deliveries.filter((d) => d.kind === "staff_notice").length > 1 &&
+          ` · ${e.deliveries.filter((d) => d.kind === "staff_notice").length - 1} update${e.deliveries.filter((d) => d.kind === "staff_notice").length === 2 ? "" : "s"} posted`}
+      </p>
+      {e.context?.reopened_at && (
+        <p className="mt-1 text-xs text-amber-700">Reopened {formatWhen(e.context.reopened_at)}: the customer changed the order after staff replied.</p>
+      )}
+      {e.context?.cancelled && <p className="mt-1 text-xs font-medium text-red-600">Customer asked to cancel.</p>}
       {e.staff_answer && (
         <p className="mt-1 text-xs text-emerald-700">
           Staff answer ({e.answered_via}, {formatWhen(e.answered_at)}): {e.staff_answer}

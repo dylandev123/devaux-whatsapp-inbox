@@ -36,7 +36,7 @@ export interface BridgeOutboxItem {
   replyToMessageId?: string;
 }
 
-interface OutboxRow {
+export interface OutboxRow {
   id: string;
   business_slug: string;
   kind: OutboxKind;
@@ -120,6 +120,13 @@ export async function isAgentEcho(
     .limit(200);
   if (recentError) throw new Error(recentError.message);
   return (recent ?? []).some((r) => r.body.trim() === text.trim());
+}
+
+/** One outbox row by id, in the shape the bridge response needs. */
+export async function outboxRowById(id: string): Promise<OutboxRow | null> {
+  const { data, error } = await agentDb().from("ai_agent_outbox").select(OUTBOX_ROW_COLUMNS).eq("id", id).maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as OutboxRow | null) ?? null;
 }
 
 export async function outboxForEvent(eventId: string): Promise<OutboxRow[]> {

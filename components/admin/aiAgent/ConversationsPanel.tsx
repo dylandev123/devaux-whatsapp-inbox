@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { aiAgentApi, ConversationView } from "@/lib/aiAgent/client";
+import { CUSTOMER_MODE_LABEL, CUSTOMER_MODES, CustomerMode } from "@/lib/aiAgent/customerMode";
 import { KnownChat } from "@/lib/knownChats";
 import { Badge, Card, formatWhen, inputClass, Notice, secondaryButton } from "@/components/admin/aiAgent/ui";
 
@@ -35,6 +36,19 @@ export function ConversationsPanel({ businessSlug, chats }: { businessSlug: stri
     setError(null);
     try {
       await aiAgentApi.setControl(businessSlug, chatId, action);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setMode(chatId: string, mode: CustomerMode | null) {
+    setBusy(true);
+    setError(null);
+    try {
+      await aiAgentApi.setCustomerMode(businessSlug, chatId, mode);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed");
@@ -82,6 +96,20 @@ export function ConversationsPanel({ businessSlug, chats }: { businessSlug: stri
                       · last <Badge value={c.last_decision} /> {formatWhen(c.last_event_at)}
                     </p>
                   </div>
+                  <select
+                    aria-label="AI handling mode"
+                    value={c.customer_mode ?? ""}
+                    disabled={busy}
+                    onChange={(e) => setMode(c.chat_id, (e.target.value || null) as CustomerMode | null)}
+                    className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-600"
+                  >
+                    <option value="">Business default</option>
+                    {CUSTOMER_MODES.map((m) => (
+                      <option key={m} value={m}>
+                        {CUSTOMER_MODE_LABEL[m]}
+                      </option>
+                    ))}
+                  </select>
                   <button type="button" disabled={busy} className={secondaryButton} onClick={() => control(c.chat_id, paused ? "resume" : "takeover")}>
                     {paused ? "Resume AI" : "Take over"}
                   </button>

@@ -17,7 +17,7 @@ export async function loadGateData(businessSlug: string, chatId: string, contact
     db.from("ai_agent_contact_rules").select("chat_id, rule").eq("business_slug", businessSlug).in("chat_id", identity.chatIds),
     db
       .from("ai_agent_conversations")
-      .select("control, human_until")
+      .select("control, human_until, customer_mode")
       .eq("business_slug", businessSlug)
       .eq("chat_id", chatId)
       .maybeSingle(),

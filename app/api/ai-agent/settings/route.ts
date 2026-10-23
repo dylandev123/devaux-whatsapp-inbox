@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { AGENT_MODES, CONTACT_SCOPES, requiredConfidence } from "@/lib/aiAgent/engine";
+import { isCustomerMode } from "@/lib/aiAgent/customerMode";
 import { parseAuthorizedSenders } from "@/lib/aiAgent/identity";
 import { validateBatchWindow } from "@/lib/aiAgent/batching";
 import { normalizeGroupJid } from "@/lib/aiAgent/chatDirectory";
@@ -50,6 +51,7 @@ interface Payload {
   batchMaxWaitSeconds?: unknown;
   customerMemoryEnabled?: unknown;
   staffAuthorizedSenders?: unknown;
+  defaultCustomerMode?: unknown;
 }
 
 function intIn(value: unknown, min: number, max: number): number | null {
@@ -134,6 +136,10 @@ export async function PUT(request: Request) {
   if (body.customerMemoryEnabled !== undefined) {
     if (typeof body.customerMemoryEnabled !== "boolean") return jsonError("customerMemoryEnabled must be a boolean", 400);
     patch.customer_memory_enabled = body.customerMemoryEnabled;
+  }
+  if (body.defaultCustomerMode !== undefined) {
+    if (!isCustomerMode(body.defaultCustomerMode)) return jsonError("defaultCustomerMode must be auto_reply, staff_first or manual_only", 400);
+    patch.default_customer_mode = body.defaultCustomerMode;
   }
   if (body.staffAuthorizedSenders !== undefined) {
     // Verified WhatsApp identities only: phone numbers or exact …@lid ids — never names.

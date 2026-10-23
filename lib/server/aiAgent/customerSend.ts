@@ -85,6 +85,7 @@ export async function customerGate(settings: AgentSettings, e: EscalationRow, no
     conversation: g.conversation,
     staffActiveAt: g.staffActiveAt,
     now,
+    explicitStaffSend: true,
   });
 }
 

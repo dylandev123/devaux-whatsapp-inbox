@@ -6,6 +6,7 @@ import { formatPhoneDisplay, telHref } from "@/lib/phone";
 import { CONVERSATION_STATUSES, ConversationStatusValue } from "@/lib/conversationStatus";
 import { MessageBubble } from "./MessageBubble";
 import { ReplyBox } from "./ReplyBox";
+import { CustomerAiMode } from "./CustomerAiMode";
 
 interface MessageThreadProps {
   conversation: Conversation | null;
@@ -150,6 +151,10 @@ export function MessageThread({
           </button>
         )}
       </div>
+
+      {conversation && businessSlug && !conversation.chatId.endsWith("@g.us") && (
+        <CustomerAiMode businessSlug={businessSlug} chatId={conversation.chatId} />
+      )}
 
       <div
         className="flex-1 overflow-y-auto px-3 py-4 sm:px-5"

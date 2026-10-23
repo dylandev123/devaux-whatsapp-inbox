@@ -12,6 +12,7 @@
 
 import { BLOCK_REASONS, failureReason } from "./outboxStatus.ts";
 import type { RepeatResolution } from "./memory.ts";
+import { type CustomerMode, effectiveCustomerMode } from "./customerMode.ts";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -77,6 +78,8 @@ export interface AgentSettings {
    * customer from the staff group ("!send"). Empty/absent = nobody. See authorizeStaffSender() in identity.ts.
    */
   staff_authorized_senders?: string[] | null;
+  /** Mode of every customer without their own setting (lib/aiAgent/customerMode.ts). Absent/unknown = Staff First. */
+  default_customer_mode?: CustomerMode | null;
 }
 
 export type ContactRule = "allow" | "exclude";
@@ -84,6 +87,8 @@ export type ContactRule = "allow" | "exclude";
 export interface ConversationControl {
   control: "ai" | "human";
   human_until: string | null;
+  /** This customer's own handling mode; null/absent = the business default. */
+  customer_mode?: CustomerMode | null;
 }
 
 export interface OrderItem {
@@ -225,23 +230,14 @@ export function needsFirstNotice(followUp: boolean, prior: PriorNotice[] | undef
 }
 
 /**
- * Why an escalation's notice was not sent, or null when it should be.
- * `prior` is the escalation's existing staff_notice rows; omitting it on a
- * follow-up is treated as "unknown" and suppresses the Observe notice.
+ * Why a staff notice (first notice or update) cannot be posted at all, or null when it may be.
+ * Whether an OPEN escalation needs a new notice is a separate question — a customer's later
+ * message is only worth one when it changes something (lib/aiAgent/escalationUpdates.ts); this
+ * only answers "is posting to the staff group permitted for this business right now".
  */
-export function staffNoticeSkipReason(
-  settings: AgentSettings | null,
-  followUp: boolean,
-  prior?: PriorNotice[]
-): string | null {
+export function staffNoticeSkipReason(settings: AgentSettings | null): string | null {
   if (!settings?.staff_group_jid) return "no_staff_group";
   if (!canSendStaffNotice(settings)) return "staff_notices_disabled";
-  // Observe posts one notice per escalation, but an open escalation whose
-  // notice never went out (e.g. notices were off) still gets its first one.
-  if (followUp && settings.mode !== "assisted") {
-    if (prior === undefined) return "notice_already_open";
-    return priorNoticeHold(prior);
-  }
   return null;
 }
 
@@ -261,6 +257,11 @@ export interface GateInput {
   /** Newest manual (non-agent) staff message in this chat, if any. */
   staffActiveAt: string | null;
   now: Date;
+  /**
+   * A person explicitly asked for this send ("!send", the dashboard button): the customer's AI handling mode
+   * governs what the AI does on its own and does not apply. Every other rule still does.
+   */
+  explicitStaffSend?: boolean;
 }
 
 export type GateResult =
@@ -293,6 +294,9 @@ export function evaluateGate(input: GateInput): GateResult {
     const age = input.now.getTime() - new Date(input.staffActiveAt).getTime();
     if (age >= 0 && age < settings.auto_takeover_minutes * 60_000) return stop("HUMAN", "staff_recently_active");
   }
+
+  // Checked after every business-wide rule above: a customer's mode only ever narrows what they allow.
+  if (!input.explicitStaffSend && effectiveCustomerMode(settings, input.conversation) === "manual_only") return stop("NO_REPLY", "customer_mode_manual_only");
 
   if (!input.text.trim()) {
     return input.hasMedia ? stop("ESCALATE", "unsupported_media") : stop("NO_REPLY", "empty_message");
@@ -676,6 +680,7 @@ const REF_PATTERN = /#?\bE-([A-Z0-9]{4,8})\b/gi;
 export const AGENT_MESSAGE_MARKERS = [
   "AI escalation #",
   "Follow-up on #",
+  "Update on #",
   "Commands: !note",
   "Draft reply for #",
   "Sending reply for #",

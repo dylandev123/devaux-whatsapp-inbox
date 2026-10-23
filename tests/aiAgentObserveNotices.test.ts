@@ -49,21 +49,21 @@ const ALL_KINDS = ["customer_reply", "holding_reply", "staff_relay", "staff_noti
 
 test("Observe + staff notices on + group: a first notice is allowed", () => {
   assert.equal(canSendStaffNotice(settings()), true);
-  assert.equal(staffNoticeSkipReason(settings(), false), null);
+  assert.equal(staffNoticeSkipReason(settings()), null);
   assert.equal(outboxAllowed(settings(), { kind: "staff_notice", toJid: GROUP }), true);
 });
 
 test("staff notices default OFF: Observe sends nothing until enabled", () => {
   const off = settings({ staff_notices_enabled: false });
   assert.equal(canSendStaffNotice(off), false);
-  assert.equal(staffNoticeSkipReason(off, false), "staff_notices_disabled");
+  assert.equal(staffNoticeSkipReason(off), "staff_notices_disabled");
   assert.equal(outboxAllowed(off, { kind: "staff_notice", toJid: GROUP }), false);
 });
 
 test("no staff group: escalation is recorded, no WhatsApp send is attempted", () => {
   const none = settings({ staff_group_jid: null });
   assert.equal(canSendStaffNotice(none), false);
-  assert.equal(staffNoticeSkipReason(none, false), "no_staff_group");
+  assert.equal(staffNoticeSkipReason(none), "no_staff_group");
   assert.equal(outboxAllowed(none, { kind: "staff_notice", toJid: GROUP }), false);
 });
 
@@ -104,18 +104,18 @@ test("Assisted mode is unchanged: every kind allowed, notices need only a group"
 
 // ── Duplicate prevention ────────────────────────────────────────────────────
 
-test("Observe: a follow-up with unknown notice history stays suppressed", () => {
-  assert.equal(staffNoticeSkipReason(settings(), true), "notice_already_open");
+test("Observe: a follow-up is no longer blanket-suppressed once a notice was delivered", () => {
+  // Root cause of "staff_notice_skipped_notice_already_sent": the skip reason used to treat ANY delivered
+  // notice as a reason to stay silent for good. Posting is now only a permission question; whether a later
+  // message deserves an update is decided from what changed (tests/aiAgentEscalationUpdates.test.ts).
+  assert.equal(staffNoticeSkipReason(settings()), null);
+  assert.equal(needsFirstNotice(true, [{ status: "sent", error: null }]), false);
 });
 
-test("Observe: a follow-up never posts a second notice once one was delivered", () => {
-  const prior = [{ status: "sent", error: null }];
-  assert.equal(staffNoticeSkipReason(settings(), true, prior), "notice_already_sent");
-  assert.equal(needsFirstNotice(true, prior), false);
-});
-
-test("Assisted keeps its follow-up notices", () => {
-  assert.equal(staffNoticeSkipReason(settings({ mode: "assisted" }), true), null);
+test("Assisted and Observe post follow-ups under the same permission", () => {
+  assert.equal(staffNoticeSkipReason(settings({ mode: "assisted" })), null);
+  assert.equal(staffNoticeSkipReason(settings({ mode: "observe" })), null);
+  assert.equal(staffNoticeSkipReason(settings({ staff_notices_enabled: false })), "staff_notices_disabled");
 });
 
 // ── Cross-business isolation ────────────────────────────────────────────────
@@ -188,9 +188,9 @@ test("the Observe notice says nothing is sent to the customer", () => {
 
 test("regression: notices enabled after an escalation opened → next message sends its first notice", () => {
   const off = settings({ staff_notices_enabled: false });
-  assert.equal(staffNoticeSkipReason(off, false, []), "staff_notices_disabled"); // first message
+  assert.equal(staffNoticeSkipReason(off), "staff_notices_disabled"); // first message
   const on = settings();
-  assert.equal(staffNoticeSkipReason(on, true, []), null);
+  assert.equal(staffNoticeSkipReason(on), null);
   assert.equal(needsFirstNotice(true, []), true);
   // Rendered as the original escalation (same ref), not a "Follow-up".
   const text = buildStaffNotice({
@@ -217,9 +217,10 @@ test("regression: that first notice goes only to the staff group, never the cust
   assert.equal(outboxAllowed(on, { kind: "customer_reply", toJid: CUSTOMER }), false);
 });
 
-test("once that notice is pending or in flight, the next message does not queue another", () => {
+test("once that notice is pending or in flight, it is held (a change is posted as an update, not a second first-notice)", () => {
   for (const status of ["pending", "dispatched"]) {
-    assert.equal(staffNoticeSkipReason(settings(), true, [{ status, error: null }]), "notice_in_flight", status);
+    assert.equal(priorNoticeHold([{ status, error: null }]), "notice_in_flight", status);
+    assert.equal(needsFirstNotice(true, [{ status, error: null }]), false, status);
   }
 });
 
@@ -243,11 +244,8 @@ test("provably-unsent prior notices may be re-sent; ambiguous or unknown ones ne
 
 test("a failed-then-blocked notice does not stop the first notice after notices are enabled", () => {
   const prior = [{ status: "failed", error: "staff_notices_disabled" }];
-  assert.equal(staffNoticeSkipReason(settings(), true, prior), null);
-});
-
-test("Assisted follow-ups are unchanged", () => {
-  assert.equal(staffNoticeSkipReason(settings({ mode: "assisted" }), true, [{ status: "sent", error: null }]), null);
+  assert.equal(staffNoticeSkipReason(settings()), null);
+  assert.equal(needsFirstNotice(true, prior), true);
 });
 
 // ── Staff notice content ────────────────────────────────────────────────────
