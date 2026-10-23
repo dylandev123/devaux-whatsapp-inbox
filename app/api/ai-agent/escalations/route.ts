@@ -3,6 +3,7 @@ import { createHash } from "crypto";
 import { StaffCommand } from "@/lib/aiAgent/engine";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
 import { agentDb, loadSettings, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
+import { outboxState } from "@/lib/aiAgent/outboxStatus";
 import { applyStaffAction, canSend, ESCALATION_COLUMNS, EscalationRow } from "@/lib/server/aiAgent/escalations";
 import { enqueue } from "@/lib/server/aiAgent/outbox";
 
@@ -27,7 +28,29 @@ export async function GET(request: Request) {
   if (params.get("status") === "open") query = query.in("status", ["open", "notified"]);
   const { data, error } = await query;
   if (error) return jsonError(error.message, 500);
-  return NextResponse.json({ escalations: data ?? [] });
+
+  // Delivery status of each escalation's staff notice / relay, derived the
+  // same way as the Activity outbox (blocked vs failed vs unresolved).
+  const rows = (data ?? []) as unknown as EscalationRow[];
+  const ids = rows.map((r) => r.id);
+  const deliveries = new Map<string, unknown[]>();
+  if (ids.length > 0) {
+    const { data: outbox, error: outboxError } = await agentDb()
+      .from("ai_agent_outbox")
+      .select("id, escalation_id, kind, status, error, dispatched_at, created_at, sent_at")
+      .eq("business_slug", businessSlug)
+      .in("kind", ["staff_notice", "staff_relay"])
+      .in("escalation_id", ids)
+      .order("created_at", { ascending: false });
+    if (outboxError) return jsonError(outboxError.message, 500);
+    const now = new Date();
+    for (const o of outbox ?? []) {
+      const list = deliveries.get(o.escalation_id) ?? [];
+      list.push({ id: o.id, kind: o.kind, state: outboxState(o, now), error: o.error, created_at: o.created_at, sent_at: o.sent_at });
+      deliveries.set(o.escalation_id, list);
+    }
+  }
+  return NextResponse.json({ escalations: rows.map((r) => ({ ...r, deliveries: deliveries.get(r.id) ?? [] })) });
 }
 
 const COMMANDS: StaffCommand[] = ["send", "note", "close", "takeover", "resume"];
@@ -50,7 +73,10 @@ export async function PATCH(request: Request) {
     ]);
     if (error) throw new Error(error.message);
     if (!escalation) return jsonError("Escalation not found", 404);
-    if (command === "send" && !canSend(settings)) {
+    // In Observe mode "send" only records the answer for review (applyStaffAction
+    // queues nothing for the customer). Anywhere else it is refused.
+    const recordOnly = command === "send" && !canSend(settings) && settings?.enabled === true && settings.mode === "observe";
+    if (command === "send" && !canSend(settings) && !recordOnly) {
       return jsonError("The agent is not enabled in Assisted mode — reply to the customer from the inbox instead.", 409);
     }
 

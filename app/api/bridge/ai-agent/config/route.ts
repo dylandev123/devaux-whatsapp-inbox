@@ -14,7 +14,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await agentDb()
     .from("ai_agent_settings")
-    .select("business_slug, enabled, mode, staff_group_jid");
+    .select("business_slug, enabled, mode, staff_group_jid, staff_notices_enabled");
   if (error) return NextResponse.json({ error: "Failed to load AI agent config" }, { status: 500 });
 
   return NextResponse.json({
@@ -24,6 +24,8 @@ export async function GET(request: Request) {
       forwardMessages: row.enabled,
       mode: row.mode,
       staffGroupJid: row.staff_group_jid,
+      // Observe mode: bridge may send staff_notice (only) to staffGroupJid when true.
+      staffNoticesEnabled: row.staff_notices_enabled === true,
     })),
   });
 }

@@ -177,6 +177,7 @@ const SETTINGS: AgentSettings = {
   auto_takeover_minutes: 120,
   max_auto_replies_per_hour: 6,
   send_holding_reply: true,
+  staff_notices_enabled: false,
 };
 const gate = (chatId: string, contactRule: "allow" | "exclude" | null) =>
   evaluateGate({

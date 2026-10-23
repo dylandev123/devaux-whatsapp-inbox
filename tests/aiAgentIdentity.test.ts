@@ -23,6 +23,7 @@ const settings: AgentSettings = {
   auto_takeover_minutes: 0,
   max_auto_replies_per_hour: 5,
   send_holding_reply: true,
+  staff_notices_enabled: false,
 };
 const gate = (over: Partial<GateInput>) =>
   evaluateGate({

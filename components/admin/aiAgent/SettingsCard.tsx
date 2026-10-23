@@ -23,6 +23,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
   const [takeoverMinutes, setTakeoverMinutes] = useState(s.auto_takeover_minutes);
   const [maxReplies, setMaxReplies] = useState(s.max_auto_replies_per_hour);
   const [holdingReply, setHoldingReply] = useState(s.send_holding_reply);
+  const [staffNotices, setStaffNotices] = useState(s.staff_notices_enabled);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -56,11 +57,12 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
       autoTakeoverMinutes: takeoverMinutes,
       maxAutoRepliesPerHour: maxReplies,
       sendHoldingReply: holdingReply,
+      staffNoticesEnabled: staffNotices,
     });
   }
 
   return (
-    <Card title="Agent" subtitle="Nothing is sent unless the agent is ON and in Assisted mode.">
+    <Card title="Agent" subtitle="Customers are only messaged when the agent is ON and in Assisted mode. Observe mode can post escalation notices to the staff group if enabled below.">
       <div className="flex flex-col gap-4">
         {!data.aiKeyConfigured && <Notice tone="warn">No OpenAI key is saved on the AI Settings page — every message will be escalated.</Notice>}
         {!data.bridgeConfigured && (
@@ -139,6 +141,14 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
             <input type="number" min={0} max={60} value={maxReplies} onChange={(e) => setMaxReplies(Number(e.target.value))} className={inputClass} />
           </div>
         </div>
+
+        <label className="flex items-center gap-2 text-sm text-zinc-700">
+          <input type="checkbox" checked={staffNotices} onChange={(e) => setStaffNotices(e.target.checked)} />
+          Observe mode: post escalation notices to the staff group (never messages customers)
+        </label>
+        {enabled && mode === "observe" && staffNotices && !s.staff_group_jid && (
+          <Notice tone="warn">No staff group selected — escalations will be recorded on this page only.</Notice>
+        )}
 
         <label className="flex items-center gap-2 text-sm text-zinc-700">
           <input type="checkbox" checked={holdingReply} onChange={(e) => setHoldingReply(e.target.checked)} />

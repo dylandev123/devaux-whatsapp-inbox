@@ -3,7 +3,7 @@
 // Supabase directly or decides anything (decisions live server-side in
 // lib/server/aiAgent/decide.ts + lib/aiAgent/engine.ts).
 
-import type { OutboxStatus } from "@/lib/aiAgent/outboxStatus";
+import type { OutboxState, OutboxStatus } from "@/lib/aiAgent/outboxStatus";
 import type {
   AgentDecision,
   AgentSettings,
@@ -34,6 +34,7 @@ export interface SettingsPatch {
   autoTakeoverMinutes?: number;
   maxAutoRepliesPerHour?: number;
   sendHoldingReply?: boolean;
+  staffNoticesEnabled?: boolean;
 }
 
 export interface ContactSearchResult {
@@ -99,11 +100,29 @@ export interface EscalationView {
   customer_message: string | null;
   ai_summary: string | null;
   proposed_reply: string | null;
-  context: { order_request?: OrderRequestDraft | null; notes?: { at: string; text: string }[] };
+  context: {
+    order_request?: OrderRequestDraft | null;
+    notes?: { at: string; text: string }[];
+    /** Why the first staff notice was not posted (no_staff_group, staff_notices_disabled). */
+    notice_skipped?: string;
+    /** Set when a staff answer was recorded but not relayed (the agent's mode at the time). */
+    answer_not_relayed?: string;
+  };
   staff_answer: string | null;
   answered_via: string | null;
   answered_at: string | null;
   created_at: string;
+  /** Staff notices and relays for this escalation, newest first, with derived delivery state. */
+  deliveries: EscalationDelivery[];
+}
+
+export interface EscalationDelivery {
+  id: string;
+  kind: string;
+  state: OutboxState;
+  error: string | null;
+  created_at: string;
+  sent_at: string | null;
 }
 
 export interface ConversationView {

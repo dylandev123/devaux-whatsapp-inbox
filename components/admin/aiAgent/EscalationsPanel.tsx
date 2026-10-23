@@ -1,11 +1,49 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { aiAgentApi, EscalationView } from "@/lib/aiAgent/client";
+import { aiAgentApi, EscalationDelivery, EscalationView } from "@/lib/aiAgent/client";
 import { formatOrderRequest } from "@/lib/aiAgent/engine";
+import { failureReason } from "@/lib/aiAgent/outboxStatus";
 import { Badge, Card, formatWhen, inputClass, Notice, primaryButton, secondaryButton } from "@/components/admin/aiAgent/ui";
 
-function EscalationItem({ businessSlug, e, onChanged }: { businessSlug: string; e: EscalationView; onChanged: () => void }) {
+const NOTICE_SKIPPED: Record<string, string> = {
+  no_staff_group: "not sent: no staff group is configured (recorded here only)",
+  staff_notices_disabled: "not sent: staff notices are switched off for Observe mode",
+};
+
+function noticeStatus(e: EscalationView): { tone: string; text: string } {
+  const notices = e.deliveries.filter((d) => d.kind === "staff_notice");
+  const latest: EscalationDelivery | undefined = notices[0];
+  if (!latest) {
+    const reason = e.context?.notice_skipped;
+    return { tone: "text-zinc-500", text: reason ? (NOTICE_SKIPPED[reason] ?? `not sent: ${reason}`) : "no notice queued" };
+  }
+  switch (latest.state) {
+    case "sent":
+      return { tone: "text-emerald-700", text: `delivered to staff group ${formatWhen(latest.sent_at)}` };
+    case "blocked":
+      return { tone: "text-zinc-500", text: `not sent on purpose: ${failureReason(latest.error)}` };
+    case "failed":
+      return { tone: "text-red-600", text: `failed: ${latest.error ?? "no reason given"}` };
+    case "unresolved":
+      return { tone: "text-amber-700", text: "outcome unknown: no ack from the bridge (check the staff group)" };
+    default:
+      return { tone: "text-zinc-500", text: latest.state };
+  }
+}
+
+function EscalationItem({
+  businessSlug,
+  e,
+  observe,
+  onChanged,
+}: {
+  businessSlug: string;
+  e: EscalationView;
+  observe: boolean;
+  onChanged: () => void;
+}) {
+  const notice = noticeStatus(e);
   const [answer, setAnswer] = useState(e.proposed_reply ?? "");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
@@ -40,9 +78,13 @@ function EscalationItem({ businessSlug, e, onChanged }: { businessSlug: string; 
       {e.ai_summary && <p className="mt-1 text-xs text-zinc-500">Summary: {e.ai_summary}</p>}
       <p className="mt-1 whitespace-pre-wrap rounded bg-zinc-50 px-2 py-1 text-zinc-800">{e.customer_message}</p>
       {order && <p className="mt-1 text-xs text-amber-800">Order request (not confirmed): {order}</p>}
+      <p className={`mt-1 text-xs ${notice.tone}`}>Staff notice: {notice.text}</p>
       {e.staff_answer && (
         <p className="mt-1 text-xs text-emerald-700">
           Staff answer ({e.answered_via}, {formatWhen(e.answered_at)}): {e.staff_answer}
+          {e.context?.answer_not_relayed && (
+            <span className="ml-1 rounded bg-zinc-100 px-1.5 py-0.5 text-zinc-600">recorded for review — not sent to the customer</span>
+          )}
         </p>
       )}
       {(e.context?.notes ?? []).map((n, i) => (
@@ -53,10 +95,10 @@ function EscalationItem({ businessSlug, e, onChanged }: { businessSlug: string; 
 
       {open && (
         <div className="mt-2 flex flex-col gap-2">
-          <textarea value={answer} onChange={(ev) => setAnswer(ev.target.value)} rows={2} placeholder="Exact text to send to the customer…" className={inputClass} />
+          <textarea value={answer} onChange={(ev) => setAnswer(ev.target.value)} rows={2} placeholder={observe ? "Staff answer to record (never sent to the customer)…" : "Exact text to send to the customer…"} className={inputClass} />
           <div className="flex flex-wrap gap-2">
-            <button type="button" disabled={busy || !answer.trim()} className={primaryButton} onClick={() => act("send", answer, "Send this exact text to the customer?")}>
-              Send to customer
+            <button type="button" disabled={busy || !answer.trim()} className={primaryButton} onClick={() => act("send", answer, observe ? undefined : "Send this exact text to the customer?")}>
+              {observe ? "Record answer (not sent)" : "Send to customer"}
             </button>
             <button type="button" disabled={busy || !answer.trim()} className={secondaryButton} onClick={() => act("note", answer)}>
               Save as note
@@ -82,7 +124,7 @@ function EscalationItem({ businessSlug, e, onChanged }: { businessSlug: string; 
   );
 }
 
-export function EscalationsPanel({ businessSlug }: { businessSlug: string }) {
+export function EscalationsPanel({ businessSlug, observe = false }: { businessSlug: string; observe?: boolean }) {
   const [items, setItems] = useState<EscalationView[]>([]);
   const [openOnly, setOpenOnly] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -103,7 +145,11 @@ export function EscalationsPanel({ businessSlug }: { businessSlug: string }) {
   return (
     <Card
       title="Escalations"
-      subtitle="Staff can also answer in the WhatsApp group by replying to the notice or including its #E- code. Answers are sent verbatim."
+      subtitle={
+        observe
+          ? "Observe mode: staff answers are recorded for review and never sent to customers."
+          : "Staff can also answer in the WhatsApp group by replying to the notice or including its #E- code. Answers are sent verbatim."
+      }
     >
       <div className="flex flex-col gap-3">
         <div className="flex items-center gap-3">
@@ -119,7 +165,7 @@ export function EscalationsPanel({ businessSlug }: { businessSlug: string }) {
         ) : (
           <ul className="divide-y divide-zinc-100 rounded-md border border-zinc-200">
             {items.map((e) => (
-              <EscalationItem key={e.id} businessSlug={businessSlug} e={e} onChanged={load} />
+              <EscalationItem key={e.id} businessSlug={businessSlug} e={e} observe={observe} onChanged={load} />
             ))}
           </ul>
         )}

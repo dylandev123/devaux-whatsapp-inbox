@@ -59,6 +59,8 @@ export interface AgentSettings {
   auto_takeover_minutes: number;
   max_auto_replies_per_hour: number;
   send_holding_reply: boolean;
+  /** Observe mode only: permit staff_notice (never customer messages) to the staff group. Default false. */
+  staff_notices_enabled: boolean;
 }
 
 export type ContactRule = "allow" | "exclude";
@@ -125,6 +127,49 @@ function chatKind(chatId: string): "group" | "system" | "direct" {
   if (id.endsWith("@g.us")) return "group";
   if (id === "broadcast" || id.endsWith("@broadcast") || id.endsWith("@newsletter")) return "system";
   return "direct";
+}
+
+// ── Send policy: which outbox kinds a business may produce ───────────────────
+//
+// customer_reply / holding_reply / staff_relay reach a customer and exist only
+// in Assisted mode. staff_notice (and staff_feedback) go to the staff group:
+// staff_notice may also be sent in Observe mode, but only when the business has
+// staff_notices_enabled AND a staff group. Observe mode never sends anything
+// else. The bridge enforces the same table independently.
+
+export const STAFF_GROUP_KINDS = ["staff_notice", "staff_feedback"] as const;
+
+/** True for outbox kinds addressed to the customer (everything but the staff-group kinds). */
+export function isCustomerBoundKind(kind: string): boolean {
+  return !(STAFF_GROUP_KINDS as readonly string[]).includes(kind);
+}
+
+/** Customer-facing sends (replies, questions, holding replies, staff relays): Assisted mode only. */
+export function canSendToCustomers(settings: AgentSettings | null): boolean {
+  return Boolean(settings?.enabled && settings.mode === "assisted");
+}
+
+/** Whether an escalation notice may be posted to the staff group right now. */
+export function canSendStaffNotice(settings: AgentSettings | null): boolean {
+  if (!settings?.enabled || !settings.staff_group_jid) return false;
+  if (settings.mode === "assisted") return true;
+  return settings.mode === "observe" && settings.staff_notices_enabled === true;
+}
+
+/** Final gate on every item the live path is about to enqueue. */
+export function outboxAllowed(settings: AgentSettings | null, item: { kind: string; toJid: string }): boolean {
+  if (!settings?.enabled) return false;
+  if (settings.mode === "assisted") return true;
+  return item.kind === "staff_notice" && canSendStaffNotice(settings) && item.toJid === settings.staff_group_jid;
+}
+
+/** Why an escalation's notice was not sent, or null when it should be. */
+export function staffNoticeSkipReason(settings: AgentSettings | null, followUp: boolean): string | null {
+  if (!settings?.staff_group_jid) return "no_staff_group";
+  if (!canSendStaffNotice(settings)) return "staff_notices_disabled";
+  // Observe mode posts one notice per escalation; later messages only update the record.
+  if (followUp && settings.mode !== "assisted") return "notice_already_open";
+  return null;
 }
 
 // ── Gate: should the agent consider this message at all? ─────────────────────
@@ -601,6 +646,8 @@ export interface StaffNoticeInput {
   draftReply: string | null;
   orderRequest: OrderRequestDraft | null;
   followUp: boolean;
+  /** Observe mode: nothing is sent to the customer; staff answers are recorded for review only. */
+  observeOnly?: boolean;
 }
 
 export function buildStaffNotice(input: StaffNoticeInput): string {
@@ -615,9 +662,13 @@ export function buildStaffNotice(input: StaffNoticeInput): string {
   ];
   const order = formatOrderRequest(input.orderRequest);
   if (order) lines.push(`Order request (NOT confirmed): ${clip(order, 400)}`);
-  if (input.draftReply && !input.followUp) lines.push(`Suggested reply: "${clip(input.draftReply, 400)}"`);
+  if (input.draftReply && !input.followUp) {
+    lines.push(`${input.observeOnly ? "AI draft (NOT sent)" : "Suggested reply"}: "${clip(input.draftReply, 400)}"`);
+  }
   lines.push(
-    `↩️ Reply to this message (or include #${input.refCode}) with the exact text to send the customer.`,
+    input.observeOnly
+      ? `👀 Observe mode: nothing is sent to the customer. Reply to this message (or include #${input.refCode}) to record your answer for review. Contact the customer directly.`
+      : `↩️ Reply to this message (or include #${input.refCode}) with the exact text to send the customer.`,
     "Commands: !note <text> · !close · !takeover · !resume"
   );
   return lines.join("\n");

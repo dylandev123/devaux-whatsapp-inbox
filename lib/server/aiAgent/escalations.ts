@@ -7,6 +7,7 @@
 import {
   AgentSettings,
   buildStaffNotice,
+  canSendToCustomers,
   EscalationPriority,
   extractRefCodes,
   MatchableEscalation,
@@ -46,8 +47,9 @@ export interface EscalationRow {
 export const ESCALATION_COLUMNS =
   "id, ref_code, business_slug, chat_id, contact_number, customer_name, priority, status, reason, reason_codes, customer_message, ai_summary, proposed_reply, context, notice_message_id, staff_answer, answered_by, answered_via, answered_at, resolved_at, created_at, updated_at";
 
+/** Customer-facing sends (and staff-group feedback) need Assisted mode; see canSendStaffNotice() for notices. */
 export function canSend(settings: AgentSettings | null): boolean {
-  return Boolean(settings?.enabled && settings.mode === "assisted");
+  return canSendToCustomers(settings);
 }
 
 export async function findOpenEscalation(businessSlug: string, chatId: string): Promise<EscalationRow | null> {
@@ -130,7 +132,8 @@ export async function createOrAppendEscalation(
 export function staffNoticeFor(
   escalation: EscalationRow,
   input: Pick<EscalateInput, "customerMessage" | "draftReply" | "orderRequest" | "reasons">,
-  followUp: boolean
+  followUp: boolean,
+  observeOnly = false
 ): string {
   return buildStaffNotice({
     refCode: escalation.ref_code,
@@ -141,6 +144,7 @@ export function staffNoticeFor(
     draftReply: input.draftReply,
     orderRequest: input.orderRequest,
     followUp,
+    observeOnly,
   });
 }
 
@@ -222,7 +226,15 @@ export async function applyStaffAction(input: {
       }
       const { error } = await db
         .from("ai_agent_escalations")
-        .update({ status: "answered", staff_answer: body, answered_by: input.actorId, answered_via: input.via, answered_at: now })
+        .update({
+          status: "answered",
+          staff_answer: body,
+          answered_by: input.actorId,
+          answered_via: input.via,
+          answered_at: now,
+          // Recorded for review only: nothing was queued for the customer.
+          context: sendable ? e.context : { ...e.context, answer_not_relayed: input.settings?.mode ?? "disabled" },
+        })
         .eq("id", e.id);
       if (error) throw new Error(error.message);
       // A correction candidate only — becomes knowledge solely on admin approval.

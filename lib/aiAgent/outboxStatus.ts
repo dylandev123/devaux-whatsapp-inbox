@@ -24,6 +24,7 @@ export const BLOCK_REASONS: ReadonlySet<string> = new Set([
   "agent_disabled",
   "bridge_send_disabled",
   "observe_mode",
+  "staff_notices_disabled",
   "human_takeover",
   "stale_reply",
   "superseded_by_newer_message",

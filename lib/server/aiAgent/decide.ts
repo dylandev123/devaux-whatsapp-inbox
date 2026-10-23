@@ -15,6 +15,7 @@ import {
   AgentSettings,
   ContactRule,
   ConversationControl,
+  canSendStaffNotice,
   detectSafeguards,
   evaluateGate,
   GateResult,
@@ -22,11 +23,13 @@ import {
   HOLDING_REPLY_ORDER,
   isValidBusinessSlug,
   ModelProposal,
+  outboxAllowed,
   OrderRequestDraft,
   priorityFor,
   requiredConfidence,
   resolveDecision,
   Resolution,
+  staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
 import {
@@ -140,8 +143,13 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
       outcome = await handleCustomerMessage(input, settings, eventId);
     }
 
+    // Last line of defence: whatever the handlers produced, only kinds the
+    // business's mode permits are enqueued. Observe mode can never produce a
+    // customer-bound item, even if a handler regresses.
+    const allowed = outcome.outbox.filter((o) => outboxAllowed(settings, o));
+    if (allowed.length !== outcome.outbox.length) outcome.reasons = [...outcome.reasons, "outbox_blocked_by_mode"];
     const rows = await enqueue(
-      outcome.outbox.map((o) => ({ ...o, eventId })),
+      allowed.map((o) => ({ ...o, eventId })),
       true
     );
     await finishEvent(eventId, startedAt, outcome);
@@ -539,16 +547,30 @@ async function handleCustomerMessage(
     }
 
     const outbox: OutboxInsert[] = [];
-    if (sendable && settings.staff_group_jid) {
+    // The staff notice is the only thing Observe mode may send (when its
+    // staff_notices_enabled flag is on). A follow-up on an already-open
+    // escalation updates the record but never posts a second notice in Observe.
+    const skip = staffNoticeSkipReason(settings, followUp);
+    if (!skip && settings.staff_group_jid) {
       outbox.push({
         businessSlug: input.businessSlug,
         chatId: input.chatId,
         kind: "staff_notice",
         toJid: settings.staff_group_jid,
-        body: staffNoticeFor(escalation, escalateInput, followUp),
+        body: staffNoticeFor(escalation, escalateInput, followUp, settings.mode !== "assisted"),
         dedupeKey: `${eventId}:staff_notice`,
         escalationId: escalation.id,
       });
+    } else if (skip) {
+      reasons.push(`staff_notice_skipped_${skip}`);
+      // First notice for this escalation never went out: say why in the admin UI.
+      if (!followUp) {
+        await agentDb()
+          .from("ai_agent_escalations")
+          .update({ context: { ...escalation.context, notice_skipped: skip } })
+          .eq("id", escalation.id)
+          .eq("business_slug", input.businessSlug);
+      }
     }
     if (sendable && settings.send_holding_reply && !followUp) {
       outbox.push({
@@ -692,7 +714,7 @@ export async function simulateMessage(input: {
     orderRequest: r?.orderRequest ?? null,
     orderComplete: r?.orderComplete ?? false,
     wouldSendToCustomer: live && sendable && (decision === "REPLY" || decision === "ASK" || (decision === "ESCALATE" && Boolean(settings?.send_holding_reply) && !p.hasOpenEscalation)),
-    wouldNotifyStaff: live && sendable && decision === "ESCALATE" && Boolean(settings?.staff_group_jid),
+    wouldNotifyStaff: live && decision === "ESCALATE" && !p.hasOpenEscalation && canSendStaffNotice(settings),
     modelError: p.modelError,
     mode: settings?.mode ?? null,
   };

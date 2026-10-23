@@ -44,8 +44,8 @@ Optional optimisation; cache for ~60 s.
 200 {
   "pollOutboxSeconds": 10,
   "businesses": [
-    { "businessSlug": "dog_food", "forwardMessages": false, "mode": "observe", "staffGroupJid": null },
-    { "businessSlug": "by_sea", "forwardMessages": false, "mode": "observe", "staffGroupJid": null }
+    { "businessSlug": "dog_food", "forwardMessages": false, "mode": "observe", "staffGroupJid": null, "staffNoticesEnabled": false },
+    { "businessSlug": "by_sea", "forwardMessages": false, "mode": "observe", "staffGroupJid": null, "staffNoticesEnabled": false }
   ]
 }
 ```
@@ -110,6 +110,20 @@ Bridge rules:
    the same `whatsappMessageId` is safe.
 5. Ignore unknown `kind` values but still honour `send`.
 
+**Observe mode.** A business in `observe` mode may have `send: true` items of
+kind `staff_notice` **only**, addressed to `staffGroupJid`, and only when
+`staffNoticesEnabled` is `true` (default `false`, set per business in the admin
+UI). Every other kind, and every item addressed to a non-group chat, must not
+be sent in Observe mode (ack `failed` with `observe_mode`; `staff_notice_disabled`
+→ ack `staff_notices_disabled`). The bridge's global send switch
+(`AGENT_SEND_ENABLED=false`) blocks staff notices too. In Observe mode the app
+never creates `customer_reply`, `holding_reply`, `staff_relay` or
+`staff_feedback` items; a staff answer to an Observe notice is stored on the
+escalation for review and never forwarded to the customer. At most one notice
+is posted per escalation: later customer messages append to the open
+escalation without a new notice. A business with no staff group records its
+escalations in the admin panel only (no item is created).
+
 `kind` values: `customer_reply`, `holding_reply` (to customer),
 `staff_notice`, `staff_feedback` (to staff group), `staff_relay` (staff answer
 → customer).
@@ -133,7 +147,7 @@ For `failed`, `error` starts with a reason code (optionally followed by
 `: <detail>`). The admin UI shows these codes as **blocked**: deliberately not
 sent, with nothing wrong:
 
-`agent_disabled`, `bridge_send_disabled`, `observe_mode`, `human_takeover`,
+`agent_disabled`, `bridge_send_disabled`, `observe_mode`, `staff_notices_disabled`, `human_takeover`,
 `stale_reply`, `superseded_by_newer_message`, `held_after_unknown_send`,
 `unapproved_commitment`, `chat_rate_limited`, `business_rate_limited`
 
@@ -204,7 +218,7 @@ Migration: `supabase/migrations/20261022000000_ai_agent.sql`.
 
 | Table / function | Purpose |
 |---|---|
-| `ai_agent_settings` | Per-business config, one row per business. Rows are created OFF / observe / none (seeded for `dog_food`; others by `20261023000000_ai_agent_multi_business.sql` or on first admin visit). No business restriction. |
+| `ai_agent_settings` | Per-business config, one row per business. Rows are created OFF / observe / none with `staff_notices_enabled = false` (seeded for `dog_food`; others by `20261023000000_ai_agent_multi_business.sql` or on first admin visit; the flag comes from `20261024000000_ai_agent_observe_staff_notices.sql`). No business restriction. |
 | `ai_agent_contact_rules` | `allow` / `exclude` per chat |
 | `ai_agent_knowledge` | Business facts; only `approved` + unexpired are used |
 | `ai_agent_conversations` | Per-chat AI/human control |

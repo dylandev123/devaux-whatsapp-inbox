@@ -132,7 +132,7 @@ export function AiAgentPage() {
             </>
           )}
           {tab === "knowledge" && <KnowledgePanel businessSlug={businessSlug} />}
-          {tab === "escalations" && <EscalationsPanel businessSlug={businessSlug} />}
+          {tab === "escalations" && <EscalationsPanel businessSlug={businessSlug} observe={s?.mode === "observe"} />}
           {tab === "takeover" && <ConversationsPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "review" && <ReviewPanel businessSlug={businessSlug} />}
           {tab === "activity" && <ActivityPanel businessSlug={businessSlug} />}

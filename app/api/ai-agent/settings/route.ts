@@ -42,6 +42,7 @@ interface Payload {
   autoTakeoverMinutes?: unknown;
   maxAutoRepliesPerHour?: unknown;
   sendHoldingReply?: unknown;
+  staffNoticesEnabled?: unknown;
 }
 
 function intIn(value: unknown, min: number, max: number): number | null {
@@ -113,6 +114,10 @@ export async function PUT(request: Request) {
   if (body.sendHoldingReply !== undefined) {
     if (typeof body.sendHoldingReply !== "boolean") return jsonError("sendHoldingReply must be a boolean", 400);
     patch.send_holding_reply = body.sendHoldingReply;
+  }
+  if (body.staffNoticesEnabled !== undefined) {
+    if (typeof body.staffNoticesEnabled !== "boolean") return jsonError("staffNoticesEnabled must be a boolean", 400);
+    patch.staff_notices_enabled = body.staffNoticesEnabled;
   }
 
   try {

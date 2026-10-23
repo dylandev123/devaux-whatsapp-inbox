@@ -29,6 +29,7 @@ const settingsFor = (slug: string, over: Partial<AgentSettings> = {}): AgentSett
   auto_takeover_minutes: 120,
   max_auto_replies_per_hour: 6,
   send_holding_reply: true,
+  staff_notices_enabled: false,
   ...over,
 });
 const gate = (slug: string, settings: AgentSettings | null, over: Partial<GateInput> = {}) =>
