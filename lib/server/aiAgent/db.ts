@@ -12,6 +12,11 @@ import { BUSINESS_LABELS } from "@/lib/whatsapp";
 
 let cached: SupabaseClient | null = null;
 
+/** Tests only: route every ai_agent_* query to a stand-in client (tests/helpers/pgSupabase.ts). Pass null to restore. */
+export function setAgentDbForTests(client: SupabaseClient | null): void {
+  cached = client;
+}
+
 export function agentDb(): SupabaseClient {
   if (cached) return cached;
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -67,7 +72,7 @@ export async function ensureSettings(businessSlug: string): Promise<AgentSetting
 }
 
 export const SETTINGS_COLUMNS =
-  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, updated_at";
+  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, updated_at";
 
 export async function loadSettings(businessSlug: string): Promise<AgentSettings | null> {
   const { data, error } = await agentDb()

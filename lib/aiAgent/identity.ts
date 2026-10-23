@@ -80,3 +80,90 @@ export function combineRules(rules: RuleRow[]): "allow" | "exclude" | null {
   if (rules.some((r) => r.rule === "allow")) return "allow";
   return null;
 }
+
+// ── Staff sender authorization ───────────────────────────────────────────────
+//
+// WhatsApp commands that message a customer ("!send", "send it") are honoured
+// only from senders on the business's own allow-list. A sender is identified
+// ONLY by identifiers WhatsApp itself reported — never by display name, and
+// never by treating @lid digits as a phone number:
+//   - a phone JID (`<msisdn>@s.whatsapp.net`) proves that phone number;
+//   - an @lid JID proves only itself, plus a phone number the bridge reported
+//     for it (Baileys participantPn) when that number is plausible and not the
+//     @lid's own digits.
+// An allow-list entry is either phone digits ("17585550001") or an exact
+// "<digits>@lid" JID. The default list is empty: nobody may send until an
+// admin adds them.
+
+export const MAX_AUTHORIZED_SENDERS = 50;
+
+/** One allow-list entry in canonical form (phone digits, or "<digits>@lid"), or null when it is neither. */
+export function normalizeAuthorizedSender(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const value = raw.trim().toLowerCase();
+  if (!value) return null;
+  const lid = value.match(LID_JID);
+  if (lid) return `${lid[1]}@lid`;
+  const phone = value.match(PHONE_JID);
+  const digits = (phone ? phone[1] : value).replace(/[\s()+.-]/g, "");
+  if (!/^\d{8,15}$/.test(digits)) return null;
+  return digits;
+}
+
+/** Parses an admin-typed list (commas, semicolons, whitespace or newlines). Invalid entries are reported, never guessed at. */
+export function parseAuthorizedSenders(input: unknown): { ok: true; senders: string[] } | { ok: false; error: string } {
+  const parts = Array.isArray(input) ? input : typeof input === "string" ? input.split(/[\n,;]+/) : null;
+  if (!parts) return { ok: false, error: "staffAuthorizedSenders must be a list of phone numbers" };
+  const out: string[] = [];
+  for (const part of parts) {
+    if (typeof part === "string" && !part.trim()) continue;
+    const entry = normalizeAuthorizedSender(part);
+    if (!entry) return { ok: false, error: `"${String(part).slice(0, 40)}" is not a phone number (8–15 digits) or a …@lid id` };
+    if (!out.includes(entry)) out.push(entry);
+  }
+  if (out.length > MAX_AUTHORIZED_SENDERS) return { ok: false, error: `At most ${MAX_AUTHORIZED_SENDERS} authorized senders` };
+  return { ok: true, senders: out };
+}
+
+/**
+ * The verified identifiers of a staff-group sender, strongest first. `phone`
+ * is whatever the bridge reported alongside the participant JID; it counts
+ * only when plausible and different from the @lid's own digits.
+ */
+export function verifiedSenderKeys(senderJid: string | null | undefined, reportedPhone: string | null | undefined): string[] {
+  const jid = (senderJid ?? "").trim().toLowerCase();
+  if (!jid) return [];
+  const keys: string[] = [];
+  const phone = jid.match(PHONE_JID);
+  if (phone) keys.push(phone[1]);
+  const lid = jid.match(LID_JID);
+  if (lid) {
+    const reported = verifiedPhoneDigits(jid, reportedPhone);
+    if (reported) keys.push(reported);
+    keys.push(`${lid[1]}@lid`);
+  }
+  return keys;
+}
+
+export interface SenderAuthorization {
+  authorized: boolean;
+  /** The verified identifier that matched the allow-list, or the best verified one when none did; null when the sender is not verifiable. */
+  senderId: string | null;
+}
+
+export function authorizeStaffSender(
+  allowList: readonly string[] | null | undefined,
+  senderJid: string | null | undefined,
+  reportedPhone: string | null | undefined
+): SenderAuthorization {
+  const keys = verifiedSenderKeys(senderJid, reportedPhone);
+  const allowed = new Set((allowList ?? []).map(normalizeAuthorizedSender).filter((e): e is string => Boolean(e)));
+  const match = keys.find((k) => allowed.has(k));
+  return { authorized: Boolean(match), senderId: match ?? keys[0] ?? null };
+}
+
+/** Re-checks a previously recorded verified sender id against the CURRENT allow-list (used by retries). */
+export function isSenderIdAuthorized(allowList: readonly string[] | null | undefined, senderId: string | null | undefined): boolean {
+  const id = normalizeAuthorizedSender(senderId);
+  return Boolean(id && (allowList ?? []).map(normalizeAuthorizedSender).includes(id));
+}

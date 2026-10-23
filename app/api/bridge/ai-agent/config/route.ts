@@ -14,7 +14,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await agentDb()
     .from("ai_agent_settings")
-    .select("business_slug, enabled, mode, staff_group_jid, staff_notices_enabled");
+    .select("business_slug, enabled, mode, staff_group_jid, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds");
   if (error) return NextResponse.json({ error: "Failed to load AI agent config" }, { status: 500 });
 
   return NextResponse.json({
@@ -26,6 +26,11 @@ export async function GET(request: Request) {
       staffGroupJid: row.staff_group_jid,
       // Observe mode: bridge may send staff_notice (only) to staffGroupJid when true.
       staffNoticesEnabled: row.staff_notices_enabled === true,
+      // Informational: batched messages come back as { status: "done", decision: null, reasons: ["batched"], outbox: [] };
+      // the decision's outbox items arrive later through /outbox/claim.
+      batchingEnabled: row.batching_enabled === true,
+      batchQuietSeconds: row.batch_quiet_seconds,
+      batchMaxWaitSeconds: row.batch_max_wait_seconds,
     })),
   });
 }

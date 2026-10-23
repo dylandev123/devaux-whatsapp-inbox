@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { AGENT_MODES, CONTACT_SCOPES, requiredConfidence } from "@/lib/aiAgent/engine";
+import { parseAuthorizedSenders } from "@/lib/aiAgent/identity";
+import { validateBatchWindow } from "@/lib/aiAgent/batching";
 import { normalizeGroupJid } from "@/lib/aiAgent/chatDirectory";
 import { loadBusinessChats } from "@/lib/server/aiAgent/chats";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
@@ -43,6 +45,11 @@ interface Payload {
   maxAutoRepliesPerHour?: unknown;
   sendHoldingReply?: unknown;
   staffNoticesEnabled?: unknown;
+  batchingEnabled?: unknown;
+  batchQuietSeconds?: unknown;
+  batchMaxWaitSeconds?: unknown;
+  customerMemoryEnabled?: unknown;
+  staffAuthorizedSenders?: unknown;
 }
 
 function intIn(value: unknown, min: number, max: number): number | null {
@@ -120,8 +127,34 @@ export async function PUT(request: Request) {
     patch.staff_notices_enabled = body.staffNoticesEnabled;
   }
 
+  if (body.batchingEnabled !== undefined) {
+    if (typeof body.batchingEnabled !== "boolean") return jsonError("batchingEnabled must be a boolean", 400);
+    patch.batching_enabled = body.batchingEnabled;
+  }
+  if (body.customerMemoryEnabled !== undefined) {
+    if (typeof body.customerMemoryEnabled !== "boolean") return jsonError("customerMemoryEnabled must be a boolean", 400);
+    patch.customer_memory_enabled = body.customerMemoryEnabled;
+  }
+  if (body.staffAuthorizedSenders !== undefined) {
+    // Verified WhatsApp identities only: phone numbers or exact …@lid ids — never names.
+    const parsed = parseAuthorizedSenders(body.staffAuthorizedSenders);
+    if (!parsed.ok) return jsonError(parsed.error, 400);
+    patch.staff_authorized_senders = parsed.senders;
+  }
+
   try {
     const before = await ensureSettings(businessSlug);
+    // The quiet period and maximum wait are validated together, against whatever
+    // the other one currently is, so the pair can never end up inconsistent.
+    if (body.batchQuietSeconds !== undefined || body.batchMaxWaitSeconds !== undefined) {
+      const window = validateBatchWindow({
+        quiet: (body.batchQuietSeconds ?? before.batch_quiet_seconds) as number,
+        maxWait: (body.batchMaxWaitSeconds ?? before.batch_max_wait_seconds) as number,
+      });
+      if (!window.ok) return jsonError(window.error, 400);
+      patch.batch_quiet_seconds = window.quiet;
+      patch.batch_max_wait_seconds = window.maxWait;
+    }
     const { data, error } = await agentDb()
       .from("ai_agent_settings")
       .update(patch)

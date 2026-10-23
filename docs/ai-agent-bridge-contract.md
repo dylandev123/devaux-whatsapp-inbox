@@ -81,9 +81,19 @@ Request:
   "hasMedia": false,                             // image/video/audio/document/sticker present
   "quotedMessageId": null,                       // contextInfo.stanzaId when replying to a message
   "senderJid": null,                             // group participant JID (staff group); null for 1:1
+  "senderPhone": null,                           // staff group, @lid participants only: the phone number WhatsApp reported for it (Baileys participantPn); null when unknown
   "timestamp": "2026-10-22T14:03:11Z"            // informational
 }
 ```
+
+Staff-group sender identity: `senderJid` (and `senderPhone` for an `@lid`
+participant) are the ONLY identifiers the app uses to decide whether a sender may
+authorize a customer send (the per-business allow-list, see
+docs/ai-agent-staff-answers.md §2). Send exactly what WhatsApp reported — never a
+display name or push name, and never a phone number derived from the `@lid`'s own
+digits. Omit `senderPhone` when WhatsApp reported none: that sender can then match
+only an exact `…@lid` allow-list entry. A message with no `senderJid` (including
+`fromMe` messages the bridge cannot attribute) is treated as an unauthorized sender.
 
 Response `200`:
 
@@ -108,25 +118,55 @@ Bridge rules:
    `whatsappMessageId`) always comes back with `send: false` — never resend.
 4. `status: "error"` → nothing to send. Non-2xx → nothing to send; a retry with
    the same `whatsappMessageId` is safe.
-5. Ignore unknown `kind` values but still honour `send`.
+5. Ignore unknown `kind` values but still honour `send`. (Note for Observe
+   mode below: an unknown kind is NOT sendable there — see `staff_draft`.)
+6. If an item carries `replyToMessageId` (staff-group items only), post it as a
+   WhatsApp quote of that message in the same chat. It is optional: a bridge that
+   ignores the field behaves correctly, the item's text already names the
+   escalation.
 
 **Observe mode.** A business in `observe` mode may have `send: true` items of
-kind `staff_notice` **only**, addressed to `staffGroupJid`, and only when
-`staffNoticesEnabled` is `true` (default `false`, set per business in the admin
-UI). Every other kind, and every item addressed to a non-group chat, must not
-be sent in Observe mode (ack `failed` with `observe_mode`; `staff_notice_disabled`
-→ ack `staff_notices_disabled`). The bridge's global send switch
-(`AGENT_SEND_ENABLED=false`) blocks staff notices too. In Observe mode the app
-never creates `customer_reply`, `holding_reply`, `staff_relay` or
-`staff_feedback` items; a staff answer to an Observe notice is stored on the
-escalation for review and never forwarded to the customer. At most one notice
-is posted per escalation: later customer messages append to the open
-escalation without a new notice. A business with no staff group records its
-escalations in the admin panel only (no item is created).
+kind `staff_notice` **or `staff_draft`** only, addressed to `staffGroupJid`, and
+only when `staffNoticesEnabled` is `true` (default `false`, set per business in
+the admin UI). Every other kind, and every item addressed to a non-group chat,
+must not be sent in Observe mode (ack `failed` with `observe_mode`;
+`staff_notice_disabled` → ack `staff_notices_disabled`). The bridge's global
+send switch (`AGENT_SEND_ENABLED=false`) blocks staff notices and drafts too. In
+Observe mode the app never creates `customer_reply`, `holding_reply`,
+`staff_relay` or `staff_feedback` items; a staff answer to an Observe notice is
+stored for review, answered with a `staff_draft` in the staff group (a reply
+staff can copy), and never forwarded to the customer. At most one notice is
+posted per escalation: later customer messages append to the open escalation
+without a new notice. A business with no staff group records its escalations in
+the admin panel only (no item is created).
 
 `kind` values: `customer_reply`, `holding_reply` (to customer),
-`staff_notice`, `staff_feedback` (to staff group), `staff_relay` (staff answer
-→ customer).
+`staff_notice`, `staff_draft`, `staff_feedback` (to staff group), `staff_relay`
+(an explicitly authorized staff reply → customer).
+
+**`staff_draft` (new, bridge change required for Observe mode).** The drafted
+customer reply the app posts in the staff group after a staff answer. It is a
+staff-group kind exactly like `staff_notice`: same Observe rule, same global
+send switch, never addressed to a customer. An older bridge that ignores unknown
+kinds still delivers it in Assisted mode (rule 5), but refuses it in Observe
+(`observe_mode`) until it treats `staff_draft` like `staff_notice`.
+**Ack it with the WhatsApp message id** (like `staff_notice`): a staff member
+quoting the draft with "send" approves exactly that draft. `staff_feedback`
+acks should also carry the id (quoting a confirmation then resolves to its
+escalation), but nothing breaks if they do not.
+
+**Batched messages (no bridge change).** When a business has message batching
+on, a customer message is queued rather than decided: the response is
+`{ "status": "done", "decision": null, "reasons": ["batched"], "outbox": [] }`
+and there is nothing to send. Once the customer has been quiet for the
+configured period (or the maximum wait is reached) the app decides the whole
+batch as one turn, and any resulting items are `pending` outbox items that the
+bridge collects from its normal `/outbox/claim` poll (§3.4). Staff messages
+(`fromMe`) and staff-group messages are never batched. The `/message` contract
+is otherwise unchanged; keep polling `/outbox/claim` at `pollOutboxSeconds`
+(10 s) so batch results are delivered promptly. `/config` additionally reports
+`batchingEnabled`, `batchQuietSeconds`, `batchMaxWaitSeconds` per business
+(informational only).
 
 Errors: `400` invalid body, `401` bad secret, `503` agent not configured,
 `500` internal (fail closed).
@@ -138,8 +178,8 @@ Errors: `400` invalid body, `401` bad secret, `503` agent not configured,
 ```
 
 `status` is `"sent"` or `"failed"`. `whatsappMessageId` is the id Baileys
-returned for the sent message — **required for `staff_notice`**, because staff
-quoted-replies to that notice are matched by this id. Responses: `200 {ok:true}`
+returned for the sent message — **required for `staff_notice` and `staff_draft`**,
+because staff quoted-replies to those messages are matched by this id. Responses: `200 {ok:true}`
 (also for a repeated identical ack), `404` unknown id, `409` item not awaiting
 an ack. Do not retry the *send* on any ack error.
 
@@ -175,6 +215,11 @@ a `/message` call (admins answering escalations in the web UI).
 Each item is handed out exactly once (Postgres `FOR UPDATE SKIP LOCKED`).
 Send it, then `/ack` it.
 
+Each poll also acts as the batch scheduler's clock: after answering, the app
+processes any batches that are due (see `docs/ai-agent-batching-memory.md`), so
+the bridge needs no extra call. The claim only hands out items the business's
+*current* mode permits, whichever path created them.
+
 ## 4. Delivery semantics
 
 At-most-once. An outbox item is `pending → dispatched` when handed to the
@@ -195,22 +240,51 @@ the model is called.
 The agent posts a notice per escalation:
 
 ```
-🔔 AI escalation #E-7K3QX (HIGH)
-Customer: Jane · 17585551234
-Reason: complaint
-Message: "The bag arrived torn"
-Suggested reply: "…"
-↩️ Reply to this message (or include #E-7K3QX) with the exact text to send the customer.
-Commands: !note <text> · !close · !takeover · !resume
+🔔 AI escalation #E-7K3QX · HIGH
+⚠️ Complaint
+👤 Jane · 17585551234
+…
+↩️ Reply to this message (or include #E-7K3QX) with your answer. I'll draft the customer reply here — it is sent only when you reply "send".
+Commands: !note <text> · !send <text> · !close · !takeover · !resume
 ```
 
 A staff message is matched to an escalation **only** by (a) a quoted reply to
-one of its notices (`quotedMessageId`), or (b) exactly one `#E-XXXXX` code.
-No reference, several references, a quote and code that disagree, or an
-unknown code → nothing is sent (the app replies in the group with a
-`staff_feedback` explanation where useful). A matched plain answer is relayed
-to the customer **verbatim**. `!note` stores an internal note, `!close`
-resolves, `!takeover`/`!resume` pause/resume the AI for that customer.
+a message the agent posted for it (`quotedMessageId`: its notice, a draft, a
+confirmation), or (b) exactly one `#E-XXXXX` code. No reference, several
+references, a quote and code that disagree, or an unknown code → nothing happens
+and nothing is sent to anyone (the app replies in the group with a
+`staff_feedback` explanation where useful, Assisted mode only). Recency and
+customer names are never used. Anything containing the agent's own message
+headers ("Draft reply for #…", "AI escalation #…") is treated as an echo, never
+as an instruction.
+
+**A plain reply is information, not permission.** It is recorded, turned into a
+concise customer-facing draft plus a classification of what the staff told us
+(one model call), and the draft comes back to the group as a `staff_draft`:
+
+```
+✍️ Draft reply for #E-7K3QX · Jane
+"Hi Jane, the 15kg bag is EC$120 and we can deliver Friday."
+
+Not sent: your reply was saved as information only — I message the customer only when you approve it.
+To send it: reply to this message with "send" (or !send <your own wording>).
+```
+
+The customer is messaged only after **explicit authorization** — `!send`, a
+message that is only "send"/"send it"/"go ahead", or `!send <exact text>` — and
+only if every customer policy also allows it: Assisted mode, contact scope and
+exclusions, human takeover, no recent human reply in the chat, a safe draft (no
+price/link the staff did not state), the draft not older than the customer's
+latest message, and the same text not already sent. Otherwise the group is told
+why in plain words and a `staff_relay` is never created. Observe mode never
+sends, however it is authorized. If the bridge later reports the authorized
+reply as not sent (kill switch, unknown-send hold, takeover…), the app posts a
+`staff_feedback` ("Reply not sent for #E-7K3QX … the customer did not receive
+it").
+
+`!note` stores an internal note, `!close` resolves, `!takeover`/`!resume`
+pause/resume the AI for that customer. Full behaviour:
+`docs/ai-agent-staff-answers.md`.
 
 ## 6. Database objects (reference — the bridge does not access these)
 
@@ -226,9 +300,13 @@ Migration: `supabase/migrations/20261022000000_ai_agent.sql`.
 | `ai_agent_escalations` | Escalations with `ref_code`, priority, status, staff answer; one unanswered per chat |
 | `ai_agent_order_requests` | Collected, never-confirmed order requests |
 | `ai_agent_outbox` | Everything to send; unique `dedupe_key` |
-| `ai_agent_learning_candidates` | Staff answers awaiting admin approval as knowledge |
+| `ai_agent_batches`, `ai_agent_batch_messages` | Durable message batching (quiet period, maximum wait, leases); migration `20261025000000_ai_agent_batching_memory.sql` |
+| `ai_agent_customer_memory` | Customer-stated preferences + staff-confirmed resolved issues; same migration |
+| `ai_agent_staff_answers` | One row per staff message that answers an escalation: verbatim words, timestamp, business, escalation ref, the draft and whether it was sent or withheld (and why), classified items, time-bounded temporary facts; unique `(business_slug, source_message_id)`; migration `20261026000000_ai_agent_staff_answers.sql` |
+| `ai_agent_learning_candidates` | Durable facts staff supplied, awaiting admin approval as knowledge (with source message, time, ref and any conflict with approved entries) |
 | `ai_agent_audit_log` | Append-only audit trail |
 | `claim_ai_agent_outbox(p_business_slug, p_limit)` | Service-role-only claim function used by 3.4 |
+| `approve_ai_agent_learning_candidate(…)` | Atomic admin approval of a candidate; replacing an overlapping entry archives it |
 
 RLS: admins can read; nothing but the app's service role can write.
 

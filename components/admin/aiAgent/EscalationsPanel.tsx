@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { aiAgentApi, EscalationDelivery, EscalationView } from "@/lib/aiAgent/client";
+import { aiAgentApi, EscalationDelivery, EscalationView, StaffAnswerItemView, StaffAnswerView } from "@/lib/aiAgent/client";
 import { formatOrderRequest } from "@/lib/aiAgent/engine";
 import { failureReason } from "@/lib/aiAgent/outboxStatus";
+import { WITHHOLD_TEXT, type WithholdReason } from "@/lib/aiAgent/staffAnswers";
 import { Badge, Card, formatWhen, inputClass, Notice, primaryButton, secondaryButton } from "@/components/admin/aiAgent/ui";
 
 const NOTICE_SKIPPED: Record<string, string> = {
@@ -32,6 +33,66 @@ function noticeStatus(e: EscalationView): { tone: string; text: string } {
   }
 }
 
+const DISPOSITION_LABEL: Record<StaffAnswerItemView["disposition"], string> = {
+  candidate: "suggested for knowledge (awaiting approval)",
+  candidate_conflict: "suggested for knowledge — overlaps an approved entry",
+  already_known: "already in knowledge",
+  temporary: "used for now only (expires)",
+  customer_memory: "saved to this customer's record only",
+  recorded_only: "recorded here only",
+  skipped: "not used",
+};
+
+function StaffAnswerLine({ a, businessSlug, onChanged }: { a: StaffAnswerView; businessSlug: string; onChanged: () => void }) {
+  const [retrying, setRetrying] = useState(false);
+  const [retryMessage, setRetryMessage] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  async function retry() {
+    if (!window.confirm("Run this staff answer again? It is only allowed when no customer message may already have been sent for it.")) return;
+    setRetrying(true);
+    setRetryMessage(null);
+    try {
+      const res = await aiAgentApi.retryStaffAnswer(businessSlug, a.id);
+      setRetryMessage({ tone: "ok", text: res.message });
+      onChanged();
+    } catch (err) {
+      setRetryMessage({ tone: "error", text: err instanceof Error ? err.message : "Retry failed" });
+    } finally {
+      setRetrying(false);
+    }
+  }
+  const withheld = a.customer_action === "withheld";
+  const reason = a.withheld_reason ? (WITHHOLD_TEXT[a.withheld_reason as WithholdReason] ?? a.withheld_reason) : null;
+  return (
+    <div className="mt-1 rounded border border-zinc-200 px-2 py-1 text-xs text-zinc-700">
+      <p>
+        <span className="font-medium">{a.command === "send" ? "Staff approved sending" : "Staff answered"}</span> ({a.source === "whatsapp" ? "WhatsApp" : "dashboard"},{" "}
+        {formatWhen(a.staff_message_at ?? a.created_at)}): {a.body}
+      </p>
+      {a.draft && <p className="mt-0.5 text-zinc-600">Customer reply: “{a.draft}”</p>}
+      <p className={withheld ? "text-amber-700" : "text-emerald-700"}>
+        {a.customer_action === "sent" ? "Sent to the customer" : withheld ? `Not sent${reason ? `: ${reason}` : ""}` : "In progress"}
+        {a.state === "failed" && " · processing failed"}
+      </p>
+      {a.state === "failed" && (
+        <div className="mt-1 rounded border border-red-200 bg-red-50 px-2 py-1 text-red-700">
+          <p>Processing failed{a.error ? `: ${a.error}` : ""}. Staff were told in the group (Assisted mode). Nothing is retried automatically.</p>
+          {a.source === "whatsapp" && (
+            <button type="button" disabled={retrying} className={`${secondaryButton} mt-1`} onClick={retry}>
+              {retrying ? "Retrying…" : "Retry (only if no customer message was sent)"}
+            </button>
+          )}
+          {retryMessage && <p className={retryMessage.tone === "ok" ? "text-emerald-700" : "text-red-700"}>{retryMessage.text}</p>}
+        </div>
+      )}
+      {a.items.map((it, i) => (
+        <p key={i} className="text-zinc-500">
+          {it.category.replace("_", " ")}: {it.content} — {DISPOSITION_LABEL[it.disposition]}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function EscalationItem({
   businessSlug,
   e,
@@ -55,7 +116,7 @@ function EscalationItem({
     setBusy(true);
     setMessage(null);
     try {
-      const res = await aiAgentApi.actOnEscalation(businessSlug, e.id, action, body);
+      const res = await aiAgentApi.actOnEscalation(businessSlug, e.id, action, body, e.updated_at);
       setMessage({ tone: "ok", text: res.message });
       onChanged();
     } catch (err) {
@@ -78,6 +139,23 @@ function EscalationItem({
       {e.ai_summary && <p className="mt-1 text-xs text-zinc-500">Summary: {e.ai_summary}</p>}
       <p className="mt-1 whitespace-pre-wrap rounded bg-zinc-50 px-2 py-1 text-zinc-800">{e.customer_message}</p>
       {order && <p className="mt-1 text-xs text-amber-800">Order request (not confirmed): {order}</p>}
+      {(e.context?.history ?? []).length > 0 && (
+        <ul className="mt-1 list-disc pl-5 text-xs text-zinc-600">
+          {(e.context?.history ?? []).map((h, i) => (
+            <li key={i}>{h}</li>
+          ))}
+        </ul>
+      )}
+      {(e.context?.updates ?? []).length > 0 && (
+        <div className="mt-1 text-xs text-blue-800">
+          <p className="font-medium">Customer follow-ups since this opened:</p>
+          {(e.context?.updates ?? []).map((u, i) => (
+            <p key={i} className="whitespace-pre-wrap">
+              {formatWhen(u.at)}: {u.text}
+            </p>
+          ))}
+        </div>
+      )}
       <p className={`mt-1 text-xs ${notice.tone}`}>Staff notice: {notice.text}</p>
       {e.staff_answer && (
         <p className="mt-1 text-xs text-emerald-700">
@@ -87,6 +165,9 @@ function EscalationItem({
           )}
         </p>
       )}
+      {(e.answers ?? []).map((a) => (
+        <StaffAnswerLine key={a.id} a={a} businessSlug={businessSlug} onChanged={onChanged} />
+      ))}
       {(e.context?.notes ?? []).map((n, i) => (
         <p key={i} className="mt-1 text-xs text-zinc-500">
           Note {formatWhen(n.at)}: {n.text}
@@ -148,7 +229,7 @@ export function EscalationsPanel({ businessSlug, observe = false }: { businessSl
       subtitle={
         observe
           ? "Observe mode: staff answers are recorded for review and never sent to customers."
-          : "Staff can also answer in the WhatsApp group by replying to the notice or including its #E- code. Answers are sent verbatim."
+          : "Staff answer in the WhatsApp group by replying to the notice or a draft, or by including its #E- code. A reply is information: a drafted customer message is posted back and sent only when staff reply \"send\" (or !send). \"Send to customer\" here sends the exact text."
       }
     >
       <div className="flex flex-col gap-3">

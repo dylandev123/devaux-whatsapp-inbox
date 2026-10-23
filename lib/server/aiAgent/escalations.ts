@@ -1,23 +1,26 @@
 // Server-only: escalation records, staff actions on them (from the staff
 // WhatsApp group or the admin UI — one shared code path), and per-conversation
 // human takeover. Matching a staff message to an escalation is decided by
-// matchStaffReply() in lib/aiAgent/engine.ts; this file only loads candidates
-// and applies the result.
+// matchStaffReply() in lib/aiAgent/engine.ts; the staff-group flow that loads
+// candidates, drafts customer replies and applies the result lives in
+// lib/server/aiAgent/staffGroup.ts.
 
 import {
   AgentSettings,
+  appendCustomerMessage,
   buildStaffNotice,
   type PriorNotice,
   canSendToCustomers,
   EscalationPriority,
-  extractRefCodes,
-  MatchableEscalation,
-  matchStaffReply,
+  type ModelProposal,
+  customerMessageSegments,
   OrderRequestDraft,
   priorityFor,
   StaffCommand,
 } from "@/lib/aiAgent/engine";
 import { ActorKind, agentDb, audit, newRefCode } from "@/lib/server/aiAgent/db";
+import { loadIdentity } from "@/lib/server/aiAgent/identity";
+import { recordResolvedIssue } from "@/lib/server/aiAgent/memory";
 import { OutboxInsert } from "@/lib/server/aiAgent/outbox";
 
 export interface EscalationRow {
@@ -48,7 +51,7 @@ export interface EscalationRow {
 export const ESCALATION_COLUMNS =
   "id, ref_code, business_slug, chat_id, contact_number, customer_name, priority, status, reason, reason_codes, customer_message, ai_summary, proposed_reply, context, notice_message_id, staff_answer, answered_by, answered_via, answered_at, resolved_at, created_at, updated_at";
 
-/** Customer-facing sends (and staff-group feedback) need Assisted mode; see canSendStaffNotice() for notices. */
+/** Customer-facing sends (and staff-group feedback) need Assisted mode — necessary, not sufficient: see planCustomerSend(). */
 export function canSend(settings: AgentSettings | null): boolean {
   return canSendToCustomers(settings);
 }
@@ -75,9 +78,14 @@ export interface EscalateInput {
   customerMessage: string;
   draftReply: string | null;
   summary: string | null;
+  intent?: ModelProposal["intent"] | null;
   orderRequest: OrderRequestDraft | null;
+  /** Verified-history lines (lib/aiAgent/memory.ts) kept on the escalation for the staff notice. */
+  history?: string[];
   eventId: string | null;
 }
+
+const MAX_RECORDED_UPDATES = 20;
 
 /** Opens an escalation, or appends to the conversation's open one. */
 export async function createOrAppendEscalation(
@@ -88,13 +96,28 @@ export async function createOrAppendEscalation(
     const existing = await findOpenEscalation(input.businessSlug, input.chatId);
     if (existing) {
       const reasonCodes = Array.from(new Set([...existing.reason_codes, ...input.reasons]));
+      const customerMessage = appendCustomerMessage(existing.customer_message, input.customerMessage);
+      // Every follow-up that adds something new is logged on the escalation, so
+      // an update is never lost even when no second notice is posted (Observe).
+      // A re-processed batch adds nothing new and is not logged twice.
+      const updates = Array.isArray(existing.context.updates) ? (existing.context.updates as unknown[]) : [];
+      const isNew = customerMessage !== existing.customer_message;
+      const nextUpdates = isNew
+        ? [...updates, { at: new Date().toISOString(), text: input.customerMessage.slice(0, 300) }].slice(-MAX_RECORDED_UPDATES)
+        : updates;
       const { data, error } = await db
         .from("ai_agent_escalations")
         .update({
-          customer_message: `${existing.customer_message ?? ""}\n---\n${input.customerMessage}`.slice(-4000),
+          customer_message: customerMessage,
           reason_codes: reasonCodes,
           priority: priorityFor(reasonCodes, existing.priority),
-          context: { ...existing.context, order_request: input.orderRequest ?? existing.context.order_request ?? null },
+          context: {
+            ...existing.context,
+            order_request: input.orderRequest ?? existing.context.order_request ?? null,
+            intent: input.intent ?? existing.context.intent ?? null,
+            history: input.history?.length ? input.history : existing.context.history ?? [],
+            updates: nextUpdates,
+          },
         })
         .eq("id", existing.id)
         .select(ESCALATION_COLUMNS)
@@ -117,7 +140,7 @@ export async function createOrAppendEscalation(
         customer_message: input.customerMessage.slice(0, 4000),
         ai_summary: input.summary,
         proposed_reply: input.draftReply,
-        context: { order_request: input.orderRequest },
+        context: { order_request: input.orderRequest, intent: input.intent ?? null, history: input.history ?? [] },
         source_event_id: input.eventId,
       })
       .select(ESCALATION_COLUMNS)
@@ -165,12 +188,16 @@ export function staffNoticeFor(
     refCode: escalation.ref_code,
     priority: escalation.priority,
     customerLabel: [escalation.customer_name, escalation.contact_number].filter(Boolean).join(" · ") || escalation.chat_id,
-    reasons: input.reasons,
-    customerMessage: input.customerMessage,
+    // The escalation's accumulated codes and history, not just this message's.
+    reasons: Array.from(new Set([...escalation.reason_codes, ...input.reasons])),
+    customerMessage: escalation.customer_message ?? input.customerMessage,
+    summary: escalation.ai_summary,
+    intent: (escalation.context.intent as ModelProposal["intent"] | null | undefined) ?? null,
     draftReply: input.draftReply,
     orderRequest: input.orderRequest,
     followUp,
     observeOnly,
+    history: Array.isArray(escalation.context.history) ? (escalation.context.history as string[]) : [],
   });
 }
 
@@ -209,6 +236,58 @@ export async function setConversationControl(input: {
   }, { reason: input.reason, human_until: humanUntil });
 }
 
+// ── Resolved issues → long-term memory ───────────────────────────────────────
+
+const ISSUE_CODES = ["complaint", "refund", "payment_claim", "health_concern", "legal_threat", "cancellation", "exception"];
+
+/**
+ * A staff-closed escalation about a real issue (not an ordinary order) becomes
+ * a short "resolved earlier" note about that customer — staff-confirmed by
+ * definition. Amounts are masked: memory never carries prices. Best effort.
+ */
+async function rememberResolvedIssue(e: EscalationRow, settings: AgentSettings | null): Promise<void> {
+  if (!settings?.customer_memory_enabled || !e.reason_codes.some((c) => ISSUE_CODES.includes(c))) return;
+  try {
+    const gist = e.ai_summary ?? customerMessageSegments(e.customer_message ?? "")[0] ?? e.reason;
+    const identity = await loadIdentity(e.business_slug, e.chat_id, e.contact_number);
+    await recordResolvedIssue({
+      businessSlug: e.business_slug,
+      chatId: e.chat_id,
+      identity,
+      escalationId: e.id,
+      refCode: e.ref_code,
+      text: gist.replace(/(?:EC\$|US\$|\$)\s?\d[\d,.]*/g, "[amount]"),
+    });
+  } catch (err) {
+    console.error("[aiAgent] rememberResolvedIssue", err instanceof Error ? err.message : err);
+  }
+}
+
+/**
+ * Records that staff answered an escalation. `notRelayed` says why the customer
+ * was not messaged (kept for the admin UI); null means a message was queued.
+ * With no body only the status and that flag change (approving an earlier draft).
+ */
+export async function markEscalationAnswered(
+  e: EscalationRow,
+  input: { body: string | null; actorId: string | null; via: "whatsapp" | "admin_ui"; notRelayed: string | null }
+): Promise<void> {
+  const context: Record<string, unknown> = { ...e.context };
+  delete context.answer_not_relayed;
+  const patch: Record<string, unknown> = {
+    status: "answered",
+    context: input.notRelayed ? { ...context, answer_not_relayed: input.notRelayed } : context,
+  };
+  if (input.body !== null) {
+    patch.staff_answer = input.body;
+    patch.answered_by = input.actorId;
+    patch.answered_via = input.via;
+    patch.answered_at = new Date().toISOString();
+  }
+  const { error } = await agentDb().from("ai_agent_escalations").update(patch).eq("id", e.id).eq("business_slug", e.business_slug);
+  if (error) throw new Error(error.message);
+}
+
 // ── Staff actions (shared by WhatsApp group + admin UI) ──────────────────────
 
 export interface StaffActionResult {
@@ -236,45 +315,11 @@ export async function applyStaffAction(input: {
   let feedback: string;
 
   switch (command) {
-    case "send": {
-      const sendable = canSend(input.settings);
-      if (sendable) {
-        outbox.push({
-          businessSlug: e.business_slug,
-          chatId: e.chat_id,
-          kind: "staff_relay",
-          toJid: e.chat_id,
-          body,
-          dedupeKey: `${input.dedupeBase}:staff_relay`,
-          escalationId: e.id,
-          createdBy: input.actorKind === "admin" ? input.actorId : null,
-        });
-      }
-      const { error } = await db
-        .from("ai_agent_escalations")
-        .update({
-          status: "answered",
-          staff_answer: body,
-          answered_by: input.actorId,
-          answered_via: input.via,
-          answered_at: now,
-          // Recorded for review only: nothing was queued for the customer.
-          context: sendable ? e.context : { ...e.context, answer_not_relayed: input.settings?.mode ?? "disabled" },
-        })
-        .eq("id", e.id);
-      if (error) throw new Error(error.message);
-      // A correction candidate only — becomes knowledge solely on admin approval.
-      await db
-        .from("ai_agent_learning_candidates")
-        .upsert(
-          { business_slug: e.business_slug, escalation_id: e.id, question: e.customer_message, staff_answer: body },
-          { onConflict: "escalation_id", ignoreDuplicates: true }
-        );
-      feedback = sendable
-        ? `✅ #${e.ref_code}: sending your answer to the customer.`
-        : `⚠️ #${e.ref_code}: answer saved, but the agent is not in Assisted mode so nothing was sent. Reply to the customer directly.`;
-      break;
-    }
+    case "send":
+      // Messaging a customer has ONE policy (planCustomerSend in customerSend.ts) and one
+      // implementation per entry point (staffGroup.ts, adminSend.ts). This generic action
+      // handler refuses to be a third, unguarded way in.
+      throw new Error("Customer sends must go through planCustomerSend()");
     case "note": {
       const notes = Array.isArray(e.context.notes) ? e.context.notes : [];
       const { error } = await db
@@ -291,6 +336,7 @@ export async function applyStaffAction(input: {
         .update({ status: "resolved", resolved_at: now })
         .eq("id", e.id);
       if (error) throw new Error(error.message);
+      await rememberResolvedIssue(e, input.settings);
       feedback = `☑️ #${e.ref_code}: closed.`;
       break;
     }
@@ -319,129 +365,4 @@ export async function applyStaffAction(input: {
     body: body ? body.slice(0, 500) : null,
   });
   return { outbox, feedback };
-}
-
-// ── Staff group messages ─────────────────────────────────────────────────────
-
-async function matchCandidates(
-  businessSlug: string,
-  text: string,
-  quotedMessageId: string | null
-): Promise<MatchableEscalation[]> {
-  const db = agentDb();
-  const refs = extractRefCodes(text);
-  const byId = new Map<string, MatchableEscalation>();
-
-  if (refs.length > 0) {
-    const { data, error } = await db
-      .from("ai_agent_escalations")
-      .select("id, ref_code, notice_message_id, status")
-      .eq("business_slug", businessSlug)
-      .in("ref_code", refs);
-    if (error) throw new Error(error.message);
-    for (const row of data ?? []) byId.set(row.id, row as MatchableEscalation);
-  }
-
-  if (quotedMessageId) {
-    // Any notice we posted (first or follow-up) identifies its escalation.
-    const { data: notices, error } = await db
-      .from("ai_agent_outbox")
-      .select("escalation_id")
-      .eq("business_slug", businessSlug)
-      .eq("kind", "staff_notice")
-      .eq("whatsapp_message_id", quotedMessageId);
-    if (error) throw new Error(error.message);
-    const ids = Array.from(new Set((notices ?? []).map((n) => n.escalation_id).filter(Boolean)));
-    if (ids.length > 0) {
-      const { data, error: escError } = await db
-        .from("ai_agent_escalations")
-        .select("id, ref_code, notice_message_id, status")
-        .eq("business_slug", businessSlug)
-        .in("id", ids);
-      if (escError) throw new Error(escError.message);
-      for (const row of data ?? []) byId.set(row.id, { ...(row as MatchableEscalation), notice_message_id: quotedMessageId });
-    }
-  }
-  return Array.from(byId.values());
-}
-
-export async function processStaffGroupMessage(input: {
-  settings: AgentSettings;
-  text: string;
-  quotedMessageId: string | null;
-  senderJid: string | null;
-  eventId: string;
-}): Promise<{ outbox: OutboxInsert[]; outcome: string; escalationId: string | null }> {
-  const { settings } = input;
-  const groupJid = settings.staff_group_jid!;
-  const candidates = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
-  const match = matchStaffReply({ text: input.text, quotedMessageId: input.quotedMessageId }, candidates);
-
-  const feedback = (body: string): OutboxInsert => ({
-    businessSlug: settings.business_slug,
-    chatId: groupJid,
-    kind: "staff_feedback",
-    toJid: groupJid,
-    body,
-    dedupeKey: `${input.eventId}:staff_feedback`,
-    eventId: input.eventId,
-  });
-  // Staff feedback only speaks in Assisted mode — Observe never posts anything.
-  const speak = canSend(settings);
-
-  switch (match.kind) {
-    case "unmatched":
-      return { outbox: [], outcome: "unmatched", escalationId: null };
-    case "ambiguous":
-      return {
-        outbox: speak ? [feedback(`⚠️ Not sent: that message matches more than one escalation (${match.refCodes.map((r) => `#${r}`).join(", ")}). Reply to one escalation at a time.`)] : [],
-        outcome: "ambiguous",
-        escalationId: null,
-      };
-    case "unknown_ref":
-      return {
-        outbox: speak ? [feedback(`⚠️ Not sent: no escalation ${match.refCodes.map((r) => `#${r}`).join(", ")} found.`)] : [],
-        outcome: "unknown_ref",
-        escalationId: null,
-      };
-    case "closed":
-      return {
-        outbox: speak ? [feedback(`ℹ️ #${match.refCode} is already closed — nothing was sent.`)] : [],
-        outcome: "closed",
-        escalationId: match.escalationId,
-      };
-    case "empty":
-      return {
-        outbox: speak ? [feedback(`⚠️ #${match.refCode}: no answer text found — nothing was sent.`)] : [],
-        outcome: "empty",
-        escalationId: match.escalationId,
-      };
-    case "matched": {
-      const { data, error } = await agentDb()
-        .from("ai_agent_escalations")
-        .select(ESCALATION_COLUMNS)
-        .eq("id", match.escalationId)
-        .eq("business_slug", settings.business_slug)
-        .maybeSingle();
-      if (error) throw new Error(error.message);
-      if (!data) {
-        // Belt and braces: candidates are already business-scoped, so this
-        // means the row belongs to another business. Never act on it.
-        return { outbox: [], outcome: "unknown_ref", escalationId: null };
-      }
-      const result = await applyStaffAction({
-        escalation: data as EscalationRow,
-        command: match.command,
-        body: match.body,
-        settings,
-        actorKind: "staff",
-        actorId: input.senderJid,
-        via: "whatsapp",
-        dedupeBase: input.eventId,
-      });
-      const outbox: OutboxInsert[] = result.outbox.map((o) => ({ ...o, eventId: input.eventId }));
-      if (speak) outbox.push(feedback(result.feedback));
-      return { outbox, outcome: `matched:${match.command}`, escalationId: match.escalationId };
-    }
-  }
 }

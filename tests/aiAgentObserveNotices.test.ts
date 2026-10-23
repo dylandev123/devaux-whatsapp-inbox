@@ -36,6 +36,10 @@ const settings = (over: Partial<AgentSettings> = {}): AgentSettings => ({
   max_auto_replies_per_hour: 6,
   send_holding_reply: true,
   staff_notices_enabled: true,
+  batching_enabled: false,
+  batch_quiet_seconds: 45,
+  batch_max_wait_seconds: 180,
+  customer_memory_enabled: false,
   ...over,
 });
 
@@ -144,7 +148,7 @@ test("a quoted staff reply to an Observe notice is matched as an answer to recor
   const m = matchStaffReply({ text: "We deliver Tuesdays", quotedMessageId: "WA-1" }, cands);
   assert.equal(m.kind, "matched");
   if (m.kind === "matched") {
-    assert.equal(m.command, "send");
+    assert.equal(m.command, "answer");
     assert.equal(m.body, "We deliver Tuesdays");
   }
   // Recording only: in Observe, applyStaffAction() queues no staff_relay
@@ -170,9 +174,10 @@ test("the Observe notice says nothing is sent to the customer", () => {
   const observe = buildStaffNotice({ ...base, observeOnly: true });
   assert.match(observe, /Observe mode: nothing is sent to the customer/);
   assert.match(observe, /AI draft \(NOT sent\)/);
-  assert.doesNotMatch(observe, /exact text to send the customer/);
+  assert.doesNotMatch(observe, /sent only when you reply "send"/);
   const assisted = buildStaffNotice(base);
-  assert.match(assisted, /exact text to send the customer/);
+  assert.match(assisted, /sent only when you reply "send"/);
+  assert.doesNotMatch(assisted, /exact text to send the customer/);
 });
 
 // ── Regression: escalation opened while notices were off ────────────────────
@@ -243,4 +248,110 @@ test("a failed-then-blocked notice does not stop the first notice after notices 
 
 test("Assisted follow-ups are unchanged", () => {
   assert.equal(staffNoticeSkipReason(settings({ mode: "assisted" }), true, [{ status: "sent", error: null }]), null);
+});
+
+// ── Staff notice content ────────────────────────────────────────────────────
+
+import { appendCustomerMessage, categorizeRequest, customerMessageSegments } from "../lib/aiAgent/engine.ts";
+
+const SEP = "\n---\n";
+const notice = (over: Partial<Parameters<typeof buildStaffNotice>[0]> = {}) =>
+  buildStaffNotice({
+    refCode: "E-ZTK57",
+    priority: "high",
+    customerLabel: "Jane · 17585551234",
+    reasons: ["order_approval"],
+    customerMessage: "I want dog food",
+    draftReply: null,
+    orderRequest: null,
+    followUp: false,
+    observeOnly: true,
+    ...over,
+  });
+
+test("notice: repeated customer messages are shown once", () => {
+  const text = notice({ customerMessage: ["Hi", "I need 2 bags", "i need 2 bags!", "I need 2 bags", "Hello"].join(SEP) });
+  assert.equal(text.match(/I need 2 bags/gi)?.length, 1);
+  assert.doesNotMatch(text, /• Hi$/m);
+  assert.doesNotMatch(text, /---/);
+  assert.equal(appendCustomerMessage("I need 2 bags", "  i need 2 BAGS "), "I need 2 bags");
+  assert.deepEqual(customerMessageSegments(["Hi", "Hi"].join(SEP)), ["Hi"]);
+});
+
+test("notice: several product enquiries become separate short points, capped", () => {
+  const msgs = ["Price of puppy food?", "Do you have 15kg adult?", "Is the lamb one in stock?", "And the senior kind?", "What about treats?", "Thanks"];
+  const text = notice({ reasons: ["unverified_answer"], customerMessage: msgs.join(SEP), intent: "question" });
+  assert.match(text, /📦 Product enquiry/);
+  assert.match(text, /• Price of puppy food\?/);
+  assert.match(text, /• What about treats\?/);
+  assert.match(text, /\+1 more message/);
+  assert.doesNotMatch(text, /Do you have 15kg adult/); // omitted middle message
+});
+
+test("notice: the summary replaces the first message, later messages are kept", () => {
+  const text = notice({
+    summary: "Wants to order 3 bags of adult food",
+    customerMessage: ["asdf long rambling first message", "Delivery on Friday please"].join(SEP),
+  });
+  assert.match(text, /• Wants to order 3 bags of adult food/);
+  assert.match(text, /• Delivery on Friday please/);
+  assert.doesNotMatch(text, /rambling/);
+});
+
+test("notice: incomplete order lists exactly what is missing and invents nothing", () => {
+  const text = notice({
+    customerMessage: "2 bags of adult 15kg",
+    orderRequest: { items: [{ product: "Adult 15kg", quantity: null }], delivery_address: null, delivery_preference: "Friday", notes: null },
+    reasons: ["collecting_order_details"],
+  });
+  assert.match(text, /🛒 New order/);
+  assert.match(text, /Adult 15kg — qty not given/);
+  assert.match(text, /Delivery: Friday/);
+  assert.match(text, /Missing: Quantity for each product/);
+  assert.match(text, /Missing: Delivery address/);
+  assert.doesNotMatch(text, /Missing: Delivery day/);
+  assert.match(text, /NOT confirmed/);
+  assert.doesNotMatch(text, /Address:/);
+  assert.doesNotMatch(text, /[$€]|EC\$|price:/i);
+});
+
+test("notice: complete order asks staff to confirm; no order data at all asks for everything", () => {
+  const done = notice({
+    orderRequest: { items: [{ product: "Adult 15kg", quantity: "2" }], delivery_address: "Castries", delivery_preference: "Sat", notes: null },
+  });
+  assert.match(done, /Check availability and price/);
+  assert.doesNotMatch(done, /Missing:/);
+  const none = notice({ intent: "order", customerMessage: "I'd like to order" });
+  assert.match(none, /Order details were not captured/);
+});
+
+test("notice: a stale AI draft is dropped once the customer has written again", () => {
+  const fresh = notice({ draftReply: "We have it for sure!", customerMessage: "Do you have lamb?", reasons: ["unverified_answer"] });
+  assert.match(fresh, /AI draft \(NOT sent\): "We have it for sure!"/);
+  const stale = notice({ draftReply: "We have it for sure!", customerMessage: ["Do you have lamb?", "Actually I want beef"].join(SEP) });
+  assert.doesNotMatch(stale, /for sure/);
+  assert.doesNotMatch(stale, /AI draft|Suggested reply/);
+  const followUp = notice({ draftReply: "old", followUp: true, observeOnly: false });
+  assert.doesNotMatch(followUp, /Suggested reply/);
+});
+
+test("notice: reason codes stay out of WhatsApp; category and ref are clear", () => {
+  const text = notice({ reasons: ["complaint", "open_escalation", "low_confidence"], customerMessage: "Bag arrived torn" });
+  assert.doesNotMatch(text, /Reason:|open_escalation|low_confidence|model_/);
+  assert.match(text, /⚠️ Complaint/);
+  assert.match(text, /AI escalation #E-ZTK57/);
+  assert.match(text, /Jane · 17585551234/);
+  assert.match(text, /Observe mode: nothing is sent to the customer/);
+  assert.match(text, /Commands: !note/);
+  assert.equal(categorizeRequest({ reasons: ["payment_claim"], orderRequest: null, messages: ["I paid"] }), "payment_issue");
+  assert.equal(categorizeRequest({ reasons: ["model_escalated"], intent: "question", orderRequest: null, messages: ["Are you open Sunday?"] }), "unanswered_question");
+  assert.equal(categorizeRequest({ reasons: ["discount"], orderRequest: null, messages: ["Any discount?"] }), "other");
+});
+
+test("notice: the ref in a generated notice still matches staff replies, and the notice itself is never an answer", () => {
+  const text = notice();
+  const escalations = [{ id: "1", ref_code: "E-ZTK57", notice_message_id: "N1", status: "notified" }];
+  assert.deepEqual(matchStaffReply({ text, quotedMessageId: "N1" }, escalations), { kind: "unmatched" });
+  const m = matchStaffReply({ text: "#E-ZTK57 we have it", quotedMessageId: null }, escalations);
+  assert.equal(m.kind === "matched" && m.command, "answer");
 });

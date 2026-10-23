@@ -38,6 +38,10 @@ const SETTINGS: AgentSettings = {
   max_auto_replies_per_hour: 6,
   send_holding_reply: true,
   staff_notices_enabled: false,
+  batching_enabled: false,
+  batch_quiet_seconds: 45,
+  batch_max_wait_seconds: 180,
+  customer_memory_enabled: false,
 };
 
 function gate(overrides: Partial<GateInput> = {}) {
@@ -297,8 +301,10 @@ test("matchStaffReply: quoted reply to the notice matches exactly", () => {
     kind: "matched",
     escalationId: "2",
     refCode: "E-FGHJK",
-    command: "send",
+    // A plain reply is an ANSWER (information), never an instruction to message the customer.
+    command: "answer",
     body: "Yes we deliver to Vieux Fort on Fridays",
+    via: "quote",
   });
 });
 

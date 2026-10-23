@@ -2,11 +2,13 @@ import { NextResponse } from "next/server";
 import { jsonError, readJson, verifyBridgeSecret } from "@/lib/server/aiAgent/auth";
 import { audit, parseBusinessSlug } from "@/lib/server/aiAgent/db";
 import { processBridgeMessage } from "@/lib/server/aiAgent/decide";
+import { sweepBatchesAfterResponse } from "@/lib/server/aiAgent/scheduler";
 
 // Bridge → app (server-to-server). Contract: docs/ai-agent-bridge-contract.md.
 // The bridge forwards each stored message here and sends ONLY the returned
 // outbox items with send: true, then acks each via /api/bridge/ai-agent/ack.
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 interface Payload {
   businessSlug?: unknown;
@@ -18,6 +20,7 @@ interface Payload {
   hasMedia?: unknown;
   quotedMessageId?: unknown;
   senderJid?: unknown;
+  senderPhone?: unknown;
   timestamp?: unknown;
 }
 
@@ -51,8 +54,11 @@ export async function POST(request: Request) {
       hasMedia: body.hasMedia === true,
       quotedMessageId: str(body.quotedMessageId, 200),
       senderJid: str(body.senderJid, 200),
+      senderPhone: str(body.senderPhone, 40),
       timestamp: str(body.timestamp, 64),
     });
+    // Any forwarded message is also a chance to process OTHER chats' due batches.
+    sweepBatchesAfterResponse();
     return NextResponse.json(result);
   } catch (err) {
     console.error("[bridge/ai-agent/message]", err);

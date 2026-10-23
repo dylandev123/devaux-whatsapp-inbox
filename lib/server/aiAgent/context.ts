@@ -1,23 +1,24 @@
 // Server-only: assembles what the agent knows about a customer, reusing the
-// existing memory tables rather than duplicating them —
-//   customers            (verified, staff-entered identity)
-//   customer_ai_profile  (AI-inferred soft facts, maintained by the analysis engine)
-//   customer_orders      (permanent order history, survives the 7-day purge)
-// plus a short slice of recent whatsapp_messages for conversational context.
-// Read-only: the agent never writes any of these tables.
+// existing memory tables rather than duplicating them (see
+// lib/server/aiAgent/memory.ts) — verified orders, customer-stated facts and
+// AI inferences arrive as ONE concise, labelled brief — plus a short slice of
+// recent whatsapp_messages for conversational context (retention-limited).
+// Read-only: loading context never writes anything.
 
 import { resolveContactName } from "@/lib/contactName";
 import { isOutbound, resolveRecipientNumber } from "@/lib/whatsapp";
 import { OrderRequestDraft } from "@/lib/aiAgent/engine";
+import { ChatIdentity } from "@/lib/aiAgent/identity";
+import { MemoryBrief } from "@/lib/aiAgent/memory";
 import { agentDb } from "@/lib/server/aiAgent/db";
+import { loadMemoryBrief } from "@/lib/server/aiAgent/memory";
 
 const TRANSCRIPT_MESSAGES = 12;
 
 export interface CustomerContext {
   customerKey: string;
   customerName: string;
-  profile: Record<string, string>;
-  recentOrders: { summary: string; status: string | null; at: string | null }[];
+  memory: MemoryBrief;
   transcript: { who: "Customer" | "Staff"; text: string; at: string }[];
 }
 
@@ -25,37 +26,32 @@ export async function loadCustomerContext(
   businessSlug: string,
   chatId: string,
   contactNumber: string | null,
-  excludeMessageId: string | null
+  excludeMessageIds: string[],
+  identity: ChatIdentity,
+  messageText: string
 ): Promise<CustomerContext> {
   const db = agentDb();
-  const customerKey = resolveRecipientNumber(contactNumber, chatId);
+  // Display label only. Customer rows are matched by a VERIFIED phone, never
+  // by lid digits that merely look like a number.
+  const customerKey = identity.phone ?? resolveRecipientNumber(contactNumber, chatId);
+  const excluded = new Set(excludeMessageIds);
 
-  const [customer, profile, orders, messages] = await Promise.all([
-    db
-      .from("customers")
-      .select("first_name, last_name, whatsapp_name, business_contact_name")
-      .eq("phone_number", customerKey)
-      .maybeSingle(),
-    db
-      .from("customer_ai_profile")
-      .select("preferences, common_orders, addresses, payment_habits, important_notes, last_known_intent")
-      .eq("business_slug", businessSlug)
-      .eq("contact_number", customerKey)
-      .maybeSingle(),
-    db
-      .from("customer_orders")
-      .select("summary, order_status, source_message_at")
-      .eq("business_slug", businessSlug)
-      .eq("contact_number", customerKey)
-      .order("source_message_at", { ascending: false, nullsFirst: false })
-      .limit(3),
+  const [customer, memory, messages] = await Promise.all([
+    identity.phone
+      ? db
+          .from("customers")
+          .select("first_name, last_name, whatsapp_name, business_contact_name")
+          .eq("phone_number", identity.phone)
+          .maybeSingle()
+      : Promise.resolve({ data: null }),
+    loadMemoryBrief(businessSlug, identity, messageText),
     db
       .from("whatsapp_messages")
       .select("whatsapp_message_id, direction, message_body, timestamp")
       .eq("business_slug", businessSlug)
       .eq("chat_id", chatId)
       .order("timestamp", { ascending: false })
-      .limit(TRANSCRIPT_MESSAGES + 1),
+      .limit(TRANSCRIPT_MESSAGES + excluded.size + 1),
   ]);
 
   // Missing tables / rows degrade to "nothing known", never to a failure.
@@ -68,13 +64,8 @@ export async function loadCustomerContext(
     phoneNumber: customerKey,
   });
 
-  const profileFacts: Record<string, string> = {};
-  for (const [key, value] of Object.entries(profile.data ?? {})) {
-    if (typeof value === "string" && value.trim()) profileFacts[key] = value.trim();
-  }
-
   const transcript = (messages.data ?? [])
-    .filter((m) => !excludeMessageId || m.whatsapp_message_id !== excludeMessageId)
+    .filter((m) => !excluded.has(m.whatsapp_message_id))
     .filter((m) => m.message_body?.trim())
     .slice(0, TRANSCRIPT_MESSAGES)
     .reverse()
@@ -84,17 +75,7 @@ export async function loadCustomerContext(
       at: m.timestamp,
     }));
 
-  return {
-    customerKey,
-    customerName,
-    profile: profileFacts,
-    recentOrders: (orders.data ?? []).map((o) => ({
-      summary: o.summary,
-      status: o.order_status,
-      at: o.source_message_at,
-    })),
-    transcript,
-  };
+  return { customerKey, customerName, memory, transcript };
 }
 
 export interface OpenOrderRequest extends OrderRequestDraft {

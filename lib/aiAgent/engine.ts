@@ -11,6 +11,7 @@
 // bar for otherwise-clean REPLY/ASK proposals — it can never bypass them.
 
 import { BLOCK_REASONS, failureReason } from "./outboxStatus.ts";
+import type { RepeatResolution } from "./memory.ts";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -63,6 +64,19 @@ export interface AgentSettings {
   send_holding_reply: boolean;
   /** Observe mode only: permit staff_notice (never customer messages) to the staff group. Default false. */
   staff_notices_enabled: boolean;
+  /** Group a customer's rapid-fire messages into one turn (see lib/aiAgent/batching.ts). Default false. */
+  batching_enabled: boolean;
+  /** Seconds of silence after the latest inbound message before the batch is processed (0–120). */
+  batch_quiet_seconds: number;
+  /** A batch is processed at most this long after its first message, however chatty the customer is. */
+  batch_max_wait_seconds: number;
+  /** Let the agent capture explicit customer preferences / resolved issues into long-term memory. Default false. */
+  customer_memory_enabled: boolean;
+  /**
+   * Verified WhatsApp identities (phone digits or exact "<digits>@lid") allowed to make the agent message a
+   * customer from the staff group ("!send"). Empty/absent = nobody. See authorizeStaffSender() in identity.ts.
+   */
+  staff_authorized_senders?: string[] | null;
 }
 
 export type ContactRule = "allow" | "exclude";
@@ -94,6 +108,8 @@ export interface ModelProposal {
   priority: EscalationPriority | null;
   summary: string | null;
   order_request: OrderRequestDraft | null;
+  /** Raw, UNVALIDATED memory candidates; validateMemoryFacts() (lib/aiAgent/memory.ts) decides what is kept. */
+  memory_facts?: unknown[];
 }
 
 export interface KnowledgeFact {
@@ -134,12 +150,15 @@ function chatKind(chatId: string): "group" | "system" | "direct" {
 // ── Send policy: which outbox kinds a business may produce ───────────────────
 //
 // customer_reply / holding_reply / staff_relay reach a customer and exist only
-// in Assisted mode. staff_notice (and staff_feedback) go to the staff group:
-// staff_notice may also be sent in Observe mode, but only when the business has
+// in Assisted mode. staff_notice, staff_draft and staff_feedback go to the staff
+// group: staff_notice and staff_draft (the drafted customer reply posted after a
+// staff answer) may also be sent in Observe mode, but only when the business has
 // staff_notices_enabled AND a staff group. Observe mode never sends anything
-// else. The bridge enforces the same table independently.
+// else. Staff-group sending (canSendStaffNotice) and customer sending
+// (canSendToCustomers) are separate permissions: neither implies the other.
+// The bridge enforces the same table independently.
 
-export const STAFF_GROUP_KINDS = ["staff_notice", "staff_feedback"] as const;
+export const STAFF_GROUP_KINDS = ["staff_notice", "staff_draft", "staff_feedback"] as const;
 
 /** True for outbox kinds addressed to the customer (everything but the staff-group kinds). */
 export function isCustomerBoundKind(kind: string): boolean {
@@ -158,11 +177,14 @@ export function canSendStaffNotice(settings: AgentSettings | null): boolean {
   return settings.mode === "observe" && settings.staff_notices_enabled === true;
 }
 
+/** Observe-capable staff-group kinds: a notice, or the draft posted after a staff answer. */
+const OBSERVE_STAFF_KINDS: readonly string[] = ["staff_notice", "staff_draft"];
+
 /** Final gate on every item the live path is about to enqueue. */
 export function outboxAllowed(settings: AgentSettings | null, item: { kind: string; toJid: string }): boolean {
   if (!settings?.enabled) return false;
   if (settings.mode === "assisted") return true;
-  return item.kind === "staff_notice" && canSendStaffNotice(settings) && item.toJid === settings.staff_group_jid;
+  return OBSERVE_STAFF_KINDS.includes(item.kind) && canSendStaffNotice(settings) && item.toJid === settings.staff_group_jid;
 }
 
 /** A staff_notice outbox row already created for an escalation (any status). */
@@ -329,6 +351,11 @@ const CREDENTIAL_PATTERN =
 const COMMITMENT_PATTERN =
   /\b((is|are|been|be|all|now|and) confirmed|(order|booking|delivery|payment) (is |has been )?(placed|booked|confirmed|scheduled|received)|confirm(ed)? your (order|delivery|payment)|in stock|out of stock|(we|i) have (it|them|that|plenty|some) (available|in stock)?|available (now|today)|(will|'ll|shall) (be )?(deliver(ed)?|ship(ped)?|drop(ped)? (it )?off|arrive) (today|tomorrow|tonight|on|by|at|this|next)|received (your|the) (payment|money|transfer)|guarantee\w*|refund (is |has been )?(approved|issued|processed)|discount (is |has been )?(approved|applied))\b/i;
 
+/** True when the text itself asserts stock, payment, delivery or another commitment. */
+export function hasCommitmentLanguage(text: string): boolean {
+  return COMMITMENT_PATTERN.test(text);
+}
+
 const MONEY_PATTERN =
   /(?:EC\$|US\$|XCD\s?|\$)\s?(\d[\d,]*(?:\.\d{1,2})?)|(\d[\d,]*(?:\.\d{1,2})?)\s?(?:EC|XCD|USD|dollars?)\b/gi;
 
@@ -457,6 +484,8 @@ export interface ResolveInput {
   autoRepliesLastHour: number;
   maxAutoRepliesPerHour: number;
   hasOpenEscalation: boolean;
+  /** "Same as last time" resolved against verified orders (lib/aiAgent/memory.ts); omit when not asked. */
+  repeatOrder?: RepeatResolution;
 }
 
 export interface Resolution {
@@ -476,9 +505,16 @@ export interface Resolution {
 export function resolveDecision(input: ResolveInput): Resolution {
   const { proposal } = input;
   const threshold = requiredConfidence(input.autonomy);
+  const repeat: RepeatResolution = input.repeatOrder ?? { kind: "none" };
+  // "Same as last time" seeds the request with the one matching VERIFIED order's
+  // items — but a request the customer is already building takes precedence.
+  const prior =
+    repeat.kind === "single" && (input.priorOrderRequest?.items.length ?? 0) === 0
+      ? mergeOrderRequest(repeat.draft, input.priorOrderRequest)
+      : input.priorOrderRequest;
   const orderRequest =
-    proposal?.intent === "order" || input.priorOrderRequest
-      ? mergeOrderRequest(input.priorOrderRequest, proposal?.order_request ?? null)
+    proposal?.intent === "order" || prior
+      ? mergeOrderRequest(prior, proposal?.order_request ?? null)
       : null;
   const missing = orderRequest ? missingOrderFields(orderRequest) : [];
   const orderComplete = Boolean(orderRequest) && missing.length === 0;
@@ -500,6 +536,18 @@ export function resolveDecision(input: ResolveInput): Resolution {
 
   if (input.hasOpenEscalation) return escalate(["open_escalation", ...input.safeguardCodes]);
   if (input.safeguardCodes.length > 0) return escalate(input.safeguardCodes);
+
+  // No usable verified order to repeat: staff handle it, nothing is guessed.
+  if (repeat.kind === "no_history" || repeat.kind === "unclear") return escalate([`repeat_order_${repeat.kind}`]);
+  // Several readings of "same as last time": ask, from verified records only.
+  // Deterministic text (no model), but the same send limits still apply.
+  if (repeat.kind === "ambiguous") {
+    const unsafe = checkReplySafety(repeat.question, []);
+    if (unsafe.length > 0) return escalate(["repeat_order_ambiguous", ...unsafe]);
+    if (threshold === Number.POSITIVE_INFINITY) return escalate(["autonomy_zero"]);
+    if (input.autoRepliesLastHour >= input.maxAutoRepliesPerHour) return escalate(["rate_limited"]);
+    return { ...base, decision: "ASK", reasons: ["repeat_order_ambiguous"], reply: repeat.question, priority: "low" };
+  }
   if (!proposal) return escalate(["model_unavailable"]);
   if (proposal.decision === "ESCALATE") return escalate([proposal.escalation_reason ? "model_escalated" : "model_uncertain"]);
   if (orderComplete) return escalate(["order_approval"]);
@@ -576,6 +624,7 @@ export function parseModelProposal(raw: string): ModelProposal {
     escalation_reason: cleanText(parsed.escalation_reason, 300),
     priority: (ESCALATION_PRIORITIES as readonly string[]).includes(parsed.priority) ? parsed.priority : null,
     summary: cleanText(parsed.summary, 500),
+    memory_facts: Array.isArray(parsed.memory_facts) ? parsed.memory_facts.slice(0, 8) : [],
     order_request: order
       ? {
           items: parseItems(order.items),
@@ -596,10 +645,21 @@ export interface MatchableEscalation {
   status: string;
 }
 
+/** Commands that act on an escalation. "send" is explicit authorization to message the customer. */
 export type StaffCommand = "send" | "note" | "close" | "takeover" | "resume";
+/** What a staff-group message can mean: a command, or a plain answer (information, never authorization). */
+export type StaffGroupCommand = StaffCommand | "answer";
 
 export type StaffMatch =
-  | { kind: "matched"; escalationId: string; refCode: string; command: StaffCommand; body: string }
+  | {
+      kind: "matched";
+      escalationId: string;
+      refCode: string;
+      command: StaffGroupCommand;
+      body: string;
+      /** How the escalation was identified: a quoted reply to one of our messages, or an explicit #E- code. */
+      via: "quote" | "ref";
+    }
   | { kind: "closed"; escalationId: string; refCode: string }
   | { kind: "ambiguous"; refCodes: string[] }
   | { kind: "unknown_ref"; refCodes: string[] }
@@ -608,25 +668,48 @@ export type StaffMatch =
 
 const REF_PATTERN = /#?\bE-([A-Z0-9]{4,8})\b/gi;
 
-const NOTICE_MARKERS = ["AI escalation #", "Follow-up on #", "Commands: !note"];
+/**
+ * Text that only ever appears in messages the agent itself posts in the staff
+ * group. A message containing any of these (an echo, a forward, a copy-paste)
+ * is never an instruction.
+ */
+export const AGENT_MESSAGE_MARKERS = [
+  "AI escalation #",
+  "Follow-up on #",
+  "Commands: !note",
+  "Draft reply for #",
+  "Sending reply for #",
+  "Answer saved for #",
+  "Reply not sent for #",
+] as const;
 
 export function extractRefCodes(text: string): string[] {
   return Array.from(new Set(Array.from(text.matchAll(REF_PATTERN), (m) => `E-${m[1].toUpperCase()}`)));
 }
 
+// A message that is nothing but an approval ("send it", "go ahead") authorizes
+// the draft it replies to. Anything longer is an answer, not an approval.
+const AUTHORIZE_ONLY =
+  /^(?:yes[ ,]+|ok(?:ay)?[ ,]+|please[ ,]+)?(?:send(?: (?:it|this|that|the (?:draft|reply)|draft|reply))?(?: please)?|go ahead(?: and send(?: it)?)?)[.! ]*$/i;
+
 /**
  * Matches a staff-group message to exactly one escalation, by a quoted reply to
- * the escalation notice or by an explicit "#E-XXXXX" reference. Anything else —
- * no reference, several references, a quote and a reference that disagree, an
- * unknown code — is never guessed.
+ * a message the agent posted for it (its notice or a draft) or by an explicit
+ * "#E-XXXXX" reference. Anything else — no reference, several references, a
+ * quote and a reference that disagree, an unknown code — is never guessed, and
+ * recency or the customer's name are never consulted.
+ *
+ * A plain message is an ANSWER: information for the agent, never permission to
+ * message the customer. Only "!send" (or a message that is just "send it")
+ * authorizes a customer message.
  */
 export function matchStaffReply(
   message: { text: string; quotedMessageId: string | null },
   escalations: MatchableEscalation[]
 ): StaffMatch {
-  // Anything shaped like our own notice (an echo, a forward, a copy-paste) is
+  // Anything shaped like our own messages (an echo, a forward, a copy-paste) is
   // never an answer — relaying it would send internal staff text to a customer.
-  if (NOTICE_MARKERS.some((m) => message.text.includes(m))) return { kind: "unmatched" };
+  if (AGENT_MESSAGE_MARKERS.some((m) => message.text.includes(m))) return { kind: "unmatched" };
   const refs = extractRefCodes(message.text);
   const byQuote = message.quotedMessageId
     ? escalations.filter((e) => e.notice_message_id && e.notice_message_id === message.quotedMessageId)
@@ -636,13 +719,16 @@ export function matchStaffReply(
   if (refs.length > 1) return { kind: "ambiguous", refCodes: refs };
 
   let target: MatchableEscalation | undefined;
+  let via: "quote" | "ref";
   if (byQuote.length === 1) {
     target = byQuote[0];
+    via = "quote";
     if (refs.length === 1 && refs[0] !== target.ref_code) {
       return { kind: "ambiguous", refCodes: [target.ref_code, refs[0]] };
     }
   } else if (refs.length === 1) {
     target = escalations.find((e) => e.ref_code === refs[0]);
+    via = "ref";
     if (!target) return { kind: "unknown_ref", refCodes: refs };
   } else {
     return { kind: "unmatched" };
@@ -653,13 +739,24 @@ export function matchStaffReply(
   }
 
   const stripped = message.text.replace(REF_PATTERN, " ").replace(/\s+/g, " ").trim();
-  const cmd = stripped.match(/^!(note|close|takeover|resume)\b\s*/i);
-  const command: StaffCommand = cmd ? (cmd[1].toLowerCase() as StaffCommand) : "send";
-  const body = cmd ? stripped.slice(cmd[0].length).trim() : stripped;
-  if ((command === "send" || command === "note") && !body) {
+  const cmd = stripped.match(/^!(send|note|close|takeover|resume)\b\s*/i);
+  let command: StaffGroupCommand;
+  let body: string;
+  if (cmd) {
+    command = cmd[1].toLowerCase() as StaffCommand;
+    body = stripped.slice(cmd[0].length).trim();
+  } else if (AUTHORIZE_ONLY.test(stripped)) {
+    command = "send";
+    body = "";
+  } else {
+    command = "answer";
+    body = stripped;
+  }
+  // "!send" alone is valid (it approves the draft); an answer or note needs text.
+  if ((command === "answer" || command === "note") && !body) {
     return { kind: "empty", escalationId: target.id, refCode: target.ref_code };
   }
-  return { kind: "matched", escalationId: target.id, refCode: target.ref_code, command, body };
+  return { kind: "matched", escalationId: target.id, refCode: target.ref_code, command, body, via };
 }
 
 // ── Text builders ────────────────────────────────────────────────────────────
@@ -688,39 +785,212 @@ export function formatOrderRequest(request: OrderRequestDraft | null): string | 
   ].join(" | ");
 }
 
+// ── Customer message history ─────────────────────────────────────────────────
+
+/** Joins the customer messages of one escalation inside ai_agent_escalations.customer_message. */
+export const CUSTOMER_MESSAGE_SEPARATOR = "\n---\n";
+const MEDIA_PLACEHOLDER = "(media message without text)";
+const MAX_CUSTOMER_MESSAGE_CHARS = 4000;
+
+function normalizeMessage(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+/** Appends a follow-up message to the stored history, skipping one the customer already sent. */
+export function appendCustomerMessage(existing: string | null, next: string): string {
+  // `next` may itself be a whole batched turn (messages joined with the separator):
+  // append each message in order, skipping any the customer already sent.
+  let history = existing;
+  for (const part of next.split(CUSTOMER_MESSAGE_SEPARATOR)) history = appendOneMessage(history, part);
+  return history ?? "";
+}
+
+function appendOneMessage(existing: string | null, next: string): string {
+  if (!existing) return next.slice(0, MAX_CUSTOMER_MESSAGE_CHARS);
+  const seen = existing.split(CUSTOMER_MESSAGE_SEPARATOR).map(normalizeMessage);
+  if (seen.includes(normalizeMessage(next))) return existing;
+  return `${existing}${CUSTOMER_MESSAGE_SEPARATOR}${next}`.slice(-MAX_CUSTOMER_MESSAGE_CHARS);
+}
+
+const GREETING_ONLY =
+  /^(hi+|hello+|hey+|hola|bonjour|ok(ay)?|thanks?|thank you|thx|good (morning|afternoon|evening)|please|\?+)\W*$/i;
+
+/** The distinct, meaningful customer messages in a stored history, oldest first. */
+export function customerMessageSegments(history: string): string[] {
+  const seen = new Set<string>();
+  const all: string[] = [];
+  for (const raw of history.split(CUSTOMER_MESSAGE_SEPARATOR)) {
+    const text = raw.replace(/\s+/g, " ").trim();
+    const key = normalizeMessage(text);
+    if (!text || !key || seen.has(key)) continue;
+    seen.add(key);
+    all.push(text);
+  }
+  const meaningful = all.filter((t) => !GREETING_ONLY.test(t));
+  return meaningful.length > 0 ? meaningful : all;
+}
+
+// ── Request category ─────────────────────────────────────────────────────────
+
+export type RequestCategory =
+  | "new_order"
+  | "product_enquiry"
+  | "complaint"
+  | "payment_issue"
+  | "unanswered_question"
+  | "other";
+
+const CATEGORY_LABEL: Record<RequestCategory, string> = {
+  new_order: "🛒 New order",
+  product_enquiry: "📦 Product enquiry",
+  complaint: "⚠️ Complaint",
+  payment_issue: "💳 Payment issue",
+  unanswered_question: "❓ Unanswered question",
+  other: "📌 Other request",
+};
+
+const COMPLAINT_CODES = ["complaint", "health_concern", "legal_threat", "refund"];
+const PRODUCT_WORDS = /\b(price|prices|cost|how much|in stock|stock|available|availability|do you (have|sell|stock)|kg|size|sizes|ingredients?|brand|product|products)\b/i;
+
+/** Derives the request category from data we already have — no extra model call. */
+export function categorizeRequest(input: {
+  reasons: string[];
+  intent?: ModelProposal["intent"] | null;
+  orderRequest: OrderRequestDraft | null;
+  messages: string[];
+}): RequestCategory {
+  const { reasons, intent } = input;
+  if (intent === "complaint" || reasons.some((r) => COMPLAINT_CODES.includes(r))) return "complaint";
+  if (reasons.includes("payment_claim")) return "payment_issue";
+  if (
+    intent === "order" ||
+    (input.orderRequest?.items.length ?? 0) > 0 ||
+    reasons.includes("order_approval") ||
+    reasons.includes("collecting_order_details")
+  ) {
+    return "new_order";
+  }
+  if (PRODUCT_WORDS.test(input.messages.join(" "))) return "product_enquiry";
+  if (intent === "question" || reasons.some((r) => ["unverified_answer", "low_confidence", "model_uncertain"].includes(r))) {
+    return "unanswered_question";
+  }
+  return "other";
+}
+
+const MISSING_ORDER_LABEL: Record<OrderField, string> = {
+  items: "Which product(s) the customer wants",
+  quantity: "Quantity for each product",
+  delivery_address: "Delivery address",
+  delivery_preference: "Delivery day/time",
+};
+
+function requestLines(input: { orderRequest: OrderRequestDraft | null; category: RequestCategory }): {
+  details: string[];
+  actions: string[];
+} {
+  const order = input.orderRequest;
+  const details: string[] = [];
+  if (order) {
+    for (const item of order.items) {
+      details.push(`${clip(item.product, 100)} — ${item.quantity ? `qty ${clip(item.quantity, 30)}` : "qty not given"}`);
+    }
+    if (order.delivery_address) details.push(`Address: ${clip(order.delivery_address, 150)}`);
+    if (order.delivery_preference) details.push(`Delivery: ${clip(order.delivery_preference, 100)}`);
+    if (order.notes) details.push(`Note: ${clip(order.notes, 150)}`);
+  }
+
+  const actions: string[] = [];
+  if (input.category === "new_order") {
+    if (!order || (order.items.length === 0 && !order.delivery_address && !order.delivery_preference)) {
+      actions.push("Order details were not captured — confirm products, quantities, delivery address and day/time");
+    } else {
+      const missing = missingOrderFields(order);
+      if (missing.length === 0) actions.push("Check availability and price, then confirm the order with the customer");
+      else for (const f of missing) actions.push(`Missing: ${MISSING_ORDER_LABEL[f]}`);
+    }
+  } else if (input.category === "complaint") {
+    actions.push("Review the complaint and respond to the customer personally");
+  } else if (input.category === "payment_issue") {
+    actions.push("Check the payment on your side before replying");
+  } else if (input.category === "product_enquiry" || input.category === "unanswered_question") {
+    actions.push("Answer the customer's question(s) above");
+  } else {
+    actions.push("Review and respond to the customer");
+  }
+  return { details, actions };
+}
+
+const MAX_REQUEST_BULLETS = 4;
+
 export interface StaffNoticeInput {
   refCode: string;
   priority: EscalationPriority;
   customerLabel: string;
+  /** Diagnostic codes. Used only to pick the category — never printed (they live in the admin dashboard). */
   reasons: string[];
+  /** Every customer message of the escalation, joined with CUSTOMER_MESSAGE_SEPARATOR. */
   customerMessage: string;
+  /** The model's one-sentence summary of the FIRST customer message, when it produced one. */
+  summary?: string | null;
+  intent?: ModelProposal["intent"] | null;
+  /** The model's draft for the first message; shown only while it is still current. */
   draftReply: string | null;
   orderRequest: OrderRequestDraft | null;
   followUp: boolean;
   /** Observe mode: nothing is sent to the customer; staff answers are recorded for review only. */
   observeOnly?: boolean;
+  /** Verified-history lines (historyLinesForStaff); shown apart from the current, unconfirmed request. */
+  history?: string[];
 }
 
 export function buildStaffNotice(input: StaffNoticeInput): string {
+  const messages = customerMessageSegments(input.customerMessage).map((m) =>
+    m === MEDIA_PLACEHOLDER ? "📎 Sent media without text" : m
+  );
+  const category = categorizeRequest({
+    reasons: input.reasons,
+    intent: input.intent,
+    orderRequest: input.orderRequest,
+    messages,
+  });
   const header = input.followUp
-    ? `🔁 Follow-up on #${input.refCode}`
-    : `🔔 AI escalation #${input.refCode} (${input.priority.toUpperCase()})`;
-  const lines = [
-    header,
-    `Customer: ${clip(input.customerLabel, 80)}`,
-    `Reason: ${input.reasons.join(", ")}`,
-    `Message: "${clip(input.customerMessage, 500)}"`,
-  ];
-  const order = formatOrderRequest(input.orderRequest);
-  if (order) lines.push(`Order request (NOT confirmed): ${clip(order, 400)}`);
-  if (input.draftReply && !input.followUp) {
-    lines.push(`${input.observeOnly ? "AI draft (NOT sent)" : "Suggested reply"}: "${clip(input.draftReply, 400)}"`);
+    ? `🔁 Follow-up on #${input.refCode} · ${input.priority.toUpperCase()}`
+    : `🔔 AI escalation #${input.refCode} · ${input.priority.toUpperCase()}`;
+
+  // The summary only describes the first message; later messages follow as their own lines.
+  const summary = input.summary ? clip(input.summary, 200) : null;
+  const points = messages.length > 0 ? messages.map((m) => clip(m, 160)) : ["(no text)"];
+  if (summary) points[0] = summary;
+  let shown = points;
+  let omitted = 0;
+  if (points.length > MAX_REQUEST_BULLETS) {
+    shown = [points[0], ...points.slice(-(MAX_REQUEST_BULLETS - 1))];
+    omitted = points.length - MAX_REQUEST_BULLETS;
+  }
+
+  const { details, actions } = requestLines({ orderRequest: input.orderRequest, category });
+  const lines = [header, CATEGORY_LABEL[category], `👤 ${clip(input.customerLabel, 80)}`, "", "*Request*"];
+  lines.push(...shown.map((p) => `• ${p}`));
+  if (omitted > 0) lines.push(`• (+${omitted} more message${omitted === 1 ? "" : "s"} in the dashboard)`);
+  if (details.length > 0) {
+    lines.push("", "*Order details* (NOT confirmed)", ...details.map((d) => `• ${d}`));
+  }
+  if (input.history && input.history.length > 0) {
+    lines.push("", "*Customer history* (from records)", ...input.history.map((h) => `• ${h}`));
+  }
+  lines.push("", "*Action needed*", ...actions.map((a) => `• ${a}`));
+
+  // A draft answers the first message only: once the customer has written
+  // again it is stale, so it is dropped rather than presented as current.
+  if (input.draftReply && !input.followUp && messages.length <= 1) {
+    lines.push("", `${input.observeOnly ? "AI draft (NOT sent)" : "Suggested reply"}: "${clip(input.draftReply, 400)}"`);
   }
   lines.push(
+    "",
     input.observeOnly
-      ? `👀 Observe mode: nothing is sent to the customer. Reply to this message (or include #${input.refCode}) to record your answer for review. Contact the customer directly.`
-      : `↩️ Reply to this message (or include #${input.refCode}) with the exact text to send the customer.`,
-    "Commands: !note <text> · !close · !takeover · !resume"
+      ? `👀 Observe mode: nothing is sent to the customer. Reply to this message (or include #${input.refCode}) with your answer — I'll record it and post a draft reply you can copy.`
+      : `↩️ Reply to this message (or include #${input.refCode}) with your answer. I'll draft the customer reply here — it is sent only when you reply "send".`,
+    "Commands: !note <text> · !send <text> · !close · !takeover · !resume"
   );
   return lines.join("\n");
 }

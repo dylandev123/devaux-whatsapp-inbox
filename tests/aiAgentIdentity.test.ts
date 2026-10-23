@@ -24,6 +24,10 @@ const settings: AgentSettings = {
   max_auto_replies_per_hour: 5,
   send_holding_reply: true,
   staff_notices_enabled: false,
+  batching_enabled: false,
+  batch_quiet_seconds: 45,
+  batch_max_wait_seconds: 180,
+  customer_memory_enabled: false,
 };
 const gate = (over: Partial<GateInput>) =>
   evaluateGate({
@@ -104,4 +108,70 @@ test("display + directory never present @lid digits as a phone number", () => {
   ];
   assert.deepEqual(aliasChatIds(PHONE, known), [PHONE_JID, LID]);
   assert.deepEqual(aliasChatIds("55500011122", known), ["55500011122@s.whatsapp.net"]);
+});
+
+// ── Staff sender authorization ───────────────────────────────────────────────
+
+import {
+  authorizeStaffSender,
+  isSenderIdAuthorized,
+  normalizeAuthorizedSender,
+  parseAuthorizedSenders,
+  verifiedSenderKeys,
+} from "../lib/aiAgent/identity.ts";
+
+test("allow-list entries: phone numbers and exact @lid ids only; formatting is normalized, names are rejected", () => {
+  assert.equal(normalizeAuthorizedSender("+1 (758) 555-0001"), "17585550001");
+  assert.equal(normalizeAuthorizedSender("17585550001@s.whatsapp.net"), "17585550001");
+  assert.equal(normalizeAuthorizedSender("17585550001:12@s.whatsapp.net"), "17585550001");
+  assert.equal(normalizeAuthorizedSender("55512345678901@LID"), "55512345678901@lid");
+  for (const bad of ["Jane", "Jane Smith", "12345", "1234567890123456789", "", "  ", null, undefined, 17585550001, "abc@lid", "120363000000000001@g.us"]) {
+    assert.equal(normalizeAuthorizedSender(bad), null, String(bad));
+  }
+  assert.deepEqual(parseAuthorizedSenders("17585550001, 17585550002\n17585550001;55512345678901@lid"), {
+    ok: true,
+    senders: ["17585550001", "17585550002", "55512345678901@lid"],
+  });
+  assert.deepEqual(parseAuthorizedSenders(""), { ok: true, senders: [] });
+  assert.equal(parseAuthorizedSenders("17585550001, Jane").ok, false);
+  assert.equal(parseAuthorizedSenders(42).ok, false);
+  assert.equal(parseAuthorizedSenders(Array.from({ length: 51 }, (_, i) => String(17585550000 + i))).ok, false);
+});
+
+test("sender identity: a phone JID proves its number; an @lid proves only itself plus a distinct reported phone", () => {
+  assert.deepEqual(verifiedSenderKeys("17585550001@s.whatsapp.net", null), ["17585550001"]);
+  assert.deepEqual(verifiedSenderKeys("17585550001:7@s.whatsapp.net", "99999999999"), ["17585550001"], "a reported phone never overrides a phone JID");
+  assert.deepEqual(verifiedSenderKeys("99887766554433@lid", null), ["99887766554433@lid"]);
+  assert.deepEqual(verifiedSenderKeys("99887766554433@lid", "17585550001"), ["17585550001", "99887766554433@lid"]);
+  assert.deepEqual(verifiedSenderKeys("99887766554433@lid", "99887766554433"), ["99887766554433@lid"], "the @lid's own digits prove nothing");
+  assert.deepEqual(verifiedSenderKeys("99887766554433@lid", "123"), ["99887766554433@lid"]);
+  assert.deepEqual(verifiedSenderKeys(null, "17585550001"), []);
+  assert.deepEqual(verifiedSenderKeys("", "17585550001"), []);
+  assert.deepEqual(verifiedSenderKeys("120363000000000001@g.us", "17585550001"), []);
+});
+
+test("authorization: default-deny, exact verified match, never by LID digits or display text", () => {
+  const list = ["17585550001", "55512345678901@lid"];
+  assert.equal(authorizeStaffSender([], "17585550001@s.whatsapp.net", null).authorized, false);
+  assert.equal(authorizeStaffSender(undefined, "17585550001@s.whatsapp.net", null).authorized, false);
+  assert.equal(authorizeStaffSender(null, "17585550001@s.whatsapp.net", null).authorized, false);
+  assert.deepEqual(authorizeStaffSender(list, "17585550001@s.whatsapp.net", null), { authorized: true, senderId: "17585550001" });
+  assert.equal(authorizeStaffSender(list, "17585550002@s.whatsapp.net", null).authorized, false);
+  // @lid digits that equal an authorized phone number do not match it.
+  assert.equal(authorizeStaffSender(list, "17585550001@lid", null).authorized, false);
+  assert.equal(authorizeStaffSender(list, "17585550001@lid", "17585550001").authorized, false);
+  // A bridge-reported phone for an unrelated @lid does.
+  assert.deepEqual(authorizeStaffSender(list, "42@lid", "17585550001"), { authorized: true, senderId: "17585550001" });
+  assert.equal(authorizeStaffSender(list, "42@lid", "17585550009").authorized, false);
+  // The exact @lid entry matches only that @lid.
+  assert.equal(authorizeStaffSender(list, "55512345678901@lid", null).authorized, true);
+  assert.equal(authorizeStaffSender(list, "55512345678902@lid", null).authorized, false);
+  // No sender at all (e.g. an unattributed message) is nobody.
+  assert.deepEqual(authorizeStaffSender(list, null, "17585550001"), { authorized: false, senderId: null });
+  // A malformed stored entry never matches anything.
+  assert.equal(authorizeStaffSender(["Jane"], "17585550001@s.whatsapp.net", null).authorized, false);
+  // Re-checks use the recorded id against the CURRENT list.
+  assert.equal(isSenderIdAuthorized(list, "17585550001"), true);
+  assert.equal(isSenderIdAuthorized([], "17585550001"), false);
+  assert.equal(isSenderIdAuthorized(list, null), false);
 });

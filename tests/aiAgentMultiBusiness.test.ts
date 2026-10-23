@@ -30,6 +30,10 @@ const settingsFor = (slug: string, over: Partial<AgentSettings> = {}): AgentSett
   max_auto_replies_per_hour: 6,
   send_holding_reply: true,
   staff_notices_enabled: false,
+  batching_enabled: false,
+  batch_quiet_seconds: 45,
+  batch_max_wait_seconds: 180,
+  customer_memory_enabled: false,
   ...over,
 });
 const gate = (slug: string, settings: AgentSettings | null, over: Partial<GateInput> = {}) =>

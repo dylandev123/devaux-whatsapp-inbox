@@ -4,9 +4,11 @@
 // in that response already 'dispatched'; items created from the admin UI stay
 // 'pending' until the bridge claims them via claim_ai_agent_outbox().
 
-import { agentDb } from "@/lib/server/aiAgent/db";
+import { outboxAllowed } from "@/lib/aiAgent/engine";
+import { buildSendFailureMessage } from "@/lib/aiAgent/staffAnswers";
+import { agentDb, loadSettings } from "@/lib/server/aiAgent/db";
 
-export type OutboxKind = "customer_reply" | "holding_reply" | "staff_notice" | "staff_relay" | "staff_feedback";
+export type OutboxKind = "customer_reply" | "holding_reply" | "staff_notice" | "staff_draft" | "staff_relay" | "staff_feedback";
 
 export interface OutboxInsert {
   businessSlug: string;
@@ -18,6 +20,8 @@ export interface OutboxInsert {
   eventId?: string | null;
   escalationId?: string | null;
   createdBy?: string | null;
+  /** Staff group only: the WhatsApp message to quote when posting (the staff member's answer). Optional for the bridge. */
+  replyToMessageId?: string | null;
 }
 
 /** Wire shape returned to the bridge. Only `send: true` items may be sent. */
@@ -28,6 +32,8 @@ export interface BridgeOutboxItem {
   to: string;
   body: string;
   send: boolean;
+  /** Present only when the bridge may post this item as a quote of that message; ignoring it is safe. */
+  replyToMessageId?: string;
 }
 
 interface OutboxRow {
@@ -37,10 +43,16 @@ interface OutboxRow {
   to_jid: string;
   body: string;
   status: string;
+  reply_to_message_id?: string | null;
+  error?: string | null;
 }
 
+const OUTBOX_ROW_COLUMNS = "id, business_slug, kind, to_jid, body, status, reply_to_message_id, error";
+
 export function toBridgeItem(row: OutboxRow, send: boolean): BridgeOutboxItem {
-  return { id: row.id, businessSlug: row.business_slug, kind: row.kind, to: row.to_jid, body: row.body, send };
+  const item: BridgeOutboxItem = { id: row.id, businessSlug: row.business_slug, kind: row.kind, to: row.to_jid, body: row.body, send };
+  if (row.reply_to_message_id) item.replyToMessageId = row.reply_to_message_id;
+  return item;
 }
 
 /**
@@ -64,12 +76,13 @@ export async function enqueue(items: OutboxInsert[], dispatchNow: boolean): Prom
         event_id: i.eventId ?? null,
         escalation_id: i.escalationId ?? null,
         created_by: i.createdBy ?? null,
+        reply_to_message_id: i.replyToMessageId ?? null,
         status: dispatchNow ? "dispatched" : "pending",
         dispatched_at: dispatchNow ? now : null,
       })),
       { onConflict: "dedupe_key", ignoreDuplicates: true }
     )
-    .select("id, business_slug, kind, to_jid, body, status");
+    .select(OUTBOX_ROW_COLUMNS);
   if (error) throw new Error(error.message);
   return (data ?? []) as OutboxRow[];
 }
@@ -112,7 +125,7 @@ export async function isAgentEcho(
 export async function outboxForEvent(eventId: string): Promise<OutboxRow[]> {
   const { data, error } = await agentDb()
     .from("ai_agent_outbox")
-    .select("id, business_slug, kind, to_jid, body, status")
+    .select(OUTBOX_ROW_COLUMNS)
     .eq("event_id", eventId)
     .order("created_at");
   if (error) throw new Error(error.message);
@@ -174,5 +187,41 @@ export async function ackOutbox(input: {
       .eq("status", "open")
       .is("notice_message_id", null);
   }
+  // An authorized customer reply that the bridge could not deliver: tell the
+  // staff group, in plain words, that the customer did NOT receive it. Best effort.
+  if (input.status === "failed" && row.kind === "staff_relay" && row.escalation_id) {
+    await notifyStaffRelayFailed(row.id, row.business_slug, row.escalation_id, input.error).catch((err) =>
+      console.error("[aiAgent] notifyStaffRelayFailed", err instanceof Error ? err.message : err)
+    );
+  }
   return "ok";
+}
+
+async function notifyStaffRelayFailed(outboxId: string, businessSlug: string, escalationId: string, error: string | null): Promise<void> {
+  const [settings, { data: e, error: loadError }] = await Promise.all([
+    loadSettings(businessSlug),
+    agentDb()
+      .from("ai_agent_escalations")
+      .select("ref_code, customer_name, contact_number, chat_id")
+      .eq("id", escalationId)
+      .eq("business_slug", businessSlug)
+      .maybeSingle(),
+  ]);
+  if (loadError) throw new Error(loadError.message);
+  if (!e || !settings?.staff_group_jid) return;
+  const item: OutboxInsert = {
+    businessSlug,
+    chatId: settings.staff_group_jid,
+    kind: "staff_feedback",
+    toJid: settings.staff_group_jid,
+    body: buildSendFailureMessage({
+      refCode: e.ref_code,
+      customerLabel: e.customer_name ?? e.contact_number ?? e.chat_id,
+      error,
+    }),
+    dedupeKey: `ack:${outboxId}:relay_failed`,
+    escalationId,
+  };
+  // Staff-group sending is its own permission: same final gate as every other item.
+  if (outboxAllowed(settings, item)) await enqueue([item], false);
 }

@@ -55,6 +55,26 @@ export function verifyBridgeSecret(request: Request): NextResponse | null {
   return null;
 }
 
+/**
+ * Scheduler endpoints (due-batch processing). Accepts the bridge secret
+ * (x-ai-agent-secret) or, for Vercel Cron, `Authorization: Bearer $CRON_SECRET`.
+ * With neither secret configured the endpoint is disabled (503), never open.
+ */
+export function verifySchedulerSecret(request: Request): NextResponse | null {
+  const cronSecret = process.env.CRON_SECRET;
+  const bearer = request.headers.get("authorization") ?? "";
+  if (cronSecret && bearer.startsWith("Bearer ")) {
+    const a = Buffer.from(bearer.slice(7));
+    const b = Buffer.from(cronSecret);
+    if (a.length === b.length && timingSafeEqual(a, b)) return null;
+  }
+  if (!process.env.AI_AGENT_BRIDGE_SECRET && !cronSecret) {
+    return NextResponse.json({ error: "Scheduler is not configured" }, { status: 503 });
+  }
+  if (process.env.AI_AGENT_BRIDGE_SECRET && request.headers.has(BRIDGE_SECRET_HEADER)) return verifyBridgeSecret(request);
+  return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+}
+
 export function jsonError(message: string, status: number): NextResponse {
   return NextResponse.json({ error: message }, { status });
 }

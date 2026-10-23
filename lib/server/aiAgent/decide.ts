@@ -13,8 +13,7 @@
 import {
   AgentDecision,
   AgentSettings,
-  ContactRule,
-  ConversationControl,
+  CUSTOMER_MESSAGE_SEPARATOR,
   canSendStaffNotice,
   detectSafeguards,
   evaluateGate,
@@ -34,30 +33,45 @@ import {
 } from "@/lib/aiAgent/engine";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
 import {
-  ChatIdentity,
-  combineRules,
-  isLidJid,
-  resolveChatIdentity,
-  verifiedPhoneDigits,
-} from "@/lib/aiAgent/identity";
+  BATCHED_DECISION,
+  BATCHED_REASON,
+  batchingActive,
+  buildCustomerTurn,
+  CustomerTurn,
+  singleMessageTurn,
+} from "@/lib/aiAgent/batching";
+import { ChatIdentity } from "@/lib/aiAgent/identity";
+import { historyLinesForStaff, MemoryBrief, validateMemoryFacts } from "@/lib/aiAgent/memory";
 import {
-  latestManualStaffMessageAt,
   loadCustomerContext,
   loadOpenOrderRequest,
   OpenOrderRequest,
 } from "@/lib/server/aiAgent/context";
+import {
+  BatchRow,
+  claimBatches,
+  completeBatch,
+  enqueueBatchMessage,
+  loadBatchMessages,
+  MAX_BATCH_ATTEMPTS,
+  newWorkerId,
+  purgeFinishedBatches,
+  releaseBatch,
+} from "@/lib/server/aiAgent/batches";
 import { agentDb, audit, KnowledgeRow, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
+import { loadGateData } from "@/lib/server/aiAgent/gateData";
+import { saveCustomerFacts } from "@/lib/server/aiAgent/memory";
 import {
   canSend,
   createOrAppendEscalation,
   originalEscalationInput,
   priorStaffNotices,
   findOpenEscalation,
-  processStaffGroupMessage,
   setConversationControl,
   staffNoticeFor,
 } from "@/lib/server/aiAgent/escalations";
 import { proposeReply } from "@/lib/server/aiAgent/model";
+import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
 import {
   BridgeOutboxItem,
   enqueue,
@@ -79,6 +93,8 @@ export interface BridgeMessageInput {
   hasMedia: boolean;
   quotedMessageId: string | null;
   senderJid: string | null;
+  /** Phone number WhatsApp reported for an @lid group participant (Baileys participantPn); null when unknown. */
+  senderPhone?: string | null;
   timestamp: string | null;
 }
 
@@ -121,8 +137,15 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   const kind = isStaffGroup ? "staff_group" : input.fromMe ? "staff_outbound" : "customer_inbound";
 
   const claim = await claimEvent(input, kind, settings);
-  if ("response" in claim) return claim.response;
-  const eventId = claim.eventId;
+  let eventId: string;
+  if ("response" in claim) {
+    // Enqueueing into a batch is idempotent, so a customer message whose first
+    // delivery died before reaching its batch is simply resumed on retry.
+    if (!(claim.resumable && kind === "customer_inbound" && batchingActive(settings))) return claim.response;
+    eventId = claim.response.eventId!;
+  } else {
+    eventId = claim.eventId;
+  }
 
   try {
     let outcome: Outcome;
@@ -132,7 +155,10 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
         text: input.text,
         quotedMessageId: input.quotedMessageId,
         senderJid: input.senderJid,
+        senderPhone: input.senderPhone ?? null,
         eventId,
+        whatsappMessageId: input.whatsappMessageId,
+        timestamp: input.timestamp,
       });
       outcome = {
         decision: "NO_REPLY",
@@ -142,8 +168,25 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
       };
     } else if (input.fromMe) {
       outcome = await handleManualStaffMessage(input, settings);
+    } else if (batchingActive(settings)) {
+      outcome = await handleBatchedCustomerMessage(input, settings, eventId);
     } else {
-      outcome = await handleCustomerMessage(input, settings, eventId);
+      outcome = await handleCustomerTurn(
+        singleMessageTurn({
+          whatsappMessageId: input.whatsappMessageId,
+          eventId,
+          text: input.text,
+          hasMedia: input.hasMedia,
+          timestamp: input.timestamp,
+        }),
+        {
+          businessSlug: input.businessSlug,
+          chatId: input.chatId,
+          contactNumber: input.contactNumber,
+          settings,
+          dedupeBase: eventId,
+        }
+      );
     }
 
     // Last line of defence: whatever the handlers produced, only kinds the
@@ -156,6 +199,11 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
       true
     );
     await finishEvent(eventId, startedAt, outcome);
+    // A message waiting in a batch has no decision yet: the batch's worker
+    // decides it, and the response is "nothing to send" (no bridge change).
+    if (outcome.batched) {
+      return { eventId, status: "done", decision: null, reasons: outcome.reasons, outbox: [] };
+    }
     if (!isStaffGroup) {
       await agentDb()
         .from("ai_agent_conversations")
@@ -184,6 +232,9 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
       .from("ai_agent_events")
       .update({ status: "error", error: message.slice(0, 1000), finished_at: new Date().toISOString() })
       .eq("id", eventId);
+    // A staff answer that died part-way must not vanish: mark it failed (retryable only when no
+    // customer message may have gone out) and tell the staff group / dashboard.
+    if (isStaffGroup) await reportStaffFailure({ settings, eventId, error: err });
     // Fail closed: nothing is sent; the event row records what went wrong.
     return { eventId, status: "error", decision: null, reasons: ["internal_error"], outbox: [] };
   }
@@ -219,13 +270,15 @@ interface Outcome {
   model?: string | null;
   knowledgeIds?: string[];
   error?: string | null;
+  /** The message was queued into this batch; a worker decides it later. */
+  batched?: { batchId: string };
 }
 
 async function claimEvent(
   input: BridgeMessageInput,
   kind: string,
   settings: AgentSettings
-): Promise<{ eventId: string } | { response: BridgeMessageResponse }> {
+): Promise<{ eventId: string } | { response: BridgeMessageResponse; resumable: boolean }> {
   const db = agentDb();
   const { data, error } = await db
     .from("ai_agent_events")
@@ -255,22 +308,24 @@ async function claimEvent(
     existing.status === "processing" && Date.now() - new Date(existing.created_at).getTime() < STALE_PROCESSING_MS;
   const items = await outboxForEvent(existing.id);
   return {
+    resumable: existing.status === "processing",
     response: {
       eventId: existing.id,
       status: processing ? "in_progress" : "duplicate",
-      decision: existing.decision,
+      decision: existing.decision === BATCHED_DECISION ? null : existing.decision,
       reasons: existing.reason_codes ?? [],
       outbox: items.map((r) => toBridgeItem(r, false)),
     },
   };
 }
 
-async function finishEvent(eventId: string, startedAt: number, outcome: Outcome): Promise<void> {
+async function finishEvent(eventId: string, startedAt: number, outcome: Outcome, batchId?: string): Promise<void> {
   const { error } = await agentDb()
     .from("ai_agent_events")
     .update({
       status: "done",
-      decision: outcome.decision,
+      decision: outcome.batched ? BATCHED_DECISION : outcome.decision,
+      batch_id: outcome.batched?.batchId ?? batchId ?? null,
       reason_codes: outcome.reasons,
       confidence: outcome.confidence ?? null,
       proposed_reply: outcome.proposedReply ?? null,
@@ -303,66 +358,6 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
   return { decision: "HUMAN", reasons: ["staff_message"], outbox: [] };
 }
 
-// Every JID that provably belongs to this contact (see lib/aiAgent/identity.ts):
-// the incoming chat_id, its verified phone JID and any @lid chats WhatsApp
-// reported the same phone for. Stored history is best-effort (messages are
-// purged after 7 days); a failed lookup just leaves the chat_id on its own,
-// which can only narrow, never widen, who is allowed.
-async function loadIdentity(businessSlug: string, chatId: string, contactNumber: string | null): Promise<ChatIdentity> {
-  const db = agentDb();
-  let storedPhone: string | null = null;
-  if (isLidJid(chatId) && !verifiedPhoneDigits(chatId, contactNumber)) {
-    const { data } = await db
-      .from("whatsapp_messages")
-      .select("contact_number")
-      .eq("business_slug", businessSlug)
-      .eq("chat_id", chatId)
-      .not("contact_number", "is", null)
-      .order("timestamp", { ascending: false })
-      .limit(50);
-    storedPhone =
-      (data ?? []).map((r) => verifiedPhoneDigits(chatId, r.contact_number)).find((p): p is string => Boolean(p)) ?? null;
-  }
-  const phone = verifiedPhoneDigits(chatId, contactNumber) ?? storedPhone;
-  let lidChats: string[] = [];
-  if (phone) {
-    const { data } = await db
-      .from("whatsapp_messages")
-      .select("chat_id")
-      .eq("business_slug", businessSlug)
-      .eq("contact_number", phone)
-      .like("chat_id", "%@lid")
-      .limit(200);
-    lidChats = [...new Set((data ?? []).map((r) => r.chat_id as string))];
-  }
-  return resolveChatIdentity(chatId, contactNumber, { storedPhone, lidChats });
-}
-
-async function loadGateData(businessSlug: string, chatId: string, contactNumber: string | null, settings: AgentSettings | null) {
-  const db = agentDb();
-  const identity = await loadIdentity(businessSlug, chatId, contactNumber);
-  const [rules, conversation, staffActiveAt] = await Promise.all([
-    db.from("ai_agent_contact_rules").select("chat_id, rule").eq("business_slug", businessSlug).in("chat_id", identity.chatIds),
-    db
-      .from("ai_agent_conversations")
-      .select("control, human_until")
-      .eq("business_slug", businessSlug)
-      .eq("chat_id", chatId)
-      .maybeSingle(),
-    latestManualStaffMessageAt(businessSlug, chatId, settings?.auto_takeover_minutes ?? 0),
-  ]);
-  const matched = (rules.data ?? []) as { chat_id: string; rule: ContactRule }[];
-  const contactRule = combineRules(matched);
-  return {
-    contactRule,
-    unresolvedLid: identity.unresolvedLid,
-    // Rule found only under another identity of the same contact (phone <-> @lid).
-    matchedViaAlias: contactRule !== null && !matched.some((r) => r.chat_id === chatId && r.rule === contactRule),
-    conversation: (conversation.data as ConversationControl | null) ?? null,
-    staffActiveAt,
-  };
-}
-
 async function autoRepliesLastHour(businessSlug: string, chatId: string): Promise<number> {
   const { count, error } = await agentDb()
     .from("ai_agent_outbox")
@@ -380,6 +375,7 @@ interface Pipeline {
   gate: GateResult;
   /** Diagnostic reason codes about how the contact was identified. */
   identityNotes: string[];
+  identity: ChatIdentity | null;
   safeguards: string[];
   resolution: Resolution | null;
   proposal: ModelProposal | null;
@@ -387,6 +383,9 @@ interface Pipeline {
   modelError: string | null;
   knowledge: KnowledgeRow[];
   customerName: string;
+  /** Verified-history / customer-said lines for the staff notice (empty when nothing is on record). */
+  history: string[];
+  memory: MemoryBrief | null;
   openOrder: OpenOrderRequest | null;
   hasOpenEscalation: boolean;
 }
@@ -394,22 +393,26 @@ interface Pipeline {
 /**
  * Shared by the live path and the test console. `forceGatePass` (console only)
  * evaluates the policy as if the gate had passed, while still reporting the
- * real gate result.
+ * real gate result. `text` is the customer's words (safeguards run on all of
+ * them); `transcript` is the same turn with per-message timestamps for the
+ * model, and defaults to `text`.
  */
 async function runPipeline(args: {
   businessSlug: string;
   chatId: string | null;
   contactNumber: string | null;
   text: string;
+  transcript?: string;
   hasMedia: boolean;
-  whatsappMessageId: string | null;
+  /** The turn's own messages: left out of the "recent conversation" slice. */
+  excludeMessageIds: string[];
   settings: AgentSettings | null;
   forceGatePass: boolean;
 }): Promise<Pipeline> {
   const { businessSlug, chatId, settings } = args;
-  const { matchedViaAlias, ...gateData } = chatId
+  const { matchedViaAlias, identity, ...gateData } = chatId
     ? await loadGateData(businessSlug, chatId, args.contactNumber, settings)
-    : { contactRule: null, unresolvedLid: false, matchedViaAlias: false, conversation: null, staffActiveAt: null };
+    : { identity: null, contactRule: null, unresolvedLid: false, matchedViaAlias: false, conversation: null, staffActiveAt: null };
   const gate = evaluateGate({
     businessSlug,
     chatId: chatId ?? "test-console@s.whatsapp.net",
@@ -424,6 +427,7 @@ async function runPipeline(args: {
   const empty: Pipeline = {
     gate,
     identityNotes: matchedViaAlias ? ["contact_matched_via_linked_identity"] : [],
+    identity,
     safeguards: [],
     resolution: null,
     proposal: null,
@@ -431,6 +435,8 @@ async function runPipeline(args: {
     modelError: null,
     knowledge: [],
     customerName: chatId ?? "Test customer",
+    history: [],
+    memory: null,
     openOrder: null,
     hasOpenEscalation: false,
   };
@@ -439,7 +445,9 @@ async function runPipeline(args: {
 
   const [knowledge, context, openOrder, openEscalation, recentReplies] = await Promise.all([
     loadActiveKnowledge(businessSlug),
-    chatId ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.whatsappMessageId) : Promise.resolve(null),
+    chatId && identity
+      ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text)
+      : Promise.resolve(null),
     chatId ? loadOpenOrderRequest(businessSlug, chatId) : Promise.resolve(null),
     chatId ? findOpenEscalation(businessSlug, chatId) : Promise.resolve(null),
     chatId ? autoRepliesLastHour(businessSlug, chatId) : Promise.resolve(0),
@@ -455,12 +463,23 @@ async function runPipeline(args: {
       }
     : null;
 
+  // "Same as last time" is resolved from VERIFIED orders (lib/aiAgent/memory.ts).
+  // When the answer is a question or a hand-off the model has nothing to add.
+  const repeat = context?.memory.repeat;
+  const repeatDecided = repeat?.kind === "ambiguous" || repeat?.kind === "no_history" || repeat?.kind === "unclear";
+
   // Injection attempts never reach the model; an open escalation means staff
   // own the conversation, so there is nothing for the model to draft.
-  const skipModel = safeguards.includes("prompt_injection") || Boolean(openEscalation);
+  const skipModel = safeguards.includes("prompt_injection") || Boolean(openEscalation) || repeatDecided;
   const modelResult = skipModel
     ? { proposal: null, model: null, error: null }
-    : await proposeReply({ businessSlug, messageText: args.text, knowledge, context, pendingOrder: priorOrder });
+    : await proposeReply({
+        businessSlug,
+        messageText: args.transcript ?? args.text,
+        knowledge,
+        context,
+        pendingOrder: priorOrder,
+      });
 
   const resolution = resolveDecision({
     autonomy: settings?.autonomy ?? 0,
@@ -471,11 +490,13 @@ async function runPipeline(args: {
     autoRepliesLastHour: recentReplies,
     maxAutoRepliesPerHour: settings?.max_auto_replies_per_hour ?? 0,
     hasOpenEscalation: Boolean(openEscalation),
+    repeatOrder: repeat,
   });
 
   return {
     gate,
     identityNotes: empty.identityNotes,
+    identity,
     safeguards,
     resolution,
     proposal: modelResult.proposal,
@@ -483,23 +504,37 @@ async function runPipeline(args: {
     modelError: modelResult.error,
     knowledge,
     customerName: context?.customerName ?? empty.customerName,
+    history: context ? historyLinesForStaff(context.memory) : [],
+    memory: context?.memory ?? null,
     openOrder,
     hasOpenEscalation: Boolean(openEscalation),
   };
 }
 
-async function handleCustomerMessage(
-  input: BridgeMessageInput,
-  settings: AgentSettings,
-  eventId: string
-): Promise<Outcome> {
+interface TurnContext {
+  businessSlug: string;
+  chatId: string;
+  contactNumber: string | null;
+  settings: AgentSettings;
+  /** Prefix of every outbox dedupe key: the event id (single message) or `batch:<id>` (batched turn). */
+  dedupeBase: string;
+}
+
+/**
+ * ONE customer turn → one decision, at most one escalation, one staff notice.
+ * A turn is a single live message (batching off) or every message of a batch.
+ */
+async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise<Outcome> {
+  const { settings, businessSlug, chatId } = ctx;
+  const eventId = turn.primaryEventId;
   const p = await runPipeline({
-    businessSlug: input.businessSlug,
-    chatId: input.chatId,
-    contactNumber: input.contactNumber,
-    text: input.text,
-    hasMedia: input.hasMedia,
-    whatsappMessageId: input.whatsappMessageId,
+    businessSlug,
+    chatId,
+    contactNumber: ctx.contactNumber,
+    text: turn.text,
+    transcript: turn.transcript,
+    hasMedia: turn.hasMedia,
+    excludeMessageIds: turn.whatsappMessageIds,
     settings,
     forceGatePass: false,
   });
@@ -520,25 +555,54 @@ async function handleCustomerMessage(
     error: p.modelError,
   };
 
+  // Long-term memory: only what the customer explicitly said, in their own
+  // words (validated against the turn), and only when the admin enabled capture.
+  if (settings.customer_memory_enabled && p.identity && p.proposal && p.safeguards.length === 0) {
+    const { accepted, rejected } = validateMemoryFacts(p.proposal.memory_facts, turn.text);
+    if (rejected.length > 0) reasons.push("memory_fact_rejected");
+    if (accepted.length > 0) {
+      try {
+        const saved = await saveCustomerFacts({
+          businessSlug,
+          chatId,
+          identity: p.identity,
+          messageId: turn.whatsappMessageIds[turn.whatsappMessageIds.length - 1] ?? null,
+          facts: accepted,
+        });
+        if (saved > 0) reasons.push("memory_saved");
+      } catch (err) {
+        // Memory is an extra: a failure here must never block the decision.
+        console.error("[aiAgent] saveCustomerFacts", err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
   // Persist the (never-confirmed) order request as it is collected.
   let orderRequestId: string | null = p.openOrder?.id ?? null;
   if (r?.orderRequest) {
-    orderRequestId = await saveOrderRequest(input, p.openOrder, r.orderRequest, r.orderComplete);
+    orderRequestId = await saveOrderRequest(
+      { businessSlug, chatId, contactNumber: ctx.contactNumber },
+      p.openOrder,
+      r.orderRequest,
+      r.orderComplete
+    );
   }
 
   if (decision === "ESCALATE") {
-    const customerMessage = input.text.trim() || "(media message without text)";
+    const customerMessage = turn.segments.join(CUSTOMER_MESSAGE_SEPARATOR) || "(media message without text)";
     const escalateInput = {
-      businessSlug: input.businessSlug,
-      chatId: input.chatId,
-      contactNumber: input.contactNumber,
+      businessSlug,
+      chatId,
+      contactNumber: ctx.contactNumber,
       customerName: p.customerName,
       reasons,
       priority: r?.priority ?? priorityFor(reasons),
       customerMessage,
       draftReply: r?.draftReply ?? null,
       summary: p.proposal?.summary ?? null,
+      intent: p.proposal?.intent ?? null,
       orderRequest: r?.orderRequest ?? null,
+      history: p.history,
       eventId,
     };
     const { escalation, followUp } = await createOrAppendEscalation(escalateInput);
@@ -555,13 +619,13 @@ async function handleCustomerMessage(
     // escalation updates the record but never posts a second notice in Observe.
     // An open escalation whose notice never went out (e.g. notices were off
     // when it opened) is still owed its first notice, in the original format.
-    const prior = followUp ? await priorStaffNotices(input.businessSlug, escalation.id) : [];
+    const prior = followUp ? await priorStaffNotices(businessSlug, escalation.id) : [];
     const skip = staffNoticeSkipReason(settings, followUp, prior);
     const firstNotice = !followUp || needsFirstNotice(followUp, prior);
     if (!skip && settings.staff_group_jid) {
       outbox.push({
-        businessSlug: input.businessSlug,
-        chatId: input.chatId,
+        businessSlug,
+        chatId,
         kind: "staff_notice",
         toJid: settings.staff_group_jid,
         body: staffNoticeFor(
@@ -572,7 +636,7 @@ async function handleCustomerMessage(
         ),
         // A late first notice is keyed per escalation (and attempt number) so two
         // concurrent messages cannot both queue it.
-        dedupeKey: followUp ? `escalation:${escalation.id}:staff_notice:${prior.length}` : `${eventId}:staff_notice`,
+        dedupeKey: followUp ? `escalation:${escalation.id}:staff_notice:${prior.length}` : `${ctx.dedupeBase}:staff_notice`,
         escalationId: escalation.id,
       });
     } else if (skip) {
@@ -583,24 +647,24 @@ async function handleCustomerMessage(
           .from("ai_agent_escalations")
           .update({ context: { ...escalation.context, notice_skipped: skip } })
           .eq("id", escalation.id)
-          .eq("business_slug", input.businessSlug);
+          .eq("business_slug", businessSlug);
       }
     }
     if (sendable && settings.send_holding_reply && !followUp) {
       outbox.push({
-        businessSlug: input.businessSlug,
-        chatId: input.chatId,
+        businessSlug,
+        chatId,
         kind: "holding_reply",
-        toJid: input.chatId,
+        toJid: chatId,
         body: r?.orderComplete ? HOLDING_REPLY_ORDER : HOLDING_REPLY_GENERAL,
-        dedupeKey: `${eventId}:holding_reply`,
+        dedupeKey: `${ctx.dedupeBase}:holding_reply`,
         escalationId: escalation.id,
       });
     }
-    await audit(input.businessSlug, "system", null, followUp ? "escalation.append" : "escalation.open", {
+    await audit(businessSlug, "system", null, followUp ? "escalation.append" : "escalation.open", {
       type: "escalation",
       id: escalation.id,
-    }, { ref_code: escalation.ref_code, reasons });
+    }, { ref_code: escalation.ref_code, reasons, messages: turn.messages.length });
     return { ...common, decision, reasons, outbox, escalationId: escalation.id };
   }
 
@@ -609,20 +673,182 @@ async function handleCustomerMessage(
     sendable && r?.reply
       ? [
           {
-            businessSlug: input.businessSlug,
-            chatId: input.chatId,
+            businessSlug,
+            chatId,
             kind: "customer_reply",
-            toJid: input.chatId,
+            toJid: chatId,
             body: r.reply,
-            dedupeKey: `${eventId}:customer_reply`,
+            dedupeKey: `${ctx.dedupeBase}:customer_reply`,
           },
         ]
       : [];
   return { ...common, decision, reasons, outbox };
 }
 
+// ── Batching ─────────────────────────────────────────────────────────────────
+
+/**
+ * Live path with batching on: an eligible customer message is stored in the
+ * chat's batch (nothing is decided or sent now); anything the gate would stop
+ * anyway is answered immediately, exactly as without batching.
+ */
+async function handleBatchedCustomerMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
+  const gateData = await loadGateData(input.businessSlug, input.chatId, input.contactNumber, settings);
+  // Media-only messages are eligible: the customer may follow with the words.
+  const gate = evaluateGate({
+    businessSlug: input.businessSlug,
+    chatId: input.chatId,
+    fromMe: false,
+    text: input.text.trim() || (input.hasMedia ? "(media)" : ""),
+    hasMedia: input.hasMedia,
+    settings,
+    ...gateData,
+    now: new Date(),
+  });
+  if (!gate.pass) return { decision: gate.decision, reasons: gate.reasons, outbox: [] };
+
+  const queued = await enqueueBatchMessage({
+    businessSlug: input.businessSlug,
+    chatId: input.chatId,
+    contactNumber: input.contactNumber,
+    whatsappMessageId: input.whatsappMessageId,
+    eventId,
+    text: input.text,
+    hasMedia: input.hasMedia,
+    messageAt: input.timestamp,
+  });
+  return { decision: "NO_REPLY", reasons: [BATCHED_REASON], outbox: [], batched: { batchId: queued.batchId } };
+}
+
+const RETRY_BACKOFF_SECONDS = 30;
+
+/** Settles the events of every message in a processed batch. */
+async function finishBatchEvents(turn: CustomerTurn, batchId: string, startedAt: number, outcome: Outcome): Promise<void> {
+  const primary = turn.primaryEventId;
+  if (primary) await finishEvent(primary, startedAt, outcome, batchId);
+  const others = turn.eventIds.filter((id) => id !== primary);
+  if (others.length === 0) return;
+  const { error } = await agentDb()
+    .from("ai_agent_events")
+    .update({
+      status: "done",
+      decision: outcome.decision,
+      reason_codes: [...outcome.reasons, `batched_with_${turn.messages.length}`],
+      escalation_id: outcome.escalationId ?? null,
+      batch_id: batchId,
+      finished_at: new Date().toISOString(),
+    })
+    .in("id", others);
+  if (error) throw new Error(error.message);
+}
+
+async function markBatchEventsFailed(eventIds: string[], batchId: string, message: string): Promise<void> {
+  if (eventIds.length === 0) return;
+  await agentDb()
+    .from("ai_agent_events")
+    .update({ status: "error", error: message.slice(0, 1000), batch_id: batchId, finished_at: new Date().toISOString() })
+    .in("id", eventIds);
+}
+
+/**
+ * Decides ONE claimed batch. Everything here is safe to run twice (a worker
+ * that crashed after a side effect, or lost its lease): events are settled by
+ * id, outbox rows by dedupe key, escalations by the one-open-per-chat index.
+ */
+async function processClaimedBatch(batch: BatchRow, worker: string): Promise<"done" | "retry" | "failed" | "cancelled"> {
+  const startedAt = Date.now();
+  let eventIds: string[] = [];
+  try {
+    const settings = await loadSettings(batch.business_slug);
+    const messages = await loadBatchMessages(batch.id);
+    const turn = buildCustomerTurn(messages);
+    eventIds = turn.eventIds;
+
+    // Settings are re-read now: a business switched off while the batch waited sends nothing.
+    if (!settings?.enabled || messages.length === 0) {
+      const outcome: Outcome = { decision: "NO_REPLY", reasons: [settings?.enabled ? "empty_batch" : "agent_disabled"], outbox: [] };
+      await finishBatchEvents(turn, batch.id, startedAt, outcome);
+      await completeBatch(batch.id, worker, "cancelled", outcome.decision);
+      return "cancelled";
+    }
+
+    const outcome = await handleCustomerTurn(turn, {
+      businessSlug: batch.business_slug,
+      chatId: batch.chat_id,
+      contactNumber: batch.contact_number,
+      settings,
+      dedupeBase: `batch:${batch.id}`,
+    });
+
+    // Same last line of defence as the live path: only kinds the business's
+    // mode permits are enqueued (Observe: a staff notice to the staff group, nothing else).
+    const allowed = outcome.outbox.filter((o) => outboxAllowed(settings, o));
+    if (allowed.length !== outcome.outbox.length) outcome.reasons = [...outcome.reasons, "outbox_blocked_by_mode"];
+    // 'pending': the bridge collects these from its outbox poll (claim_ai_agent_outbox,
+    // which re-checks the mode in SQL); there is no request to answer.
+    await enqueue(allowed.map((o) => ({ ...o, eventId: turn.primaryEventId })), false);
+
+    await finishBatchEvents(turn, batch.id, startedAt, outcome);
+    await agentDb()
+      .from("ai_agent_conversations")
+      .upsert(
+        {
+          business_slug: batch.business_slug,
+          chat_id: batch.chat_id,
+          contact_number: batch.contact_number,
+          last_decision: outcome.decision,
+          last_event_at: new Date().toISOString(),
+        },
+        { onConflict: "business_slug,chat_id" }
+      );
+    const owned = await completeBatch(batch.id, worker, "done", outcome.decision);
+    if (!owned) console.warn("[aiAgent] batch lease was taken over before completion", batch.id);
+    return "done";
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("[aiAgent] processClaimedBatch failed", batch.id, message);
+    if (batch.attempts >= MAX_BATCH_ATTEMPTS) {
+      // Out of attempts: fail closed. Nothing was sent for this batch.
+      await markBatchEventsFailed(eventIds, batch.id, message).catch(() => {});
+      await completeBatch(batch.id, worker, "failed", null, message).catch(() => {});
+      return "failed";
+    }
+    await releaseBatch(batch.id, worker, message, RETRY_BACKOFF_SECONDS * batch.attempts).catch(() => {});
+    return "retry";
+  }
+}
+
+export interface BatchRunSummary {
+  claimed: number;
+  done: number;
+  retry: number;
+  failed: number;
+  cancelled: number;
+}
+
+/**
+ * The scheduler's unit of work. Safe to call from any number of places at
+ * once (cron endpoint, bridge outbox poll, forwarded messages): Postgres hands
+ * each due batch to exactly one caller, and a crashed caller's batch is
+ * re-offered when its lease expires. `budgetMs` bounds one invocation.
+ */
+export async function processDueBatches(options: { budgetMs?: number; concurrency?: number } = {}): Promise<BatchRunSummary> {
+  const worker = newWorkerId();
+  const deadline = Date.now() + (options.budgetMs ?? 40_000);
+  const summary: BatchRunSummary = { claimed: 0, done: 0, retry: 0, failed: 0, cancelled: 0 };
+  while (Date.now() < deadline) {
+    const batches = await claimBatches(options.concurrency ?? 3, worker);
+    if (batches.length === 0) break;
+    summary.claimed += batches.length;
+    const results = await Promise.all(batches.map((b) => processClaimedBatch(b, worker)));
+    for (const r of results) summary[r] += 1;
+  }
+  if (summary.claimed === 0 && Math.random() < 0.02) await purgeFinishedBatches();
+  return summary;
+}
+
 async function saveOrderRequest(
-  input: BridgeMessageInput,
+  input: Pick<BridgeMessageInput, "businessSlug" | "chatId" | "contactNumber">,
   existing: OpenOrderRequest | null,
   draft: OrderRequestDraft,
   complete: boolean
@@ -702,7 +928,7 @@ export async function simulateMessage(input: {
     contactNumber,
     text: input.text,
     hasMedia: false,
-    whatsappMessageId: null,
+    excludeMessageIds: [],
     settings,
     forceGatePass: true,
   });

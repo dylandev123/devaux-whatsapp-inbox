@@ -4,12 +4,15 @@ import { StaffCommand } from "@/lib/aiAgent/engine";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
 import { agentDb, loadSettings, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
 import { outboxState } from "@/lib/aiAgent/outboxStatus";
-import { applyStaffAction, canSend, ESCALATION_COLUMNS, EscalationRow } from "@/lib/server/aiAgent/escalations";
+import { sendAdminAnswer } from "@/lib/server/aiAgent/adminSend";
+import { applyStaffAction, ESCALATION_COLUMNS, EscalationRow } from "@/lib/server/aiAgent/escalations";
 import { enqueue } from "@/lib/server/aiAgent/outbox";
+import { STAFF_ANSWER_COLUMNS } from "@/lib/server/aiAgent/staffKnowledge";
 
-// Admin-only. Escalation history + answering from the admin UI. Answers go
-// through applyStaffAction() — the same code path as a staff reply in the
-// WhatsApp group — and are queued for the bridge to claim.
+// Admin-only. Escalation history + answering from the admin UI. A customer send
+// goes through sendAdminAnswer() → planCustomerSend(), the same policy as an
+// authorized "!send" in the staff WhatsApp group; other actions go through
+// applyStaffAction(). Anything to send is queued for the bridge to claim.
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
@@ -50,7 +53,28 @@ export async function GET(request: Request) {
       deliveries.set(o.escalation_id, list);
     }
   }
-  return NextResponse.json({ escalations: rows.map((r) => ({ ...r, deliveries: deliveries.get(r.id) ?? [] })) });
+
+  // What staff said and what became of it: the draft, whether it was sent or
+  // withheld (and why), and where each piece of information went.
+  const answers = new Map<string, unknown[]>();
+  if (ids.length > 0) {
+    const { data: answerRows, error: answerError } = await agentDb()
+      .from("ai_agent_staff_answers")
+      .select(STAFF_ANSWER_COLUMNS)
+      .eq("business_slug", businessSlug)
+      .in("escalation_id", ids)
+      .order("created_at", { ascending: false })
+      .limit(300);
+    if (answerError) return jsonError(answerError.message, 500);
+    for (const a of (answerRows ?? []) as { escalation_id: string }[]) {
+      const list = answers.get(a.escalation_id) ?? [];
+      if (list.length < 5) list.push(a);
+      answers.set(a.escalation_id, list);
+    }
+  }
+  return NextResponse.json({
+    escalations: rows.map((r) => ({ ...r, deliveries: deliveries.get(r.id) ?? [], answers: answers.get(r.id) ?? [] })),
+  });
 }
 
 const COMMANDS: StaffCommand[] = ["send", "note", "close", "takeover", "resume"];
@@ -58,13 +82,15 @@ const COMMANDS: StaffCommand[] = ["send", "note", "close", "takeover", "resume"]
 export async function PATCH(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
-  const body = await readJson<{ businessSlug?: unknown; id?: unknown; action?: unknown; body?: unknown }>(request);
+  const body = await readJson<{ businessSlug?: unknown; id?: unknown; action?: unknown; body?: unknown; basedOn?: unknown }>(request);
   const businessSlug = await resolveBusinessSlug(body?.businessSlug);
   if (!body || !businessSlug || typeof body.id !== "string") return jsonError("businessSlug and id are required", 400);
   if (!COMMANDS.includes(body.action as StaffCommand)) return jsonError(`action must be one of ${COMMANDS.join(", ")}`, 400);
   const command = body.action as StaffCommand;
   const text = typeof body.body === "string" ? body.body.trim().slice(0, 4000) : "";
   if ((command === "send" || command === "note") && !text) return jsonError("body is required", 400);
+  const basedOn = typeof body.basedOn === "string" && !Number.isNaN(Date.parse(body.basedOn)) ? body.basedOn : null;
+  if (command === "send" && !basedOn) return jsonError("basedOn (when you last viewed this escalation) is required to send", 400);
 
   try {
     const [settings, { data: escalation, error }] = await Promise.all([
@@ -73,24 +99,26 @@ export async function PATCH(request: Request) {
     ]);
     if (error) throw new Error(error.message);
     if (!escalation) return jsonError("Escalation not found", 404);
-    // In Observe mode "send" only records the answer for review (applyStaffAction
-    // queues nothing for the customer). Anywhere else it is refused.
-    const recordOnly = command === "send" && !canSend(settings) && settings?.enabled === true && settings.mode === "observe";
-    if (command === "send" && !canSend(settings) && !recordOnly) {
-      return jsonError("The agent is not enabled in Assisted mode — reply to the customer from the inbox instead.", 409);
+    const row = escalation as EscalationRow;
+
+    // Messaging a customer is decided by ONE policy shared with the WhatsApp staff group
+    // (lib/server/aiAgent/customerSend.ts): mode, contact scope, takeover, recent human
+    // activity, stale text, safety, duplicates and unknown-send holds all apply here too.
+    if (command === "send") {
+      const sent = await sendAdminAnswer({ settings, escalation: row, text, adminId: admin.userId, basedOn: basedOn! });
+      if (!sent.ok) return jsonError(sent.message, sent.status);
+      return NextResponse.json({ ok: true, message: sent.message, queued: sent.queued, sent: sent.sent });
     }
 
-    // Identical double-submits collapse onto one outbox item.
-    const digest = createHash("sha256").update(text).digest("hex").slice(0, 16);
     const result = await applyStaffAction({
-      escalation: escalation as EscalationRow,
+      escalation: row,
       command,
       body: text,
       settings,
       actorKind: "admin",
       actorId: admin.userId,
       via: "admin_ui",
-      dedupeBase: `ui:${body.id}:${digest}`,
+      dedupeBase: `ui:${body.id}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`,
     });
     await enqueue(result.outbox, false);
     return NextResponse.json({ ok: true, message: result.feedback, queued: result.outbox.length });

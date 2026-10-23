@@ -35,6 +35,12 @@ export interface SettingsPatch {
   maxAutoRepliesPerHour?: number;
   sendHoldingReply?: boolean;
   staffNoticesEnabled?: boolean;
+  batchingEnabled?: boolean;
+  batchQuietSeconds?: number;
+  batchMaxWaitSeconds?: number;
+  customerMemoryEnabled?: boolean;
+  /** Phone numbers (or exact …@lid ids) allowed to send customer replies from the staff group. */
+  staffAuthorizedSenders?: string[];
 }
 
 export interface ContactSearchResult {
@@ -107,13 +113,47 @@ export interface EscalationView {
     notice_skipped?: string;
     /** Set when a staff answer was recorded but not relayed (the agent's mode at the time). */
     answer_not_relayed?: string;
+    /** Verified-history lines shown to staff in the notice (confirmed orders, customer-stated facts). */
+    history?: string[];
+    /** Customer messages added after the escalation opened (kept even when no second notice is posted). */
+    updates?: { at: string; text: string }[];
   };
   staff_answer: string | null;
   answered_via: string | null;
   answered_at: string | null;
   created_at: string;
+  /** Used as `basedOn` when sending: the version of the escalation the admin is looking at. */
+  updated_at: string;
   /** Staff notices and relays for this escalation, newest first, with derived delivery state. */
   deliveries: EscalationDelivery[];
+  /** What staff said in the group or dashboard, newest first, and what became of it. */
+  answers: StaffAnswerView[];
+}
+
+export interface StaffAnswerItemView {
+  category: "durable" | "temporary" | "customer_specific" | "one_off";
+  disposition: "candidate" | "candidate_conflict" | "already_known" | "temporary" | "customer_memory" | "recorded_only" | "skipped";
+  title: string;
+  content: string;
+  validUntil?: string | null;
+  note?: string;
+}
+
+export interface StaffAnswerView {
+  id: string;
+  source: "whatsapp" | "admin_ui";
+  command: "answer" | "send";
+  body: string;
+  staff_message_at: string | null;
+  created_at: string;
+  state: "processing" | "done" | "failed";
+  /** Why processing failed (state = failed). */
+  error: string | null;
+  retry_count: number;
+  draft: string | null;
+  customer_action: "sent" | "withheld" | null;
+  withheld_reason: string | null;
+  items: StaffAnswerItemView[];
 }
 
 export interface EscalationDelivery {
@@ -142,7 +182,8 @@ export interface EventView {
   kind: string;
   status: string;
   message_excerpt: string | null;
-  decision: AgentDecision | null;
+  /** BATCHED: the message is waiting in (or was decided with) a batch. */
+  decision: AgentDecision | "BATCHED" | null;
   reason_codes: string[];
   confidence: number | null;
   proposed_reply: string | null;
@@ -191,6 +232,14 @@ export interface ActivityDiagnostics {
   contacts: { chatId: string; name: string | null; rule: "allow" | "exclude"; isLid: boolean; phone: string | null }[];
 }
 
+export interface KnowledgeConflictView {
+  id: string;
+  title: string;
+  content: string;
+  severity: "conflict" | "related";
+  reason: string;
+}
+
 export interface LearningCandidate {
   id: string;
   escalation_id: string | null;
@@ -198,6 +247,17 @@ export interface LearningCandidate {
   staff_answer: string;
   status: "pending" | "approved" | "rejected";
   created_at: string;
+  /** 'durable' = a classified permanent fact; 'staff_answer' = a legacy raw answer. */
+  category: string;
+  suggested_kind: KnowledgeKind | null;
+  suggested_title: string | null;
+  /** The staff's words this was learned from, when, and the escalation reference. */
+  source_message: string | null;
+  source_message_at: string | null;
+  ref_code: string | null;
+  /** Approved entries this overlaps, recomputed against today's knowledge. */
+  conflicts: KnowledgeConflictView[];
+  duplicate_of?: { id: string; title: string } | null;
 }
 
 export interface OrderRequestView {
@@ -210,6 +270,46 @@ export interface OrderRequestView {
   notes: string | null;
   status: "collecting" | "pending_approval" | "approved" | "rejected" | "cancelled";
   updated_at: string;
+}
+
+export interface MemoryOrderView {
+  id: string;
+  summary: string;
+  status: string | null;
+  at: string | null;
+  products: string[];
+  quantity: string | null;
+  address: string | null;
+  excluded: boolean;
+  /** Staff-processed (Added / Completed). Everything else is an unconfirmed request. */
+  verified: boolean;
+}
+
+export interface MemoryFactView {
+  id: string;
+  kind: "preference" | "delivery_preference" | "resolved_issue" | "note";
+  source: "customer_stated" | "staff_confirmed" | "admin";
+  content: string;
+  evidence: string | null;
+  expires_at: string | null;
+  updated_at: string;
+  customer_key: string;
+}
+
+export interface CustomerMemoryView {
+  identity: { chatId: string; phone: string | null; chatIds: string[]; unresolvedLid: boolean };
+  customerKey: string;
+  orders: MemoryOrderView[];
+  facts: MemoryFactView[];
+  inferences: Record<string, string>;
+  openOrderRequests: { id: string; status: string; items: unknown; updated_at: string }[];
+}
+
+export interface MemoryCustomerListItem {
+  customerKey: string;
+  chatId: string;
+  facts: number;
+  updatedAt: string;
 }
 
 export interface SimulationView {
@@ -280,8 +380,11 @@ export const aiAgentApi = {
 
   listEscalations: (b: string, openOnly: boolean) =>
     api<{ escalations: EscalationView[] }>(`/api/ai-agent/escalations${q(b, openOnly ? "&status=open" : "")}`),
-  actOnEscalation: (b: string, id: string, action: string, body?: string) =>
-    api<{ ok: true; message: string }>("/api/ai-agent/escalations", send("PATCH", { businessSlug: b, id, action, body })),
+  /** `basedOn` = the escalation's updated_at as displayed; a send is refused if the customer wrote after it. */
+  actOnEscalation: (b: string, id: string, action: string, body?: string, basedOn?: string) =>
+    api<{ ok: true; message: string }>("/api/ai-agent/escalations", send("PATCH", { businessSlug: b, id, action, body, basedOn })),
+  retryStaffAnswer: (b: string, answerId: string) =>
+    api<{ ok: true; message: string; queued: number }>("/api/ai-agent/escalations/retry", send("POST", { businessSlug: b, answerId })),
 
   listConversations: (b: string) => api<{ conversations: ConversationView[] }>(`/api/ai-agent/conversations${q(b)}`),
   setControl: (b: string, chatId: string, action: "takeover" | "resume", minutes?: number) =>
@@ -295,12 +398,28 @@ export const aiAgentApi = {
     b: string,
     id: string,
     action: "approve" | "reject",
-    fields: Partial<{ kind: KnowledgeKind; title: string; content: string }> = {}
+    fields: Partial<{ kind: KnowledgeKind; title: string; content: string; resolution: "replace" | "keep_both"; replaceKnowledgeId: string }> = {}
   ) => api<{ ok: true }>("/api/ai-agent/learning", send("PATCH", { businessSlug: b, id, action, ...fields })),
 
   listOrderRequests: (b: string) => api<{ requests: OrderRequestView[] }>(`/api/ai-agent/order-requests${q(b)}`),
   reviewOrderRequest: (b: string, id: string, action: "approve" | "reject" | "cancel") =>
     api<{ request: OrderRequestView }>("/api/ai-agent/order-requests", send("PATCH", { businessSlug: b, id, action })),
+
+  listMemoryCustomers: (b: string) => api<{ customers: MemoryCustomerListItem[] }>(`/api/ai-agent/memory${q(b)}`),
+  getMemory: (b: string, chatId: string) =>
+    api<{ memory: CustomerMemoryView }>(`/api/ai-agent/memory${q(b, `&chatId=${encodeURIComponent(chatId)}`)}`),
+  addMemoryFact: (b: string, chatId: string, kind: "preference" | "delivery_preference" | "note", content: string) =>
+    api<{ fact: MemoryFactView }>("/api/ai-agent/memory", send("POST", { businessSlug: b, chatId, action: "add_fact", kind, content })),
+  updateMemoryFact: (b: string, chatId: string, id: string, content: string) =>
+    api<{ fact: MemoryFactView }>("/api/ai-agent/memory", send("PATCH", { businessSlug: b, chatId, action: "update_fact", id, content })),
+  deleteMemoryFact: (b: string, chatId: string, id: string) =>
+    api<{ ok: true }>("/api/ai-agent/memory", send("DELETE", { businessSlug: b, chatId, id })),
+  setOrderExcluded: (b: string, chatId: string, orderId: string, excluded: boolean) =>
+    api<{ ok: true }>("/api/ai-agent/memory", send("PATCH", { businessSlug: b, chatId, action: excluded ? "exclude_order" : "include_order", orderId })),
+  clearInference: (b: string, chatId: string, fields: string[]) =>
+    api<{ ok: true }>("/api/ai-agent/memory", send("PATCH", { businessSlug: b, chatId, action: "clear_inference", fields })),
+  forgetCustomer: (b: string, chatId: string, opts: { includeOrders: boolean; includeLogs: boolean }) =>
+    api<{ result: Record<string, number> }>("/api/ai-agent/memory", send("POST", { businessSlug: b, chatId, action: "forget", confirm: "DELETE", ...opts })),
 
   simulate: (b: string, text: string, chatId: string | null) =>
     api<SimulationView>("/api/ai-agent/test", send("POST", { businessSlug: b, text, chatId })),

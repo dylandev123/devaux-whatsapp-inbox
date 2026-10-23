@@ -178,6 +178,10 @@ const SETTINGS: AgentSettings = {
   max_auto_replies_per_hour: 6,
   send_holding_reply: true,
   staff_notices_enabled: false,
+  batching_enabled: false,
+  batch_quiet_seconds: 45,
+  batch_max_wait_seconds: 180,
+  customer_memory_enabled: false,
 };
 const gate = (chatId: string, contactRule: "allow" | "exclude" | null) =>
   evaluateGate({
