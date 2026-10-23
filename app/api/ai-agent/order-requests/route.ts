@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, pilotSlug } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
 
 // Admin-only. Order requests the agent collected. Approving records that staff
 // reviewed the request — it sends nothing; confirming with the customer stays
@@ -13,8 +13,8 @@ const COLUMNS =
 export async function GET(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
-  const businessSlug = pilotSlug(new URL(request.url).searchParams.get("businessSlug"));
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(new URL(request.url).searchParams.get("businessSlug"));
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
   const { data, error } = await agentDb()
     .from("ai_agent_order_requests")
@@ -32,7 +32,7 @@ export async function PATCH(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
   const body = await readJson<{ businessSlug?: unknown; id?: unknown; action?: unknown }>(request);
-  const businessSlug = pilotSlug(body?.businessSlug);
+  const businessSlug = await resolveBusinessSlug(body?.businessSlug);
   if (!body || !businessSlug || typeof body.id !== "string") return jsonError("businessSlug and id are required", 400);
   const status = typeof body.action === "string" ? TRANSITIONS[body.action] : undefined;
   if (!status) return jsonError('action must be "approve", "reject" or "cancel"', 400);

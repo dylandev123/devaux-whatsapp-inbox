@@ -12,10 +12,16 @@
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-// Pilot allow-list. Mirrors the ai_agent_settings_pilot_only check constraint
-// in supabase/migrations/20261022000000_ai_agent.sql — both must change to
-// extend the pilot.
-export const AI_AGENT_PILOT_BUSINESSES = ["dog_food"] as const;
+// Any configured business may run the agent, but every business starts OFF /
+// observe / no contacts (the ai_agent_settings column defaults) and is only
+// ever enabled by an explicit admin action. There is no allow-list: the former
+// Dog Food-only restriction (and its ai_agent_settings_pilot_only constraint)
+// was removed by 20261023000000_ai_agent_multi_business.sql.
+export const DEFAULT_AGENT_SETTINGS = {
+  enabled: false,
+  mode: "observe",
+  contact_scope: "none",
+} as const;
 
 export const AGENT_DECISIONS = ["REPLY", "ASK", "ESCALATE", "NO_REPLY", "HUMAN"] as const;
 export type AgentDecision = (typeof AGENT_DECISIONS)[number];
@@ -93,8 +99,9 @@ export interface KnowledgeFact {
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
-export function isPilotBusiness(businessSlug: string): boolean {
-  return (AI_AGENT_PILOT_BUSINESSES as readonly string[]).includes(businessSlug);
+/** Canonical slug shape (see lib/businessSlug.ts); says nothing about whether the business exists. */
+export function isValidBusinessSlug(businessSlug: string): boolean {
+  return /^[a-z0-9_]{1,64}$/.test(businessSlug);
 }
 
 /**
@@ -142,8 +149,11 @@ export type GateResult =
 
 export function evaluateGate(input: GateInput): GateResult {
   const { settings } = input;
-  if (!isPilotBusiness(input.businessSlug)) return stop("NO_REPLY", "business_not_in_pilot");
+  if (!isValidBusinessSlug(input.businessSlug)) return stop("NO_REPLY", "invalid_business");
   if (!settings || !settings.enabled) return stop("NO_REPLY", "agent_disabled");
+  // Settings, rules and takeover state are per business: another business's
+  // row must never authorise a reply here.
+  if (settings.business_slug !== input.businessSlug) return stop("NO_REPLY", "business_mismatch");
 
   const kind = chatKind(input.chatId);
   if (kind === "system") return stop("NO_REPLY", "system_chat");

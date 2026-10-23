@@ -6,8 +6,9 @@
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { randomBytes } from "crypto";
-import { AgentSettings, generateRefCode, KnowledgeKind, isPilotBusiness } from "@/lib/aiAgent/engine";
+import { AgentSettings, generateRefCode, isValidBusinessSlug, KnowledgeKind } from "@/lib/aiAgent/engine";
 import { normalizeBusinessSlug } from "@/lib/businessSlug";
+import { BUSINESS_LABELS } from "@/lib/whatsapp";
 
 let cached: SupabaseClient | null = null;
 
@@ -22,11 +23,47 @@ export function agentDb(): SupabaseClient {
   return cached;
 }
 
-/** Normalized slug, or null when it isn't a pilot business (callers 400/ignore). */
-export function pilotSlug(raw: unknown): string | null {
+/** Normalized slug when well-formed (no existence check), else null. Used on the bridge path. */
+export function parseBusinessSlug(raw: unknown): string | null {
   if (typeof raw !== "string" || !raw.trim()) return null;
   const slug = normalizeBusinessSlug(raw);
-  return isPilotBusiness(slug) ? slug : null;
+  return isValidBusinessSlug(slug) ? slug : null;
+}
+
+/**
+ * Admin routes: normalized slug of a business that actually exists (an active
+ * whatsapp_businesses row, or one that already has agent settings), else null
+ * — so a typo can never create settings for a business that isn't there.
+ */
+export async function resolveBusinessSlug(raw: unknown): Promise<string | null> {
+  const slug = parseBusinessSlug(raw);
+  if (!slug) return null;
+  const db = agentDb();
+  const [biz, cfg] = await Promise.all([
+    db.from("whatsapp_businesses").select("business_slug").eq("business_slug", slug).eq("is_active", true).maybeSingle(),
+    db.from("ai_agent_settings").select("business_slug").eq("business_slug", slug).maybeSingle(),
+  ]);
+  if (biz.data || cfg.data) return slug;
+  // whatsapp_businesses missing (migration not run): fall back to the static list.
+  if (biz.error && slug in BUSINESS_LABELS) return slug;
+  return null;
+}
+
+/**
+ * Makes sure the business has a settings row. A new row takes the column
+ * defaults — OFF, observe, contact scope none — and an existing row is never
+ * touched, so this can never enable anything or reset a configuration.
+ */
+export async function ensureSettings(businessSlug: string): Promise<AgentSettings> {
+  const existing = await loadSettings(businessSlug);
+  if (existing) return existing;
+  const { error } = await agentDb()
+    .from("ai_agent_settings")
+    .upsert({ business_slug: businessSlug }, { onConflict: "business_slug", ignoreDuplicates: true });
+  if (error) throw new Error(error.message);
+  const created = await loadSettings(businessSlug);
+  if (!created) throw new Error("Could not create AI agent settings");
+  return created;
 }
 
 export const SETTINGS_COLUMNS =

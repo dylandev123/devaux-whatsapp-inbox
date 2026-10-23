@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { verifyBridgeSecret } from "@/lib/server/aiAgent/auth";
 import { agentDb } from "@/lib/server/aiAgent/db";
-import { AI_AGENT_PILOT_BUSINESSES } from "@/lib/aiAgent/engine";
 
 // Bridge → app: which businesses the bridge should forward messages for, and
-// each one's staff group. Purely an optimisation — forwarding a message for a
+// each one's staff group. One entry per configured business; a business with
+// no row is simply absent (= not forwarded). Purely an optimisation — forwarding a message for a
 // disabled business is always safe (it is ignored without side effects).
 export const dynamic = "force-dynamic";
 
@@ -14,8 +14,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await agentDb()
     .from("ai_agent_settings")
-    .select("business_slug, enabled, mode, staff_group_jid")
-    .in("business_slug", [...AI_AGENT_PILOT_BUSINESSES]);
+    .select("business_slug, enabled, mode, staff_group_jid");
   if (error) return NextResponse.json({ error: "Failed to load AI agent config" }, { status: 500 });
 
   return NextResponse.json({

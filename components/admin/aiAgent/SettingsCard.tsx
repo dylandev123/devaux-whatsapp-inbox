@@ -1,24 +1,25 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { aiAgentApi, SettingsPatch, SettingsResponse } from "@/lib/aiAgent/client";
 import { requiredConfidence } from "@/lib/aiAgent/engine";
-import { KnownChat } from "@/lib/knownChats";
+import { StaffGroupPicker, StaffGroupValue } from "@/components/admin/aiAgent/StaffGroupPicker";
 import { Card, inputClass, Notice, primaryButton } from "@/components/admin/aiAgent/ui";
 
 interface Props {
   businessSlug: string;
   data: SettingsResponse;
-  chats: KnownChat[];
   onSaved: (next: SettingsResponse["settings"]) => void;
 }
 
-export function SettingsCard({ businessSlug, data, chats, onSaved }: Props) {
+export function SettingsCard({ businessSlug, data, onSaved }: Props) {
   const s = data.settings;
   const [enabled, setEnabled] = useState(s.enabled);
   const [mode, setMode] = useState(s.mode);
   const [autonomy, setAutonomy] = useState(s.autonomy);
-  const [staffGroupJid, setStaffGroupJid] = useState(s.staff_group_jid ?? "");
+  const [staffGroup, setStaffGroup] = useState<StaffGroupValue | null>(
+    s.staff_group_jid ? { jid: s.staff_group_jid, name: s.staff_group_name, manual: false } : null
+  );
   const [takeoverMinutes, setTakeoverMinutes] = useState(s.auto_takeover_minutes);
   const [maxReplies, setMaxReplies] = useState(s.max_auto_replies_per_hour);
   const [holdingReply, setHoldingReply] = useState(s.send_holding_reply);
@@ -26,7 +27,6 @@ export function SettingsCard({ businessSlug, data, chats, onSaved }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
-  const groups = useMemo(() => chats.filter((c) => c.isGroup), [chats]);
   const threshold = requiredConfidence(autonomy);
 
   async function save(patch: SettingsPatch, confirmText?: string) {
@@ -47,12 +47,12 @@ export function SettingsCard({ businessSlug, data, chats, onSaved }: Props) {
   }
 
   function saveAll() {
-    const group = groups.find((g) => g.chatId === staffGroupJid);
     void save({
       mode,
       autonomy,
-      staffGroupJid: staffGroupJid || null,
-      staffGroupName: group?.contactName ?? s.staff_group_name ?? null,
+      staffGroupJid: staffGroup?.jid ?? null,
+      staffGroupName: staffGroup?.name ?? null,
+      staffGroupManual: staffGroup?.manual ?? false,
       autoTakeoverMinutes: takeoverMinutes,
       maxAutoRepliesPerHour: maxReplies,
       sendHoldingReply: holdingReply,
@@ -125,18 +125,8 @@ export function SettingsCard({ businessSlug, data, chats, onSaved }: Props) {
 
         <div>
           <label className="mb-1 block text-xs font-medium text-zinc-500">Staff escalation WhatsApp group</label>
-          <select value={staffGroupJid} onChange={(e) => setStaffGroupJid(e.target.value)} className={inputClass}>
-            <option value="">— None —</option>
-            {s.staff_group_jid && !groups.some((g) => g.chatId === s.staff_group_jid) && (
-              <option value={s.staff_group_jid}>{s.staff_group_name ?? s.staff_group_jid}</option>
-            )}
-            {groups.map((g) => (
-              <option key={g.chatId} value={g.chatId}>
-                {g.contactName ? `${g.contactName} (last sender)` : g.chatId}
-              </option>
-            ))}
-          </select>
-          <p className="mt-1 text-xs text-zinc-400">Groups this business number has messages in. Staff answer escalations by replying in this group.</p>
+          <StaffGroupPicker businessSlug={businessSlug} value={staffGroup} onChange={setStaffGroup} />
+          <p className="mt-1 text-xs text-zinc-400">Pick a group this business number has messages in. Staff answer escalations by replying in this group.</p>
         </div>
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

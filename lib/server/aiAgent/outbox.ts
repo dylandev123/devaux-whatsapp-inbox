@@ -170,6 +170,7 @@ export async function ackOutbox(input: {
       .from("ai_agent_escalations")
       .update({ notice_message_id: input.whatsappMessageId, status: "notified" })
       .eq("id", row.escalation_id)
+      .eq("business_slug", row.business_slug)
       .eq("status", "open")
       .is("notice_message_id", null);
   }

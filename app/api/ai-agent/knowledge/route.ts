@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { KNOWLEDGE_KINDS } from "@/lib/aiAgent/engine";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, KNOWLEDGE_COLUMNS, KnowledgeRow, pilotSlug } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, KNOWLEDGE_COLUMNS, KnowledgeRow, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
 
 // Admin-only. Business knowledge: the only facts the agent may state. Any edit
 // to an approved entry sends it back to draft until it is re-approved.
@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
-  const businessSlug = pilotSlug(new URL(request.url).searchParams.get("businessSlug"));
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(new URL(request.url).searchParams.get("businessSlug"));
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
   const { data, error } = await agentDb()
     .from("ai_agent_knowledge")
@@ -58,8 +58,8 @@ export async function POST(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
   const body = await readJson<Fields & { businessSlug?: unknown; approve?: unknown }>(request);
-  const businessSlug = pilotSlug(body?.businessSlug);
-  if (!body || !businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(body?.businessSlug);
+  if (!body || !businessSlug) return jsonError("Unknown businessSlug", 400);
   const fields = validateFields(body, false);
   if (typeof fields === "string") return jsonError(fields, 400);
 
@@ -91,7 +91,7 @@ export async function PATCH(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
   const body = await readJson<Fields & { businessSlug?: unknown; id?: unknown; action?: unknown }>(request);
-  const businessSlug = pilotSlug(body?.businessSlug);
+  const businessSlug = await resolveBusinessSlug(body?.businessSlug);
   if (!body || !businessSlug || typeof body.id !== "string") return jsonError("businessSlug and id are required", 400);
 
   const db = agentDb();
@@ -139,6 +139,7 @@ export async function PATCH(request: Request) {
     .from("ai_agent_knowledge")
     .update({ ...patch, updated_by: admin.userId })
     .eq("id", prev.id)
+    .eq("business_slug", businessSlug)
     .select(KNOWLEDGE_COLUMNS)
     .single();
   if (error) return jsonError(error.message, 500);

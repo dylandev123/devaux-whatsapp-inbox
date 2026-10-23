@@ -13,9 +13,10 @@ import type {
   OrderRequestDraft,
 } from "@/lib/aiAgent/engine";
 
+export type { AgentBusiness } from "@/lib/aiAgent/businessList";
+
 export interface SettingsResponse {
   settings: AgentSettings & { updated_at: string };
-  pilotBusinesses: string[];
   requiredConfidence: number | null;
   bridgeConfigured: boolean;
   aiKeyConfigured: boolean;
@@ -28,9 +29,39 @@ export interface SettingsPatch {
   autonomy?: number;
   staffGroupJid?: string | null;
   staffGroupName?: string | null;
+  /** true when the JID was typed in rather than picked from discovered groups. */
+  staffGroupManual?: boolean;
   autoTakeoverMinutes?: number;
   maxAutoRepliesPerHour?: number;
   sendHoldingReply?: boolean;
+}
+
+export interface ContactSearchResult {
+  chatId: string;
+  name: string | null;
+  number: string | null;
+  isLid: boolean;
+  lastMessageAt: string | null;
+  rule: "allow" | "exclude" | null;
+}
+export interface ContactSearchResponse {
+  results: ContactSearchResult[];
+  total: number;
+  manual: { chatId: string; rule: "allow" | "exclude" | null } | null;
+  rpcAvailable: boolean;
+}
+export interface GroupSearchResult {
+  chatId: string;
+  name: string | null;
+  label: string;
+  lastSender: string | null;
+  lastMessageAt: string | null;
+  memberCount: number | null;
+}
+export interface GroupSearchResponse {
+  results: GroupSearchResult[];
+  total: number;
+  rpcAvailable: boolean;
 }
 
 export interface ContactRuleView {
@@ -182,6 +213,8 @@ const q = (businessSlug: string, extra = "") => `?businessSlug=${encodeURICompon
 const send = (method: string, body: unknown): RequestInit => ({ method, body: JSON.stringify(body) });
 
 export const aiAgentApi = {
+  getBusinesses: () =>
+    api<{ businesses: import("@/lib/aiAgent/businessList").AgentBusiness[]; sessionsKnown: boolean }>("/api/ai-agent/businesses"),
   getSettings: (b: string) => api<SettingsResponse>(`/api/ai-agent/settings${q(b)}`),
   saveSettings: (b: string, patch: SettingsPatch) =>
     api<{ settings: SettingsResponse["settings"]; requiredConfidence: number | null }>(
@@ -192,6 +225,12 @@ export const aiAgentApi = {
   listContacts: (b: string) => api<{ rules: ContactRuleView[] }>(`/api/ai-agent/contacts${q(b)}`),
   setContact: (b: string, chatId: string, displayName: string | null, rule: "allow" | "exclude") =>
     api<{ rule: ContactRuleView }>("/api/ai-agent/contacts", send("POST", { businessSlug: b, chatId, displayName, rule })),
+  addContactByNumber: (b: string, number: string, rule: "allow" | "exclude") =>
+    api<{ rule: ContactRuleView; rules: ContactRuleView[] }>("/api/ai-agent/contacts", send("POST", { businessSlug: b, number, rule })),
+  searchContacts: (b: string, query: string) =>
+    api<ContactSearchResponse>(`/api/ai-agent/chats${q(b, `&kind=contact&q=${encodeURIComponent(query)}`)}`),
+  searchGroups: (b: string, query: string) =>
+    api<GroupSearchResponse>(`/api/ai-agent/chats${q(b, `&kind=group&q=${encodeURIComponent(query)}`)}`),
   removeContact: (b: string, chatId: string) =>
     api<{ ok: true }>(`/api/ai-agent/contacts${q(b, `&chatId=${encodeURIComponent(chatId)}`)}`, { method: "DELETE" }),
 

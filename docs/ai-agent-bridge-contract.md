@@ -44,12 +44,13 @@ Optional optimisation; cache for ~60 s.
 200 {
   "pollOutboxSeconds": 10,
   "businesses": [
-    { "businessSlug": "dog_food", "forwardMessages": false, "mode": "observe", "staffGroupJid": null }
+    { "businessSlug": "dog_food", "forwardMessages": false, "mode": "observe", "staffGroupJid": null },
+    { "businessSlug": "by_sea", "forwardMessages": false, "mode": "observe", "staffGroupJid": null }
   ]
 }
 ```
 
-Forward messages only for businesses with `forwardMessages: true`. Forwarding
+One entry per business that has agent settings; each business is configured independently (own staff group, mode and on/off). A business missing from the list is not enabled. Forward messages only for businesses with `forwardMessages: true`. Forwarding
 for any other business is harmless (answered with `status: "ignored"`, nothing
 written), so a stale cache is safe.
 
@@ -203,7 +204,7 @@ Migration: `supabase/migrations/20261022000000_ai_agent.sql`.
 
 | Table / function | Purpose |
 |---|---|
-| `ai_agent_settings` | Per-business config. Seeded for `dog_food` only, OFF/observe/none. Check constraint: only `dog_food` may be enabled. |
+| `ai_agent_settings` | Per-business config, one row per business. Rows are created OFF / observe / none (seeded for `dog_food`; others by `20261023000000_ai_agent_multi_business.sql` or on first admin visit). No business restriction. |
 | `ai_agent_contact_rules` | `allow` / `exclude` per chat |
 | `ai_agent_knowledge` | Business facts; only `approved` + unexpired are used |
 | `ai_agent_conversations` | Per-chat AI/human control |

@@ -20,7 +20,7 @@ import {
   GateResult,
   HOLDING_REPLY_GENERAL,
   HOLDING_REPLY_ORDER,
-  isPilotBusiness,
+  isValidBusinessSlug,
   ModelProposal,
   OrderRequestDraft,
   priorityFor,
@@ -91,8 +91,9 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   const startedAt = Date.now();
   const input = { ...raw, businessSlug: normalizeBusinessSlug(raw.businessSlug) };
 
-  // Non-pilot and disabled businesses are dropped without writing anything.
-  if (!isPilotBusiness(input.businessSlug)) return ignored("business_not_in_pilot");
+  // Malformed, unconfigured (no settings row = default OFF) and disabled
+  // businesses are dropped without writing anything.
+  if (!isValidBusinessSlug(input.businessSlug)) return ignored("invalid_business");
   const settings = await loadSettings(input.businessSlug);
   if (!settings?.enabled) return ignored("agent_disabled");
 

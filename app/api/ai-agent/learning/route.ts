@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { KNOWLEDGE_KINDS } from "@/lib/aiAgent/engine";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, pilotSlug } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
 
 // Admin-only. Staff corrections become permanent knowledge ONLY through an
 // explicit admin approval here (the admin can edit the wording first).
@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
-  const businessSlug = pilotSlug(new URL(request.url).searchParams.get("businessSlug"));
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(new URL(request.url).searchParams.get("businessSlug"));
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
   const { data, error } = await agentDb()
     .from("ai_agent_learning_candidates")
@@ -36,7 +36,7 @@ export async function PATCH(request: Request) {
     title?: unknown;
     content?: unknown;
   }>(request);
-  const businessSlug = pilotSlug(body?.businessSlug);
+  const businessSlug = await resolveBusinessSlug(body?.businessSlug);
   if (!body || !businessSlug || typeof body.id !== "string") return jsonError("businessSlug and id are required", 400);
   if (body.action !== "approve" && body.action !== "reject") return jsonError('action must be "approve" or "reject"', 400);
 

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { jsonError, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, pilotSlug } from "@/lib/server/aiAgent/db";
+import { agentDb, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
 
 // Admin-only, read-only. Recent decisions (ai_agent_events), outbox items
 // (ai_agent_outbox) and the audit trail. Items still awaiting the bridge
@@ -15,8 +15,8 @@ export async function GET(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
   const params = new URL(request.url).searchParams;
-  const businessSlug = pilotSlug(params.get("businessSlug"));
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(params.get("businessSlug"));
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
   const chatId = params.get("chatId");
 
   const db = agentDb();

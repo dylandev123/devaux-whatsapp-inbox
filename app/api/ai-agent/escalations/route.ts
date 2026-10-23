@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createHash } from "crypto";
 import { StaffCommand } from "@/lib/aiAgent/engine";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, loadSettings, pilotSlug } from "@/lib/server/aiAgent/db";
+import { agentDb, loadSettings, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
 import { applyStaffAction, canSend, ESCALATION_COLUMNS, EscalationRow } from "@/lib/server/aiAgent/escalations";
 import { enqueue } from "@/lib/server/aiAgent/outbox";
 
@@ -15,8 +15,8 @@ export async function GET(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
   const params = new URL(request.url).searchParams;
-  const businessSlug = pilotSlug(params.get("businessSlug"));
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(params.get("businessSlug"));
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
   let query = agentDb()
     .from("ai_agent_escalations")
@@ -36,7 +36,7 @@ export async function PATCH(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
   const body = await readJson<{ businessSlug?: unknown; id?: unknown; action?: unknown; body?: unknown }>(request);
-  const businessSlug = pilotSlug(body?.businessSlug);
+  const businessSlug = await resolveBusinessSlug(body?.businessSlug);
   if (!body || !businessSlug || typeof body.id !== "string") return jsonError("businessSlug and id are required", 400);
   if (!COMMANDS.includes(body.action as StaffCommand)) return jsonError(`action must be one of ${COMMANDS.join(", ")}`, 400);
   const command = body.action as StaffCommand;

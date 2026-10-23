@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
-import { AGENT_MODES, AI_AGENT_PILOT_BUSINESSES, CONTACT_SCOPES, requiredConfidence } from "@/lib/aiAgent/engine";
+import { AGENT_MODES, CONTACT_SCOPES, requiredConfidence } from "@/lib/aiAgent/engine";
+import { normalizeGroupJid } from "@/lib/aiAgent/chatDirectory";
+import { loadBusinessChats } from "@/lib/server/aiAgent/chats";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, loadSettings, pilotSlug, SETTINGS_COLUMNS } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, ensureSettings, loadSettings, resolveBusinessSlug, SETTINGS_COLUMNS } from "@/lib/server/aiAgent/db";
 import { getAiSettings } from "@/lib/server/aiSettings";
 
 // Admin-only (middleware.ts ADMIN_API_PREFIXES + requireAdmin()).
@@ -10,15 +12,15 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
-  const businessSlug = pilotSlug(new URL(request.url).searchParams.get("businessSlug"));
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(new URL(request.url).searchParams.get("businessSlug"));
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
   try {
-    const [settings, ai] = await Promise.all([loadSettings(businessSlug), getAiSettings().catch(() => null)]);
-    if (!settings) return jsonError("AI agent settings row missing — apply the ai_agent migration", 404);
+    // First visit to a business creates its row with the safe defaults
+    // (OFF / observe / no contacts); it is never enabled here.
+    const [settings, ai] = await Promise.all([ensureSettings(businessSlug), getAiSettings().catch(() => null)]);
     return NextResponse.json({
       settings,
-      pilotBusinesses: AI_AGENT_PILOT_BUSINESSES,
       requiredConfidence: requiredConfidence(settings.autonomy),
       bridgeConfigured: Boolean(process.env.AI_AGENT_BRIDGE_SECRET),
       aiKeyConfigured: Boolean(ai?.api_key),
@@ -36,6 +38,7 @@ interface Payload {
   autonomy?: unknown;
   staffGroupJid?: unknown;
   staffGroupName?: unknown;
+  staffGroupManual?: unknown;
   autoTakeoverMinutes?: unknown;
   maxAutoRepliesPerHour?: unknown;
   sendHoldingReply?: unknown;
@@ -50,8 +53,8 @@ export async function PUT(request: Request) {
   if (admin instanceof NextResponse) return admin;
   const body = await readJson<Payload>(request);
   if (!body) return jsonError("Invalid JSON body", 400);
-  const businessSlug = pilotSlug(body.businessSlug);
-  if (!businessSlug) return jsonError("businessSlug must be a pilot business", 400);
+  const businessSlug = await resolveBusinessSlug(body.businessSlug);
+  if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
   const patch: Record<string, unknown> = { updated_by: admin.userId };
   if (body.enabled !== undefined) {
@@ -75,9 +78,24 @@ export async function PUT(request: Request) {
     if (body.staffGroupJid === null || body.staffGroupJid === "") {
       patch.staff_group_jid = null;
       patch.staff_group_name = null;
-    } else if (typeof body.staffGroupJid === "string" && body.staffGroupJid.endsWith("@g.us")) {
-      patch.staff_group_jid = body.staffGroupJid.trim();
-      patch.staff_group_name = typeof body.staffGroupName === "string" ? body.staffGroupName.slice(0, 200) : null;
+    } else if (typeof body.staffGroupJid === "string" && normalizeGroupJid(body.staffGroupJid)) {
+      const jid = normalizeGroupJid(body.staffGroupJid)!;
+      // A group must be one this business has seen, unless the admin typed
+      // the JID in explicitly (staffGroupManual) for a group with no stored
+      // messages yet. Keeps another business's groups out of the dropdown path.
+      const current = await loadSettings(businessSlug);
+      if (current?.staff_group_jid !== jid && body.staffGroupManual !== true) {
+        try {
+          const known = await loadBusinessChats(businessSlug);
+          if (!known.groups.some((g) => g.chatId.toLowerCase() === jid)) {
+            return jsonError("That group has no messages for this business — pick a discovered group or enter its JID manually", 400);
+          }
+        } catch (err) {
+          return jsonError(err instanceof Error ? err.message : "Failed to verify the group", 500);
+        }
+      }
+      patch.staff_group_jid = jid;
+      patch.staff_group_name = typeof body.staffGroupName === "string" ? body.staffGroupName.trim().slice(0, 200) || null : null;
     } else {
       return jsonError("staffGroupJid must be a WhatsApp group id (…@g.us)", 400);
     }
@@ -98,7 +116,7 @@ export async function PUT(request: Request) {
   }
 
   try {
-    const before = await loadSettings(businessSlug);
+    const before = await ensureSettings(businessSlug);
     const { data, error } = await agentDb()
       .from("ai_agent_settings")
       .update(patch)

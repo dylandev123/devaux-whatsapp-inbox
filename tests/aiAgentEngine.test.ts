@@ -101,8 +101,9 @@ test("requiredConfidence: 0 never auto-sends, default 30 ≈ 0.87, floor 0.65", 
 
 // ── Gate ─────────────────────────────────────────────────────────────────────
 
-test("gate: non-pilot business and disabled agent never reply", () => {
-  assert.deepEqual(gate({ businessSlug: "by_sea" }), { pass: false, decision: "NO_REPLY", reasons: ["business_not_in_pilot"] });
+test("gate: another business's settings, a malformed slug and a disabled agent never reply", () => {
+  assert.deepEqual(gate({ businessSlug: "by_sea" }), { pass: false, decision: "NO_REPLY", reasons: ["business_mismatch"] });
+  assert.deepEqual(gate({ businessSlug: "By Sea!" }), { pass: false, decision: "NO_REPLY", reasons: ["invalid_business"] });
   assert.deepEqual(gate({ settings: { ...SETTINGS, enabled: false } }), { pass: false, decision: "NO_REPLY", reasons: ["agent_disabled"] });
   assert.deepEqual(gate({ settings: null }), { pass: false, decision: "NO_REPLY", reasons: ["agent_disabled"] });
 });

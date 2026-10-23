@@ -197,6 +197,9 @@ export async function applyStaffAction(input: {
   dedupeBase: string;
 }): Promise<StaffActionResult> {
   const { escalation: e, command, body } = input;
+  if (input.settings && input.settings.business_slug !== e.business_slug) {
+    throw new Error("Escalation belongs to a different business");
+  }
   const db = agentDb();
   const now = new Date().toISOString();
   const outbox: OutboxInsert[] = [];
@@ -315,6 +318,7 @@ async function matchCandidates(
       const { data, error: escError } = await db
         .from("ai_agent_escalations")
         .select("id, ref_code, notice_message_id, status")
+        .eq("business_slug", businessSlug)
         .in("id", ids);
       if (escError) throw new Error(escError.message);
       for (const row of data ?? []) byId.set(row.id, { ...(row as MatchableEscalation), notice_message_id: quotedMessageId });
@@ -379,8 +383,14 @@ export async function processStaffGroupMessage(input: {
         .from("ai_agent_escalations")
         .select(ESCALATION_COLUMNS)
         .eq("id", match.escalationId)
-        .single();
+        .eq("business_slug", settings.business_slug)
+        .maybeSingle();
       if (error) throw new Error(error.message);
+      if (!data) {
+        // Belt and braces: candidates are already business-scoped, so this
+        // means the row belongs to another business. Never act on it.
+        return { outbox: [], outcome: "unknown_ref", escalationId: null };
+      }
       const result = await applyStaffAction({
         escalation: data as EscalationRow,
         command: match.command,
