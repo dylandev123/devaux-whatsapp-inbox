@@ -135,8 +135,44 @@ WhatsApp". Both new options default off.
   appear in the knowledge it cited (staff-answer drafts: in the staff's words or approved knowledge). Also, a ready draft whose cited knowledge was changed,
   archived or expired after it was written now needs `!approve confirm`. Staff-typed `!edit` wording is staff-attested and stays ready.
 
+## Multi-message conversations and orders
+
+The pilot keeps the conversation going; it never stops after the first approved reply.
+
+* **One request per customer turn.** A reply to something staff approved is a **new** request (new `#E-` code, new AI suggestion v1), not an
+  edit of the answered one. The order collected so far lives in the customer's open order request and is handed to the model every turn,
+  so earlier answers are never asked for again.
+* **Customer writes again before staff act.** The update notice now carries the AI's **fresh suggestion** (v2, v3…) for the new state of the
+  conversation. The earlier version is superseded (kept for Evaluation). Quote *that* update to approve it; quoting an older notice or
+  suggestion is refused and names the current one. If the AI has nothing to suggest the update says so and the old draft stays unapprovable.
+* **Review mode.** In Approval Pilot the model is told staff approve every reply, so it always writes the next customer message (it no longer
+  goes quiet because a request is open) and names what it is missing in `escalation_reason`.
+* **Order slots**, gathered a step at a time: product and variant (and bag size), quantity, delivery or collection, delivery address (only for
+  delivery), contact only if unknown, notes. Corrections win, cancelled items drop out, several products are kept. When nothing is left to
+  ask, the draft summarises the order for staff and needs `!approve confirm` (stock, total and delivery are never promised by the AI). The AI
+  never quotes a price, fee, time or stock unless approved knowledge says it, and never says an order is confirmed.
+* **Not every message is an order.** Product, price, hours and delivery questions are answered from approved knowledge or flagged as a
+  knowledge gap (`⚠️ confirm the facts`, with the reason) and no order is started.
+* A draft that only asks for the next order detail is **customer-ready** (plain `!approve`); one that states a price, stock, day/time or offer
+  without approved knowledge still needs `!approve confirm` or `!edit`.
+* The notice is concise: customer + latest message, the AI suggestion, "Order so far (not confirmed)", "Missing / uncertain", the code and the
+  commands. Everything else (full history, versions, verdicts) is in the dashboard.
+
+## Rollout stages (existing controls only)
+
+| Stage | Setting | Result |
+|---|---|---|
+| 1. Personal testing | Mode *Approval Pilot*, contact scope *Selected*, **one** *Allow* rule (your test customer), your number in *Authorized senders* | Only that chat reaches the AI; every reply needs `!approve` |
+| 2. Selected customers | Add *Allow* rules one by one (Setup → Contacts) | Same approval for every reply |
+| 3. Supervised automation | Not built or enabled. Would be a per-customer, per-step opt-in on top of *Assisted*, using verified knowledge only; order finalisation, payments, complaints, exceptions and unverified facts stay staff-controlled | — |
+| 4. Broader automation | Not built or enabled | — |
+
+Any contact that is not allowed gets no reply, no draft and no staff notice (`contact_not_permitted`).
+
 ## Deployment order
 
+0. The bridge **must** poll `/outbox/claim` in this mode and know `approval_pilot` (bridge commit "Approval Pilot mode" after `e1ee0e7`). Notices from batched
+   turns and approved replies are `pending` until it does; messages queued while an older bridge ran are delivered, once, when the new one starts.
 1. Deploy the **bridge** (WhatsappOperation) with Approval Pilot support. Until then it fails closed in that mode (sends nothing).
 2. Run `supabase/migrations/20261030000000_ai_agent_approval_pilot.sql`, then `20261031000000_ai_agent_pilot_refinements.sql`, in the Supabase SQL editor (after the 20261022–20261029 agent migrations).
 3. Deploy this app. Nothing changes until an admin picks *Approval Pilot* for a business; every setting defaults to today's behavior.

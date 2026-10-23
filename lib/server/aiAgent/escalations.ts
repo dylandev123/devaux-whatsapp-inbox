@@ -134,6 +134,11 @@ export interface EscalateInput {
   draftMeta?: { ready: boolean; notes: string[]; knowledge_ids: string[]; knowledge_version: string | null } | null;
   /** What the AI could not work out, for the pilot notice ("Missing / uncertain"). */
   missing?: string[];
+  /**
+   * Approval Pilot: an escalation staff already answered stays closed. The customer's next message is a reply
+   * to what staff approved, so it is a new request with its own AI draft, not a change to the old one.
+   */
+  noReopen?: boolean;
 }
 
 export interface EscalationWrite {
@@ -170,7 +175,7 @@ export async function createOrAppendEscalation(input: EscalateInput): Promise<Es
   const db = agentDb();
   for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt += 1) {
     const existing = await findOpenEscalation(input.businessSlug, input.chatId);
-    const answered = existing ? null : await findRecentAnsweredEscalation(input.businessSlug, input.chatId);
+    const answered = existing || input.noReopen ? null : await findRecentAnsweredEscalation(input.businessSlug, input.chatId);
     const anchorPrev = answered ? snapshotFromContext(answered.context) : null;
     const anchorNext = anchorPrev ? nextSnapshot(anchorPrev, turnFacts(input)) : null;
     const reopen =

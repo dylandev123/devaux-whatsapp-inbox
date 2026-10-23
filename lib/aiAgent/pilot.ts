@@ -86,8 +86,15 @@ const NOTE_TEXT: Record<string, string> = {
   knowledge_changed: "Knowledge this draft relied on was changed or has expired since it was written",
 };
 
+/**
+ * Reason codes that describe the situation, not a risk in the draft. Every Approval Pilot request is "handled by staff",
+ * and a draft that only asks the customer for the next missing order detail states no fact that needs checking
+ * (prices, stock, times and offers are still checked on their own). The missing details are listed in the notice.
+ */
+const INFORMATIONAL_CODES = new Set(["verified_answer", "open_escalation", "collecting_order_details"]);
+
 const STOCK_CLAIM =
-  /\b(in stock|out of stock|sold out|back in stock|restocked|available|availability|(?:we|i)(?:'ve| have| got| still have| carry)\b[^.!?]{0,40}\b(?:it|them|that|some|plenty|enough|left|ready)|\d+\s+(?:left|remaining|in stock)|plenty (?:of|left)|ready (?:for|to) (?:pick ?up|collect))\b/i;
+  /\b(in stock|out of stock|sold out|back in stock|restocked|available|availability|(?:we|i)(?:'ve| have| got| still have| carry)\b(?!\s+(?:noted|added|changed|updated|passed|recorded|made|put|written|taken|logged|set)\b)[^.!?]{0,40}\b(?:it|them|that|some|plenty|enough|left|ready)|\d+\s+(?:left|remaining|in stock)|plenty (?:of|left)|ready (?:for|to) (?:pick ?up|collect))\b/i;
 const SCHEDULE_CLAIM =
   /\b(\d{1,2}(?::\d{2})?\s?(?:am|pm)|monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|this (?:morning|afternoon|evening|week)|next week|within \d+\s?(?:hours?|days?|mins?|minutes?)|same[- ]day)\b/gi;
 const OFFER_CLAIM = /\b(free (?:delivery|shipping)|discount|\d+\s?% off|special offer|promo(?:tion)?|buy one get one|bogo)\b/i;
@@ -136,7 +143,7 @@ export function assessDraftReadiness(input: {
   for (const code of checkReplySafety(input.reply, cited)) notes.add(code);
   for (const code of unsupportedClaimCodes(input.reply, cited.map((k) => k.content))) notes.add(code);
   if (p && Number.isFinite(input.requiredConfidence) && p.confidence < input.requiredConfidence) notes.add("low_confidence");
-  for (const code of input.reasonCodes) if (code in NOTE_TEXT && !["verified_answer"].includes(code)) notes.add(code);
+  for (const code of input.reasonCodes) if (code in NOTE_TEXT && !INFORMATIONAL_CODES.has(code)) notes.add(code);
 
   const ordered = Array.from(notes).map((c) => NOTE_TEXT[c] ?? c);
   return { ready: ordered.length === 0, notes: Array.from(new Set(ordered)).slice(0, 4) };
@@ -190,6 +197,8 @@ export interface PilotNoticeInput {
   draft: { version: number; body: string; ready: boolean; notes: string[] } | null;
   /** What the AI could not work out (its escalation reason, or the order details still missing). */
   missing: string[];
+  /** The order collected so far (never confirmed), one short line per item or detail. Empty when this is not an order. */
+  order?: string[];
 }
 
 /** The primary staff message in Approval Pilot: the request, the AI's independent suggestion, what is uncertain, the commands. */
@@ -210,6 +219,8 @@ export function buildPilotNotice(input: PilotNoticeInput): string {
   } else {
     lines.push("🤖 No AI suggestion — it needs a person to answer.");
   }
+  const order = (input.order ?? []).filter(Boolean).slice(0, 6);
+  if (order.length > 0) lines.push("", "Order so far (not confirmed):", ...order.map((o) => `• ${clip(o, 120)}`));
   const missing = input.missing.filter(Boolean).slice(0, 3);
   if (missing.length > 0) lines.push("", "Missing / uncertain:", ...missing.map((m) => `• ${clip(m, 120)}`));
   lines.push("", `Reply to this message (or include #${input.refCode}): ${PILOT_COMMAND_HINT}`);

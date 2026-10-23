@@ -166,7 +166,11 @@ Assisted: the AI never sends on its own. The bridge must send, in this mode, onl
 dashboard's "Send to customer"). `customer_reply`, `holding_reply` and unknown kinds are refused with ack
 `failed` / `approval_pilot_mode`; a `staff_relay` addressed to a group is refused too. A `staff_relay` still
 respects `held_after_unknown_send`. `/outbox/claim` is polled in this mode. A bridge that does not know the mode
-fails closed (`observe_mode` for everything). Full behavior: `docs/ai-agent-approval-pilot.md`.
+fails closed (`observe_mode` for everything) **and never polls the outbox in it**, which strands every batched notice and approved reply as
+`pending`. **Deployment check:** `staff_feedback` rows blocked with `observe_mode` while the business is in Approval Pilot, and `staff_notice`
+rows that stay `pending`, mean the bridge predates this mode. The bridge must also re-read `/config` before refusing an item for its mode
+(the admin may have just switched modes). A `staff_relay` after an unknown-outcome send to the same chat is acked `held_after_unknown_send`.
+Full behavior: `docs/ai-agent-approval-pilot.md`.
 
 **Batched messages (no bridge change).** When a business has message batching
 on, a customer message is queued rather than decided: the response is

@@ -450,12 +450,17 @@ export function mergeOrderRequest(
 
 export type OrderField = "items" | "quantity" | "delivery_address" | "delivery_preference";
 
+/** The customer will collect it themselves, so there is nothing to deliver and no address to ask for. */
+export function isCollection(preference: string | null | undefined): boolean {
+  return /\b(collect(ion|ing)?|pick[\s-]?up|pick(ing)? (it|them) up|come (and )?get|fetch)\b/i.test(preference ?? "");
+}
+
 export function missingOrderFields(request: OrderRequestDraft | null): OrderField[] {
   if (!request) return ["items", "quantity", "delivery_address", "delivery_preference"];
   const missing: OrderField[] = [];
   if (request.items.length === 0) missing.push("items");
   else if (request.items.some((i) => !i.quantity)) missing.push("quantity");
-  if (!request.delivery_address) missing.push("delivery_address");
+  if (!request.delivery_address && !isCollection(request.delivery_preference)) missing.push("delivery_address");
   if (!request.delivery_preference) missing.push("delivery_preference");
   return missing;
 }
@@ -464,7 +469,7 @@ const FIELD_QUESTIONS: Record<OrderField, string> = {
   items: "which product(s) you'd like",
   quantity: "how many of each",
   delivery_address: "your delivery address",
-  delivery_preference: "your preferred delivery day and time",
+  delivery_preference: "whether you'd like delivery or to collect, and your preferred day and time",
 };
 
 /** Deterministic fallback question when the model's ASK text is missing or unsafe. */

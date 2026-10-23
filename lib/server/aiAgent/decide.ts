@@ -94,7 +94,7 @@ import {
 } from "@/lib/server/aiAgent/evaluation";
 import { loadGateData } from "@/lib/server/aiAgent/gateData";
 import { saveCustomerFacts } from "@/lib/server/aiAgent/memory";
-import { draftMetaFrom, ensureAiDraft, purgePilotDrafts } from "@/lib/server/aiAgent/pilot";
+import { createFollowUpAiDraft, type DraftMeta, draftMetaFrom, ensureAiDraft, purgePilotDrafts, turnBasisAt } from "@/lib/server/aiAgent/pilot";
 import { maybeExtractPassive } from "@/lib/server/aiAgent/teach";
 import {
   canSend,
@@ -575,7 +575,10 @@ async function runPipeline(args: {
         knowledge,
         context,
         pendingOrder: priorOrder,
-        openEscalation: Boolean(openEscalation),
+        // Approval Pilot: staff approve every reply, so the AI keeps drafting the conversation's next message
+        // even while an earlier request is still open (rule 10 of the prompt), instead of going quiet.
+        openEscalation: Boolean(openEscalation) && settings?.mode !== "approval_pilot",
+        reviewMode: settings?.mode === "approval_pilot",
       });
 
   // The model may only restate what the customer actually wrote: ungrounded products, quantities,
@@ -742,6 +745,7 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
       orderRequest: r?.orderRequest ?? null,
       history: p.history,
       eventId,
+      noReopen: settings.mode === "approval_pilot",
       ...pilotDraftInfo(settings, p, r, reasons),
     };
     const write = await createOrAppendEscalation(escalateInput);
@@ -807,6 +811,17 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
         ]
       : [];
   return { ...common, decision, reasons, outbox: outbox.filter((o) => customerModeAllowsKind(p.customerMode, o.kind)) };
+}
+
+/** The order as collected so far, one short line per item or detail, for the pilot notice. Empty when there is none. */
+function orderSummaryLines(order: OrderRequestDraft | null): string[] {
+  if (!order || (order.items.length === 0 && !order.delivery_address && !order.delivery_preference)) return [];
+  return [
+    ...order.items.map((i) => `${i.quantity ?? "qty not given"} × ${i.product}`),
+    ...(order.delivery_preference ? [`Delivery/collection: ${order.delivery_preference}`] : []),
+    ...(order.delivery_address ? [`Address: ${order.delivery_address}`] : []),
+    ...(order.notes ? [`Note: ${order.notes}`] : []),
+  ];
 }
 
 const ORDER_FIELD_TEXT: Record<string, string> = {
@@ -920,6 +935,13 @@ async function notifyStaff(args: {
 
   let escalation: EscalationRow = write.escalation;
   let current: RequestSnapshot = write.current;
+  const followUpDraft = async () =>
+    createFollowUpAiDraft({
+      escalation,
+      reply: escalateInput.draftReply,
+      meta: (escalateInput.draftMeta ?? null) as DraftMeta | null,
+      basisAt: await turnBasisAt(args.turn.eventIds, escalation),
+    });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const prior = write.followUp || attempt > 0 ? await priorStaffNotices(businessSlug, escalation.id) : [];
     const first = priorNoticeHold(prior) === null;
@@ -928,7 +950,9 @@ async function notifyStaff(args: {
     let urgent = false;
     if (first && settings.mode === "approval_pilot") {
       // Approval Pilot: concise notice with the AI's independent suggestion (version 1), made before any staff input.
-      const draft = await ensureAiDraft(escalation);
+      // A first notice that only goes out after the customer wrote again (the earlier one never reached the group)
+      // is still answered with the AI's latest suggestion.
+      const draft = (await ensureAiDraft(escalation)) ?? (write.followUp ? await followUpDraft() : null);
       body = buildPilotNotice({
         refCode: escalation.ref_code,
         priority: escalation.priority,
@@ -936,6 +960,7 @@ async function notifyStaff(args: {
         messages: customerMessageSegments(escalation.customer_message ?? escalateInput.customerMessage),
         draft: draft ? { version: draft.version, body: draft.body, ready: draft.ready, notes: draft.confirm_notes } : null,
         missing: escalateInput.missing ?? [],
+        order: orderSummaryLines(escalateInput.orderRequest ?? (escalation.context.order_request as OrderRequestDraft | null | undefined) ?? null),
       });
     } else if (first) {
       body = staffNoticeFor(escalation, write.followUp ? originalEscalationInput(escalation, escalateInput) : escalateInput, false, observeOnly);
@@ -944,6 +969,8 @@ async function notifyStaff(args: {
       const changes = diffSnapshots(baseline, current);
       if (changes.length === 0) return { reasons: ["staff_update_not_material"], row: null };
       urgent = isUrgentChange(changes);
+      // Approval Pilot: the AI answers the new state of the conversation; that suggestion is the next draft to approve.
+      const draft = settings.mode === "approval_pilot" ? await followUpDraft() : null;
       body = buildStaffUpdate({
         refCode: escalation.ref_code,
         priority: escalation.priority,
@@ -953,6 +980,8 @@ async function notifyStaff(args: {
         afterStaffReply: Boolean(escalation.answered_at),
         observeOnly: observeOnly && settings.mode !== "approval_pilot",
         pilot: settings.mode === "approval_pilot",
+        draft: draft ? { version: draft.version, body: draft.body, ready: draft.ready, notes: draft.confirm_notes } : null,
+        latestMessage: args.turn.segments[args.turn.segments.length - 1] ?? null,
       });
     }
 

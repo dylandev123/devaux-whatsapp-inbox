@@ -173,18 +173,88 @@ export async function ensureAiDraft(e: EscalationRow): Promise<PilotDraftRow | n
 }
 
 /**
+ * The moment a follow-up draft's answer is based on: the newest customer event of the turn, or the follow-up recorded on
+ * the escalation, whichever is later. Every inbound message the agent was handed is logged as an event when it arrives,
+ * and every follow-up is stamped when it is recorded, so a draft based on this moment goes stale on ANY later customer
+ * message (customerWroteAfter), including one that arrived while the AI was still thinking.
+ */
+export async function turnBasisAt(eventIds: string[], escalation: Pick<EscalationRow, "context">): Promise<string> {
+  let latest = 0;
+  const ids = eventIds.filter(Boolean);
+  if (ids.length > 0) {
+    const { data, error } = await agentDb().from("ai_agent_events").select("created_at").in("id", ids).order("created_at", { ascending: false }).limit(1);
+    if (error) throw new Error(error.message);
+    latest = Date.parse((data ?? [])[0]?.created_at ?? "") || 0;
+  }
+  const updates = Array.isArray(escalation.context.updates) ? (escalation.context.updates as { at?: string }[]) : [];
+  for (const u of updates) latest = Math.max(latest, Date.parse(u?.at ?? "") || 0);
+  return new Date(latest || Date.now()).toISOString();
+}
+
+/**
+ * Approval Pilot, multi-message conversations: the customer wrote again while staff had not acted yet. The AI has
+ * answered the NEW state of the conversation, and that answer becomes the next draft version (the previous one is
+ * superseded and kept as history, so Evaluation still shows what it first suggested). Never touches a draft that
+ * was written after the customer's latest message (staff's own newer edit wins), and creates nothing twice for a
+ * redelivered batch (same text and basis = the same draft).
+ */
+export async function createFollowUpAiDraft(args: {
+  escalation: EscalationRow;
+  reply: string | null;
+  meta: DraftMeta | null;
+  basisAt: string;
+}): Promise<PilotDraftRow | null> {
+  const body = args.reply?.trim();
+  if (!body) return null;
+  const e = args.escalation;
+  const current = await currentDraft(e.business_slug, e.id);
+  // Already based on the customer's latest message (a redelivered batch, or staff's own newer wording): leave it.
+  if (current && Date.parse(current.basis_at) >= Date.parse(args.basisAt)) return current;
+  const ready = args.meta?.ready === true;
+  return createDraftVersion({
+    escalation: e,
+    source: "ai",
+    body: body.slice(0, 2000),
+    ready,
+    notes: ready ? [] : args.meta?.notes?.length ? args.meta.notes : ["The AI's draft was not checked against approved knowledge"],
+    createdBy: "ai",
+    now: new Date(args.basisAt),
+    knowledgeIds: args.meta?.knowledge_ids ?? [],
+    knowledgeVersion: args.meta?.knowledge_version ?? null,
+  });
+}
+
+/** The draft a staff notice showed: the newest draft that existed when the notice was posted (notices are posted right after their draft). */
+export async function draftShownByNotice(businessSlug: string, escalationId: string, noticeAt: string | null): Promise<PilotDraftRow | null> {
+  if (!noticeAt) return draftByVersion(businessSlug, escalationId, 1);
+  const { data, error } = await agentDb()
+    .from("ai_agent_pilot_drafts")
+    .select(PILOT_DRAFT_COLUMNS)
+    .eq("business_slug", businessSlug)
+    .eq("escalation_id", escalationId)
+    .lte("created_at", noticeAt)
+    .order("version", { ascending: false })
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return ((data ?? [])[0] as PilotDraftRow | undefined) ?? (await draftByVersion(businessSlug, escalationId, 1));
+}
+
+/**
  * A new draft version: replaces whatever was current. The replaced draft is kept, unchanged, with what
  * happened to it (an edit, or superseded) — history is never rewritten.
  */
 export async function createDraftVersion(args: {
   escalation: EscalationRow;
-  source: "staff_edit" | "staff_answer";
+  source: "ai" | "staff_edit" | "staff_answer";
   body: string;
   ready: boolean;
   notes: string[];
   createdBy: string | null;
   validUntil?: string | null;
   now?: Date;
+  /** The AI's follow-up draft only: what it was written from (like version 1). */
+  knowledgeIds?: string[];
+  knowledgeVersion?: string | null;
 }): Promise<PilotDraftRow> {
   const e = args.escalation;
   const db = agentDb();
@@ -200,7 +270,8 @@ export async function createDraftVersion(args: {
         .update({
           status: "superseded",
           outcome: edited ? "edited" : "superseded",
-          final_text: args.body,
+          // A newer AI suggestion is not what reached the customer: only staff wording is a "final text".
+          final_text: args.source === "ai" ? null : args.body,
           decided_by: args.createdBy,
           decided_at: new Date().toISOString(),
           ...(verdict ? { verdict, verdict_source: "inferred" } : {}),
@@ -222,6 +293,7 @@ export async function createDraftVersion(args: {
         body_hash: hash,
         ready: args.ready,
         confirm_notes: args.ready ? [] : args.notes,
+        ...(args.source === "ai" ? { knowledge_ids: args.knowledgeIds ?? [], knowledge_version: args.knowledgeVersion ?? null } : {}),
         basis_at: (args.now ?? new Date()).toISOString(),
         valid_until: args.validUntil ?? null,
         created_by: args.createdBy,
@@ -266,8 +338,10 @@ export interface PilotCtx {
   whatsappMessageId: string;
   /** The staff message quoted a staff_draft we posted for a pilot draft: that draft's id. */
   quotedDraftId: string | null;
-  /** The quoted message was one of our escalation notices (they only ever show version 1). */
+  /** The quoted message was one of our escalation notices: it shows the draft that existed when it was posted. */
   quotedNotice: boolean;
+  /** When that notice was created (to find the draft it showed); null if unknown. */
+  quotedNoticeAt?: string | null;
 }
 
 export interface PilotResult {
@@ -319,7 +393,7 @@ type Target = { ok: true; draft: PilotDraftRow } | { ok: false; result: PilotRes
 /**
  * Which draft a command means — never a guess:
  *   a quoted DRAFT → exactly that version (if it is no longer current, refuse and say which is);
- *   a quoted NOTICE → version 1, the only one a notice shows;
+ *   a quoted NOTICE → the draft that notice showed (version 1 for the first notice, the AI's newer suggestion for an update);
  *   an explicit #E- code → the escalation's current draft;
  * and an explicit "v2" must match whatever the above resolved to.
  */
@@ -330,7 +404,7 @@ async function resolveTarget(ctx: PilotCtx, version: number | null): Promise<Tar
   if (ctx.quotedDraftId) {
     draft = await draftById(e.business_slug, e.id, ctx.quotedDraftId);
   } else if (ctx.quotedNotice) {
-    draft = await draftByVersion(e.business_slug, e.id, 1);
+    draft = await draftShownByNotice(e.business_slug, e.id, ctx.quotedNoticeAt ?? null);
   } else {
     draft = current;
   }

@@ -121,12 +121,13 @@ async function matchCandidates(
   businessSlug: string,
   text: string,
   quotedMessageId: string | null
-): Promise<{ candidates: MatchableEscalation[]; quotedDraft: QuotedDraft | null; quotedNotice: boolean }> {
+): Promise<{ candidates: MatchableEscalation[]; quotedDraft: QuotedDraft | null; quotedNotice: boolean; quotedNoticeAt: string | null }> {
   const db = agentDb();
   const refs = extractRefCodes(text);
   const byId = new Map<string, MatchableEscalation>();
   let quotedDraft: QuotedDraft | null = null;
   let quotedNotice = false;
+  let quotedNoticeAt: string | null = null;
 
   if (refs.length > 0) {
     const { data, error } = await db
@@ -143,7 +144,7 @@ async function matchCandidates(
     // a confirmation) identifies exactly that escalation — within this business.
     const { data: posted, error } = await db
       .from("ai_agent_outbox")
-      .select("escalation_id, kind, dedupe_key")
+      .select("escalation_id, kind, dedupe_key, created_at")
       .eq("business_slug", businessSlug)
       .in("kind", QUOTABLE_KINDS)
       .eq("whatsapp_message_id", quotedMessageId);
@@ -162,8 +163,11 @@ async function matchCandidates(
     // A quoted DRAFT must resolve to exactly that draft; it never falls back to "the newest one".
     const drafts = rows.filter((n) => n.kind === "staff_draft");
     const pilotKeys = drafts.map((n) => n.dedupe_key as string).filter((k) => k.startsWith(PILOT_DRAFT_KEY_PREFIX));
-    // An escalation notice only ever shows the AI's first suggestion (Approval Pilot binds a quote of it to version 1).
-    quotedNotice = rows.some((n) => n.kind === "staff_notice");
+    // An escalation notice shows the AI's suggestion as it was when posted (the first notice: version 1; an update:
+    // the newer suggestion). Approval Pilot binds a quote of it to exactly that draft.
+    const noticeRows = rows.filter((n) => n.kind === "staff_notice");
+    quotedNotice = noticeRows.length > 0;
+    quotedNoticeAt = noticeRows.length === 1 ? ((noticeRows[0].created_at as string | null) ?? null) : null;
     if (drafts.length > 0) {
       quotedDraft = {
         key: drafts.length === 1 ? (drafts[0].dedupe_key as string) : null,
@@ -171,7 +175,7 @@ async function matchCandidates(
       };
     }
   }
-  return { candidates: Array.from(byId.values()), quotedDraft, quotedNotice };
+  return { candidates: Array.from(byId.values()), quotedDraft, quotedNotice, quotedNoticeAt };
 }
 
 const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number ?? e.chat_id;
@@ -181,7 +185,7 @@ const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number 
 export async function processStaffGroupMessage(input: StaffGroupMessage): Promise<StaffGroupResult> {
   const { settings } = input;
   const groupJid = settings.staff_group_jid!;
-  const { candidates, quotedDraft, quotedNotice } = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
+  const { candidates, quotedDraft, quotedNotice, quotedNoticeAt } = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
   // Approval Pilot: only an explicit !command ever sends — a casual "send it" is not one.
   const match = matchStaffReply({ text: input.text, quotedMessageId: input.quotedMessageId }, candidates, {
     explicitCommandsOnly: settings.mode === "approval_pilot",
@@ -277,6 +281,7 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
         via: match.via,
         quotedDraft: match.via === "quote" ? quotedDraft : null,
         quotedNotice: match.via === "quote" && quotedNotice,
+        quotedNoticeAt: match.via === "quote" ? quotedNoticeAt : null,
         senderAuth,
       };
 
@@ -353,6 +358,7 @@ async function handlePilotCommand(ctx: Ctx, command: PilotCommand | "loose_appro
     whatsappMessageId: ctx.whatsappMessageId,
     quotedDraftId: ctx.quotedDraft?.pilotDraftId ?? null,
     quotedNotice: ctx.quotedNotice,
+    quotedNoticeAt: ctx.quotedNoticeAt,
   };
   const done = (r: { outbox: OutboxInsert[]; queued?: OutboxRow[]; outcome: string }): StaffGroupResult => ({
     outbox: r.outbox,
@@ -392,6 +398,7 @@ interface Ctx extends StaffGroupMessage {
   quotedDraft: QuotedDraft | null;
   /** Set when the quoted message was one of our escalation notices. */
   quotedNotice: boolean;
+  quotedNoticeAt: string | null;
   senderAuth: SenderAuthorization;
 }
 
@@ -805,6 +812,7 @@ export async function retryStaffAnswer(args: { businessSlug: string; answerId: s
     via: claimed.matched_via === "quote" ? "quote" : "ref",
     quotedDraft: null,
     quotedNotice: false,
+    quotedNoticeAt: null,
     senderAuth,
   };
   try {
