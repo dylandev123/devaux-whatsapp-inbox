@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { AGENT_MODES, CONTACT_SCOPES, requiredConfidence } from "@/lib/aiAgent/engine";
+import { AGENT_MODES, CONTACT_SCOPES, PASSIVE_LEARNING_SCOPES, requiredConfidence } from "@/lib/aiAgent/engine";
 import { isCustomerMode } from "@/lib/aiAgent/customerMode";
 import { parseAuthorizedSenders } from "@/lib/aiAgent/identity";
 import { validateBatchWindow } from "@/lib/aiAgent/batching";
@@ -52,6 +52,8 @@ interface Payload {
   customerMemoryEnabled?: unknown;
   staffAuthorizedSenders?: unknown;
   defaultCustomerMode?: unknown;
+  passiveLearningScope?: unknown;
+  knowledgeConfirmViaWhatsapp?: unknown;
 }
 
 function intIn(value: unknown, min: number, max: number): number | null {
@@ -140,6 +142,14 @@ export async function PUT(request: Request) {
   if (body.defaultCustomerMode !== undefined) {
     if (!isCustomerMode(body.defaultCustomerMode)) return jsonError("defaultCustomerMode must be auto_reply, staff_first or manual_only", 400);
     patch.default_customer_mode = body.defaultCustomerMode;
+  }
+  if (body.passiveLearningScope !== undefined) {
+    if (!(PASSIVE_LEARNING_SCOPES as readonly unknown[]).includes(body.passiveLearningScope)) return jsonError("passiveLearningScope must be off, staff_group or staff_group_and_chats", 400);
+    patch.passive_learning_scope = body.passiveLearningScope;
+  }
+  if (body.knowledgeConfirmViaWhatsapp !== undefined) {
+    if (typeof body.knowledgeConfirmViaWhatsapp !== "boolean") return jsonError("knowledgeConfirmViaWhatsapp must be a boolean", 400);
+    patch.knowledge_confirm_via_whatsapp = body.knowledgeConfirmViaWhatsapp;
   }
   if (body.staffAuthorizedSenders !== undefined) {
     // Verified WhatsApp identities only: phone numbers or exact …@lid ids — never names.

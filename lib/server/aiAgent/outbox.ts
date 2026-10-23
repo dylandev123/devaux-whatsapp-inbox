@@ -5,6 +5,7 @@
 // 'pending' until the bridge claims them via claim_ai_agent_outbox().
 
 import { outboxAllowed } from "@/lib/aiAgent/engine";
+import { BLOCK_REASONS, failureReason } from "@/lib/aiAgent/outboxStatus";
 import { buildSendFailureMessage } from "@/lib/aiAgent/staffAnswers";
 import { agentDb, loadSettings } from "@/lib/server/aiAgent/db";
 
@@ -194,6 +195,16 @@ export async function ackOutbox(input: {
       .eq("status", "open")
       .is("notice_message_id", null);
   }
+  // An approved Approval Pilot draft the bridge provably did NOT send goes back to "current", so it can be
+  // approved again (through the whole send policy again). Never after an ambiguous send: that stays unresolved.
+  if (input.status === "failed" && row.kind === "staff_relay") {
+    const code = failureReason(input.error);
+    if (code && code !== "held_after_unknown_send" && (code === "not_sent" || BLOCK_REASONS.has(code))) {
+      await reopenDraftAfterUnsentApproval(row.id).catch((err) =>
+        console.error("[aiAgent] reopenDraftAfterUnsentApproval", err instanceof Error ? err.message : err)
+      );
+    }
+  }
   // An authorized customer reply that the bridge could not deliver: tell the
   // staff group, in plain words, that the customer did NOT receive it. Best effort.
   if (input.status === "failed" && row.kind === "staff_relay" && row.escalation_id) {
@@ -202,6 +213,20 @@ export async function ackOutbox(input: {
     );
   }
   return "ok";
+}
+
+/**
+ * The bridge could provably not deliver an approved pilot reply (blocked, or "not_sent"): the draft returns to
+ * "current". Lives here (not in pilot.ts) so the outbox never depends on the pilot module.
+ */
+async function reopenDraftAfterUnsentApproval(outboxId: string): Promise<void> {
+  const { error } = await agentDb()
+    .from("ai_agent_pilot_drafts")
+    .update({ status: "current", decided_by: null, decided_at: null, decision_message_id: null, approval_outbox_id: null, outcome: null })
+    .eq("approval_outbox_id", outboxId)
+    .eq("status", "approved");
+  // 23505: a newer draft is already current. The approved one stays as history.
+  if (error && error.code !== "23505") throw new Error(error.message);
 }
 
 async function notifyStaffRelayFailed(outboxId: string, businessSlug: string, escalationId: string, error: string | null): Promise<void> {

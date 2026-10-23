@@ -33,7 +33,10 @@ export type ApproveResult =
 export async function approveCandidate(input: {
   businessSlug: string;
   candidateId: string;
-  adminId: string;
+  /** The admin's user id; null for an approval from WhatsApp (then `via` is "whatsapp" and `senderId` is the verified sender). */
+  adminId: string | null;
+  via?: "admin" | "whatsapp";
+  senderId?: string | null;
   kind: unknown;
   title: unknown;
   content: unknown;
@@ -43,13 +46,16 @@ export async function approveCandidate(input: {
   const db = agentDb();
   const { data: candidate, error } = await db
     .from("ai_agent_learning_candidates")
-    .select("id, escalation_id, staff_answer, status, suggested_kind, suggested_title")
+    .select("id, escalation_id, staff_answer, status, suggested_kind, suggested_title, fact_expires_at, proposal_expires_at, proposed_by, source, sender_verified")
     .eq("id", input.candidateId)
     .eq("business_slug", input.businessSlug)
     .maybeSingle();
   if (error) return { ok: false, status: 500, error: error.message };
   if (!candidate) return { ok: false, status: 404, error: "Candidate not found" };
   if (candidate.status !== "pending") return { ok: false, status: 409, error: "Candidate was already reviewed" };
+  if (candidate.proposal_expires_at && Date.parse(candidate.proposal_expires_at) <= Date.now()) {
+    return { ok: false, status: 409, error: "This suggestion expired before anyone confirmed it. Teach it again if it is still true." };
+  }
 
   if (!(KNOWLEDGE_KINDS as readonly unknown[]).includes(input.kind)) return { ok: false, status: 400, error: "Invalid kind" };
   if (typeof input.title !== "string" || !input.title.trim()) return { ok: false, status: 400, error: "title is required" };
@@ -59,7 +65,12 @@ export async function approveCandidate(input: {
 
   // Stock, shortages and "today" facts are classified temporary and never become candidates; this
   // is the backstop for older candidates and for text an admin edited into one.
-  if (statesTemporaryCondition(`${title} ${content}`)) {
+  // A candidate staff proposed WITH an expiry is a temporary fact on purpose: it becomes an expiring entry.
+  const factExpiresAt: string | null = candidate.fact_expires_at ?? null;
+  if (factExpiresAt && Date.parse(factExpiresAt) <= Date.now()) {
+    return { ok: false, status: 409, error: "This temporary fact has already expired, so it was not added." };
+  }
+  if (!factExpiresAt && statesTemporaryCondition(`${title} ${content}`)) {
     return {
       ok: false,
       status: 409,
@@ -69,6 +80,8 @@ export async function approveCandidate(input: {
   }
 
   const assessment = assessCandidate(candidate, await approvedKnowledgeLite(input.businessSlug), { kind, title, content });
+  // A temporary fact (stock, "today") never replaces or conflicts with a permanent entry: it just expires.
+  if (factExpiresAt) assessment.conflicts = [];
   if (assessment.duplicateOf) {
     return { ok: false, status: 409, error: `Already in the knowledge base as "${assessment.duplicateOf.title}"` };
   }
@@ -104,6 +117,9 @@ export async function approveCandidate(input: {
     p_resolution: conflicts.length > 0 ? resolution : "none",
     p_replace_knowledge_id: replaceId,
     p_require_resolution: conflicts.length > 0,
+    p_via: input.via ?? "admin",
+    p_sender: input.senderId ?? null,
+    p_expires_at: factExpiresAt,
   });
   if (rpcError) {
     const known: Record<string, [string, number]> = {
@@ -111,13 +127,22 @@ export async function approveCandidate(input: {
       candidate_not_found: ["Candidate not found", 404],
       resolution_required: ["Choose to replace the overlapping entry or keep both", 409],
       replace_target_not_found: ["The entry to replace is no longer approved", 409],
+      candidate_expired: ["This suggestion expired before anyone confirmed it", 409],
     };
     const hit = Object.entries(known).find(([code]) => rpcError.message.includes(code));
     return hit ? { ok: false, status: hit[1][1], error: hit[1][0] } : { ok: false, status: 500, error: rpcError.message };
   }
   const { knowledge_id: knowledgeId, archived_id: archivedId } = result as { knowledge_id: string; archived_id: string | null };
-  await audit(input.businessSlug, "admin", input.adminId, "learning.approve", { type: "learning", id: candidate.id }, {
+  const viaWhatsApp = input.via === "whatsapp";
+  await audit(input.businessSlug, viaWhatsApp ? "staff" : "admin", viaWhatsApp ? (input.senderId ?? null) : input.adminId, "learning.approve", { type: "learning", id: candidate.id }, {
+    via: input.via ?? "admin",
+    expires_at: factExpiresAt,
     knowledge_id: knowledgeId,
+    source: candidate.source ?? null,
+    sender_verified: candidate.sender_verified !== false,
+    proposed_by: candidate.proposed_by ?? null,
+    // The same authorized person may teach and then confirm; the audit trail records that they did.
+    self_confirmed: viaWhatsApp && Boolean(input.senderId) && candidate.proposed_by === input.senderId,
     replaced_knowledge_id: archivedId,
     resolution: conflicts.length > 0 ? resolution : "none",
     conflicts: conflicts.map((c) => c.id),

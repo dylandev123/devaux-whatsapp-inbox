@@ -13,14 +13,14 @@ import { approvedKnowledgeLite, approveCandidate, assessCandidate } from "@/lib/
 export const dynamic = "force-dynamic";
 
 const CANDIDATE_COLUMNS =
-  "id, escalation_id, question, staff_answer, status, knowledge_id, reviewed_at, created_at, category, suggested_kind, suggested_title, source_message, source_message_at, ref_code, conflicts";
+  "id, escalation_id, question, staff_answer, status, knowledge_id, reviewed_at, created_at, category, suggested_kind, suggested_title, source_message, source_message_at, ref_code, conflicts, source, short_code, fact_expires_at, proposal_expires_at, sender_verified";
 
 interface CandidateRow {
   id: string;
   escalation_id: string | null;
   question: string | null;
   staff_answer: string;
-  status: "pending" | "approved" | "rejected";
+  status: "pending" | "approved" | "rejected" | "expired";
   category: string;
   suggested_kind: string | null;
   suggested_title: string | null;
@@ -33,6 +33,14 @@ export async function GET(request: Request) {
   const businessSlug = await resolveBusinessSlug(new URL(request.url).searchParams.get("businessSlug"));
   if (!businessSlug) return jsonError("Unknown businessSlug", 400);
 
+  // Suggestions nobody confirmed in time lapse (WhatsApp proposals carry a deadline).
+  await agentDb()
+    .from("ai_agent_learning_candidates")
+    .update({ status: "expired" })
+    .eq("business_slug", businessSlug)
+    .eq("status", "pending")
+    .not("proposal_expires_at", "is", null)
+    .lte("proposal_expires_at", new Date().toISOString());
   const { data, error } = await agentDb()
     .from("ai_agent_learning_candidates")
     .select(CANDIDATE_COLUMNS)

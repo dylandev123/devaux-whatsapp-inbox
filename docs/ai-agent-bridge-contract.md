@@ -150,10 +150,23 @@ staff-group kind exactly like `staff_notice`: same Observe rule, same global
 send switch, never addressed to a customer. An older bridge that ignores unknown
 kinds still delivers it in Assisted mode (rule 5), but refuses it in Observe
 (`observe_mode`) until it treats `staff_draft` like `staff_notice`.
+**Deployment check:** if the Activity tab shows `staff_draft` rows blocked with `observe_mode` while `staff_notice` rows send, the
+running bridge predates `staff_draft` support (it allows only `staff_notice` in Observe). Deploy a bridge build whose
+Observe allow-list is `staff_notice` + `staff_draft`; the Inbox side needs no change. Blocked rows are final and are
+never resent.
 **Ack it with the WhatsApp message id** (like `staff_notice`): a staff member
 quoting the draft with "send" approves exactly that draft. `staff_feedback`
 acks should also carry the id (quoting a confirmation then resolves to its
 escalation), but nothing breaks if they do not.
+
+**Approval Pilot mode (`mode: "approval_pilot"`, bridge change required).** Between Observe and
+Assisted: the AI never sends on its own. The bridge must send, in this mode, only
+`staff_notice`, `staff_draft`, `staff_feedback` (to `staffGroupJid`, no `staffNoticesEnabled` needed) and
+`staff_relay` (an approved reply to a customer: `!approve`, `!send <text>` from an authorized sender, or the
+dashboard's "Send to customer"). `customer_reply`, `holding_reply` and unknown kinds are refused with ack
+`failed` / `approval_pilot_mode`; a `staff_relay` addressed to a group is refused too. A `staff_relay` still
+respects `held_after_unknown_send`. `/outbox/claim` is polled in this mode. A bridge that does not know the mode
+fails closed (`observe_mode` for everything). Full behavior: `docs/ai-agent-approval-pilot.md`.
 
 **Batched messages (no bridge change).** When a business has message batching
 on, a customer message is queued rather than decided: the response is
@@ -187,7 +200,7 @@ For `failed`, `error` starts with a reason code (optionally followed by
 `: <detail>`). The admin UI shows these codes as **blocked**: deliberately not
 sent, with nothing wrong:
 
-`agent_disabled`, `bridge_send_disabled`, `observe_mode`, `staff_notices_disabled`, `human_takeover`,
+`agent_disabled`, `bridge_send_disabled`, `observe_mode`, `approval_pilot_mode`, `staff_notices_disabled`, `human_takeover`,
 `stale_reply`, `superseded_by_newer_message`, `held_after_unknown_send`,
 `unapproved_commitment`, `chat_rate_limited`, `business_rate_limited`
 

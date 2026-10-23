@@ -130,6 +130,10 @@ export interface EscalateInput {
   eventId: string | null;
   /** The turn's individual customer messages (a batch is several); defaults to customerMessage as one. */
   segments?: string[];
+  /** Approval Pilot: how far the AI's draft can be trusted (kept on the escalation; never sent anywhere). */
+  draftMeta?: { ready: boolean; notes: string[]; knowledge_ids: string[]; knowledge_version: string | null } | null;
+  /** What the AI could not work out, for the pilot notice ("Missing / uncertain"). */
+  missing?: string[];
 }
 
 export interface EscalationWrite {
@@ -248,6 +252,7 @@ export async function createOrAppendEscalation(input: EscalateInput): Promise<Es
           order_request: snapshotContext.order_request ?? input.orderRequest,
           intent: input.intent ?? null,
           history: input.history ?? [],
+          ...(input.draftMeta ? { draft_meta: input.draftMeta } : {}),
         },
         source_event_id: input.eventId,
       })

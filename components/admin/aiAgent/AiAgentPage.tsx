@@ -7,6 +7,7 @@ import { ActivityPanel } from "@/components/admin/aiAgent/ActivityPanel";
 import { ContactPermissions } from "@/components/admin/aiAgent/ContactPermissions";
 import { ConversationsPanel } from "@/components/admin/aiAgent/ConversationsPanel";
 import { EscalationsPanel } from "@/components/admin/aiAgent/EscalationsPanel";
+import { EvaluationPanel } from "@/components/admin/aiAgent/EvaluationPanel";
 import { KnowledgePanel } from "@/components/admin/aiAgent/KnowledgePanel";
 import { MemoryPanel } from "@/components/admin/aiAgent/MemoryPanel";
 import { ReviewPanel } from "@/components/admin/aiAgent/ReviewPanel";
@@ -21,6 +22,7 @@ const TABS = [
   { id: "memory", label: "Memory" },
   { id: "takeover", label: "Takeover" },
   { id: "review", label: "Review" },
+  { id: "evaluation", label: "Evaluation" },
   { id: "activity", label: "Activity" },
   { id: "test", label: "Test console" },
 ] as const;
@@ -138,6 +140,7 @@ export function AiAgentPage() {
           {tab === "memory" && <MemoryPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "takeover" && <ConversationsPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "review" && <ReviewPanel businessSlug={businessSlug} />}
+          {tab === "evaluation" && <EvaluationPanel businessSlug={businessSlug} />}
           {tab === "activity" && <ActivityPanel businessSlug={businessSlug} />}
           {tab === "test" && <TestConsole businessSlug={businessSlug} chats={chats} />}
         </>

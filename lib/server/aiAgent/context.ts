@@ -28,7 +28,9 @@ export async function loadCustomerContext(
   contactNumber: string | null,
   excludeMessageIds: string[],
   identity: ChatIdentity,
-  messageText: string
+  messageText: string,
+  /** Simulations of a past turn: only conversation from before it (the messages the model could have seen then). */
+  options: { before?: string } = {}
 ): Promise<CustomerContext> {
   const db = agentDb();
   // Display label only. Customer rows are matched by a VERIFIED phone, never
@@ -45,13 +47,16 @@ export async function loadCustomerContext(
           .maybeSingle()
       : Promise.resolve({ data: null }),
     loadMemoryBrief(businessSlug, identity, messageText),
-    db
-      .from("whatsapp_messages")
-      .select("whatsapp_message_id, direction, message_body, timestamp")
-      .eq("business_slug", businessSlug)
-      .eq("chat_id", chatId)
-      .order("timestamp", { ascending: false })
-      .limit(TRANSCRIPT_MESSAGES + excluded.size + 1),
+    (() => {
+      const query = db
+        .from("whatsapp_messages")
+        .select("whatsapp_message_id, direction, message_body, timestamp")
+        .eq("business_slug", businessSlug)
+        .eq("chat_id", chatId);
+      return (options.before ? query.lt("timestamp", options.before) : query)
+        .order("timestamp", { ascending: false })
+        .limit(TRANSCRIPT_MESSAGES + excluded.size + 1);
+    })(),
   ]);
 
   // Missing tables / rows degrade to "nothing known", never to a failure.

@@ -7,6 +7,7 @@
 
 import OpenAI from "openai";
 import { ModelProposal, OrderRequestDraft, parseModelProposal } from "@/lib/aiAgent/engine";
+import { estimateTokens, type ShadowUsage } from "@/lib/aiAgent/evaluation";
 import { renderMemoryBrief } from "@/lib/aiAgent/memory";
 import { parseStaffAnalysis, type StaffAnalysis } from "@/lib/aiAgent/staffAnswers";
 import { getAiSettings } from "@/lib/server/aiSettings";
@@ -59,6 +60,8 @@ export interface ModelCallResult {
   proposal: ModelProposal | null;
   model: string | null;
   error: string | null;
+  /** Tokens used by this call: API-reported when available, else estimated from text length. Absent when no call was made. */
+  usage?: ShadowUsage | null;
 }
 
 export interface ProposeReplyInput {
@@ -110,7 +113,11 @@ export async function proposeReply(input: ProposeReplyInput): Promise<ModelCallR
     });
     if (response.error) throw new Error(response.error.message);
     if (!response.output_text?.trim()) throw new Error("Model returned no text");
-    return { proposal: parseModelProposal(response.output_text), model: settings.model, error: null };
+    const reported = response.usage;
+    const usage: ShadowUsage = reported
+      ? { inputTokens: reported.input_tokens, outputTokens: reported.output_tokens, estimated: false }
+      : { inputTokens: estimateTokens(SYSTEM_PROMPT.length + sections.join("\n\n").length), outputTokens: estimateTokens(response.output_text.length), estimated: true };
+    return { proposal: parseModelProposal(response.output_text), model: settings.model, error: null, usage };
   } catch (err) {
     const message = err instanceof OpenAI.APIError ? `${err.status ?? ""} ${err.message}`.trim() : err instanceof Error ? err.message : "Unknown model error";
     return { proposal: null, model: settings.model, error: message };

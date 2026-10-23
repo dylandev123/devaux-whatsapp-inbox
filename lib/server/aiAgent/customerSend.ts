@@ -16,6 +16,7 @@
 import { createHash } from "crypto";
 import {
   type AgentSettings,
+  canSendApproved,
   evaluateGate,
   type GateResult,
   type PriorNotice,
@@ -58,6 +59,8 @@ export interface CustomerSendRequest {
   /** Typed text only: when the person last looked at the escalation. A customer message after that makes it stale. */
   basedOn?: string | null;
   eventId?: string | null;
+  /** A pilot draft's own expiry (its facts may be time-bound); same effect as a stored draft's valid_until. */
+  validUntil?: string | null;
   now?: Date;
 }
 
@@ -107,6 +110,19 @@ export async function customerWroteAfter(e: EscalationRow, since: string): Promi
     .limit(1);
   if (error) throw new Error(error.message);
   if ((newer ?? []).length > 0) return true;
+  // Strict invalidation: ANY customer message after the draft counts, even "thanks" (which never reaches the
+  // escalation's updates). The agent's own event log records every inbound message it was handed, so this does not
+  // depend on the bridge's message storage.
+  const { data: inbound, error: inboundError } = await db
+    .from("ai_agent_events")
+    .select("id")
+    .eq("business_slug", e.business_slug)
+    .eq("chat_id", e.chat_id)
+    .eq("kind", "customer_inbound")
+    .gt("created_at", since)
+    .limit(1);
+  if (inboundError) throw new Error(inboundError.message);
+  if ((inbound ?? []).length > 0) return true;
   // Stored messages are best effort (retention-limited); a failed lookup cannot make a draft look fresher.
   const { data: messages } = await db
     .from("whatsapp_messages")
@@ -143,14 +159,14 @@ export async function planCustomerSend(req: CustomerSendRequest): Promise<Custom
   const relayKey = `${relayBase}:${earlier.length}`;
 
   // Nothing about the customer is looked up when the agent cannot message customers at all.
-  const sendable = Boolean(settings?.enabled && settings.mode === "assisted");
+  const sendable = canSendApproved(settings);
   const gate: GateResult = settings && sendable ? await customerGate(settings, e, now) : { pass: false, decision: "NO_REPLY", reasons: ["agent_disabled"] };
 
   const knowledge = req.draft && sendable ? await loadActiveKnowledge(e.business_slug) : [];
   const safetyCodes = req.draft ? checkStaffDraftSafety(text, req.draft.body, knowledge) : checkExactSendSafety(text);
   const basis = req.draft?.created_at ?? req.basedOn ?? null;
   const stale = sendable && basis ? await customerWroteAfter(e, basis) : false;
-  const expired = req.draft ? draftExpired(req.draft.valid_until, now) : false;
+  const expired = draftExpired(req.draft?.valid_until ?? req.validUntil ?? null, now);
 
   const authorized = req.requester.kind === "admin" ? true : req.requester.senderAuthorized;
   const decision = decideCustomerSend({

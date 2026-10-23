@@ -22,13 +22,15 @@
 
 import {
   type AgentSettings,
-  canSendToCustomers,
+  canSendApproved,
   extractRefCodes,
+  looksLikeAgentMessage,
   type MatchableEscalation,
   matchStaffReply,
   outboxAllowed,
 } from "@/lib/aiAgent/engine";
 import { authorizeStaffSender, isSenderIdAuthorized, type SenderAuthorization } from "@/lib/aiAgent/identity";
+import { BUSINESS_COMMANDS, buildPilotDraftPost, DRAFT_COMMANDS, noteTexts, parsePilotCommand, PILOT_REFUSAL_TEXT, type PilotCommand, unsupportedClaimCodes } from "@/lib/aiAgent/pilot";
 import {
   buildProcessingFailureMessage,
   buildStaffDraftMessage,
@@ -47,7 +49,20 @@ import {
   type EscalationRow,
   markEscalationAnswered,
 } from "@/lib/server/aiAgent/escalations";
-import { enqueue, OutboxInsert, outboxForEvent } from "@/lib/server/aiAgent/outbox";
+import { enqueue, OutboxInsert, type OutboxRow, outboxForEvent } from "@/lib/server/aiAgent/outbox";
+import {
+  businessStatusText,
+  createDraftVersion,
+  draftPostItem,
+  handleApprove,
+  handleEdit,
+  handleEscalationStatus,
+  handleReject,
+  PILOT_DRAFT_KEY_PREFIX,
+  type PilotCtx,
+  recordStaffTextSent,
+} from "@/lib/server/aiAgent/pilot";
+import { handleConfirm, handleDiscard, handleTeach, maybeExtractPassive } from "@/lib/server/aiAgent/teach";
 import {
   analyzeAndStore,
   answerByDraftKey,
@@ -73,6 +88,8 @@ export interface StaffGroupMessage {
   senderJid: string | null;
   /** The participant's phone number when the bridge could resolve one for an @lid sender (Baileys participantPn). */
   senderPhone?: string | null;
+  /** The message was sent from the business account itself (linked phone / inbox): not an individually verified sender. */
+  fromMe?: boolean;
   eventId: string;
   /** The staff message's own WhatsApp id: the idempotency key of the answer. */
   whatsappMessageId: string;
@@ -81,6 +98,8 @@ export interface StaffGroupMessage {
 
 export interface StaffGroupResult {
   outbox: OutboxInsert[];
+  /** Outbox rows already created inside the command (an approved send), handed to the bridge as they are. */
+  queued?: OutboxRow[];
   outcome: string;
   escalationId: string | null;
 }
@@ -94,17 +113,20 @@ const QUOTABLE_KINDS = ["staff_notice", "staff_draft", "staff_feedback"];
 interface QuotedDraft {
   /** The draft message's dedupe key, when exactly one staff_draft row carries the quoted WhatsApp id. */
   key: string | null;
+  /** Approval Pilot: the pilot draft's id when the quoted message was the post of exactly one pilot draft. */
+  pilotDraftId: string | null;
 }
 
 async function matchCandidates(
   businessSlug: string,
   text: string,
   quotedMessageId: string | null
-): Promise<{ candidates: MatchableEscalation[]; quotedDraft: QuotedDraft | null }> {
+): Promise<{ candidates: MatchableEscalation[]; quotedDraft: QuotedDraft | null; quotedNotice: boolean }> {
   const db = agentDb();
   const refs = extractRefCodes(text);
   const byId = new Map<string, MatchableEscalation>();
   let quotedDraft: QuotedDraft | null = null;
+  let quotedNotice = false;
 
   if (refs.length > 0) {
     const { data, error } = await db
@@ -139,9 +161,17 @@ async function matchCandidates(
     }
     // A quoted DRAFT must resolve to exactly that draft; it never falls back to "the newest one".
     const drafts = rows.filter((n) => n.kind === "staff_draft");
-    if (drafts.length > 0) quotedDraft = { key: drafts.length === 1 ? (drafts[0].dedupe_key as string) : null };
+    const pilotKeys = drafts.map((n) => n.dedupe_key as string).filter((k) => k.startsWith(PILOT_DRAFT_KEY_PREFIX));
+    // An escalation notice only ever shows the AI's first suggestion (Approval Pilot binds a quote of it to version 1).
+    quotedNotice = rows.some((n) => n.kind === "staff_notice");
+    if (drafts.length > 0) {
+      quotedDraft = {
+        key: drafts.length === 1 ? (drafts[0].dedupe_key as string) : null,
+        pilotDraftId: drafts.length === 1 && pilotKeys.length === 1 ? pilotKeys[0].slice(PILOT_DRAFT_KEY_PREFIX.length) : null,
+      };
+    }
   }
-  return { candidates: Array.from(byId.values()), quotedDraft };
+  return { candidates: Array.from(byId.values()), quotedDraft, quotedNotice };
 }
 
 const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number ?? e.chat_id;
@@ -151,8 +181,23 @@ const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number 
 export async function processStaffGroupMessage(input: StaffGroupMessage): Promise<StaffGroupResult> {
   const { settings } = input;
   const groupJid = settings.staff_group_jid!;
-  const { candidates, quotedDraft } = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
-  const match = matchStaffReply({ text: input.text, quotedMessageId: input.quotedMessageId }, candidates);
+  const { candidates, quotedDraft, quotedNotice } = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
+  // Approval Pilot: only an explicit !command ever sends — a casual "send it" is not one.
+  const match = matchStaffReply({ text: input.text, quotedMessageId: input.quotedMessageId }, candidates, {
+    explicitCommandsOnly: settings.mode === "approval_pilot",
+  });
+  const senderAuth = authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone);
+
+  // !confirm / !discard name a knowledge code, never an escalation: they work whatever else the message quotes
+  // (e.g. the proposal message of a fact taught for an escalation that has since closed).
+  const knowledgeCmd = looksLikeAgentMessage(input.text) ? null : parsePilotCommand(input.text.replace(/#?\bE-[A-Z0-9]{4,8}\b/gi, " "));
+  if (knowledgeCmd && (knowledgeCmd.command === "confirm" || knowledgeCmd.command === "discard") && match.kind !== "unmatched") {
+    return handleUntargeted(input, knowledgeCmd, senderAuth, canSendApproved(settings));
+  }
+  // !teach quoting a closed request still teaches (just not tied to that request).
+  if (match.kind === "closed" && knowledgeCmd?.command === "teach") {
+    return handleUntargeted(input, knowledgeCmd, senderAuth, canSendApproved(settings));
+  }
 
   const feedback = (body: string, escalationId: string | null = null): OutboxInsert => ({
     businessSlug: settings.business_slug,
@@ -165,12 +210,29 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
     escalationId,
   });
   // Plain feedback only speaks in Assisted mode — Observe posts notices and drafts only.
-  const speak = canSendToCustomers(settings);
+  const speak = canSendApproved(settings);
 
   switch (match.kind) {
-    case "unmatched":
-      // No quote, no reference: ordinary staff chatter. Nothing happens, nothing is posted.
-      return { outbox: [], outcome: "unmatched", escalationId: null };
+    case "unmatched": {
+      // No quote, no reference. A business-level command (!teach, !confirm, !discard, !status) still works;
+      // an escalation command without a target fails safely; anything else is ordinary staff chatter.
+      const cmd = looksLikeAgentMessage(input.text) ? null : parsePilotCommand(input.text);
+      if (cmd) return handleUntargeted(input, cmd, senderAuth, speak);
+      // Chatter from an authorized sender may state a reusable fact: noted as a PENDING suggestion, if the admin enabled it.
+      const passive = await maybeExtractPassive({
+        settings,
+        source: "staff_group",
+        text: input.text,
+        // A message from the business account itself has no individually verified author.
+        senderAuth: input.fromMe ? { authorized: false, senderId: null } : senderAuth,
+        unverifiedSender: input.fromMe === true,
+        senderJid: input.senderJid,
+        eventId: input.eventId,
+        whatsappMessageId: input.whatsappMessageId,
+        timestamp: input.timestamp,
+      });
+      return { outbox: passive.outbox, outcome: passive.outcome === "passive:skipped" ? "unmatched" : passive.outcome, escalationId: null };
+    }
     case "ambiguous":
       return {
         outbox: speak ? [feedback(`⚠️ Nothing sent: that message matches more than one escalation (${match.refCodes.map((r) => `#${r}`).join(", ")}). Reply to one escalation at a time.`)] : [],
@@ -214,11 +276,13 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
         escalation,
         via: match.via,
         quotedDraft: match.via === "quote" ? quotedDraft : null,
-        senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone),
+        quotedNotice: match.via === "quote" && quotedNotice,
+        senderAuth,
       };
 
       if (match.command === "answer") return handleAnswer(ctx, match.body);
       if (match.command === "send") return handleSend(ctx, match.body);
+      if (isPilotGroupCommand(match.command)) return handlePilotCommand(ctx, match.command, match.body);
 
       const result = await applyStaffAction({
         escalation,
@@ -237,11 +301,97 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
   }
 }
 
+/** A pilot command with no escalation target (no quote, no #E- code). */
+async function handleUntargeted(
+  input: StaffGroupMessage,
+  cmd: { command: string; body: string },
+  senderAuth: SenderAuthorization,
+  speak: boolean
+): Promise<StaffGroupResult> {
+  const { settings } = input;
+  const base = { settings, senderAuth, senderJid: input.senderJid, body: cmd.body, eventId: input.eventId };
+  const wrap = (r: { outbox: OutboxInsert[]; outcome: string }): StaffGroupResult => ({ outbox: r.outbox, outcome: r.outcome, escalationId: null });
+  switch (cmd.command) {
+    case "teach":
+      return wrap(await handleTeach({ ...base, escalation: null, whatsappMessageId: input.whatsappMessageId, timestamp: input.timestamp }));
+    case "confirm":
+      return wrap(await handleConfirm(base));
+    case "discard":
+      return wrap(await handleDiscard(base));
+    case "status": {
+      const text = await businessStatusText(settings.business_slug);
+      return {
+        outbox: speak && settings.staff_group_jid ? [{ businessSlug: settings.business_slug, chatId: settings.staff_group_jid, kind: "staff_feedback", toJid: settings.staff_group_jid, body: text, dedupeKey: `${input.eventId}:staff_feedback`, eventId: input.eventId }] : [],
+        outcome: "pilot:status_business",
+        escalationId: null,
+      };
+    }
+    default: {
+      // approve / edit / reject with nothing to act on: never guess.
+      return {
+        outbox: speak && settings.staff_group_jid ? [{ businessSlug: settings.business_slug, chatId: settings.staff_group_jid, kind: "staff_feedback", toJid: settings.staff_group_jid, body: PILOT_REFUSAL_TEXT.no_target(""), dedupeKey: `${input.eventId}:staff_feedback`, eventId: input.eventId }] : [],
+        outcome: "pilot:no_target",
+        escalationId: null,
+      };
+    }
+  }
+}
+
+/** The Approval Pilot / learning commands that were matched to an escalation. */
+function isPilotGroupCommand(command: string): command is PilotCommand | "loose_approval" {
+  return command === "loose_approval" || (BUSINESS_COMMANDS as readonly string[]).includes(command) || (DRAFT_COMMANDS as readonly string[]).includes(command);
+}
+
+async function handlePilotCommand(ctx: Ctx, command: PilotCommand | "loose_approval", body: string): Promise<StaffGroupResult> {
+  const { settings, escalation: e } = ctx;
+  const pctx: PilotCtx = {
+    settings,
+    escalation: e,
+    senderJid: ctx.senderJid,
+    senderAuth: ctx.senderAuth,
+    eventId: ctx.eventId,
+    whatsappMessageId: ctx.whatsappMessageId,
+    quotedDraftId: ctx.quotedDraft?.pilotDraftId ?? null,
+    quotedNotice: ctx.quotedNotice,
+  };
+  const done = (r: { outbox: OutboxInsert[]; queued?: OutboxRow[]; outcome: string }): StaffGroupResult => ({
+    outbox: r.outbox,
+    queued: r.queued,
+    outcome: `matched:${r.outcome}`,
+    escalationId: e.id,
+  });
+  const base = { settings, senderAuth: ctx.senderAuth, senderJid: ctx.senderJid, body, eventId: ctx.eventId };
+  switch (command) {
+    case "approve":
+      return done(await handleApprove(pctx, body));
+    case "edit":
+      return done(await handleEdit(pctx, body));
+    case "reject":
+      return done(await handleReject(pctx, body));
+    case "status":
+      return done(await handleEscalationStatus(pctx));
+    case "teach":
+      return done(await handleTeach({ ...base, escalation: { id: e.id, ref_code: e.ref_code }, whatsappMessageId: ctx.whatsappMessageId, timestamp: ctx.timestamp }));
+    case "confirm":
+      return done(await handleConfirm(base));
+    case "discard":
+      return done(await handleDiscard(base));
+    case "loose_approval":
+      return {
+        outbox: canSendApproved(settings) ? [feedbackItem(ctx, PILOT_REFUSAL_TEXT.loose_approval(e.ref_code))] : [],
+        outcome: "matched:pilot:loose_approval",
+        escalationId: e.id,
+      };
+  }
+}
+
 interface Ctx extends StaffGroupMessage {
   escalation: EscalationRow;
   via: "quote" | "ref";
   /** Set when the quoted message was one of our drafts. */
   quotedDraft: QuotedDraft | null;
+  /** Set when the quoted message was one of our escalation notices. */
+  quotedNotice: boolean;
   senderAuth: SenderAuthorization;
 }
 
@@ -282,7 +432,10 @@ async function handleAnswer(ctx: Ctx, body: string, resume?: StaffAnswerRow): Pr
     const knowledge = await loadActiveKnowledge(e.business_slug);
     const analysis = await analyzeAndStore({ settings, escalation: e, answer, mode: "draft_and_classify", staffText: body, knowledge });
     const draft = analysis.draft?.trim() || null;
-    const safety = draft ? checkStaffDraftSafety(draft, body, knowledge) : [];
+    // Staff words are the verification: a stock/day/time/offer claim must be in what they said or in approved knowledge.
+    const safety = draft
+      ? Array.from(new Set([...checkStaffDraftSafety(draft, body, knowledge), ...unsupportedClaimCodes(draft, [body, ...knowledge.map((k) => k.content)])]))
+      : [];
     const gate = await customerGate(settings, e);
     // authorized: false — a plain reply is never permission to message the customer.
     const decision = decideCustomerSend({
@@ -297,16 +450,42 @@ async function handleAnswer(ctx: Ctx, body: string, resume?: StaffAnswerRow): Pr
 
     await markEscalationAnswered(e, { body, actorId: ctx.senderJid, via: "whatsapp", notRelayed: reason });
 
-    const message = buildStaffDraftMessage({
+    let message = buildStaffDraftMessage({
       refCode: e.ref_code,
       customerLabel: customerLabel(e),
       draft,
       decision: { send: false, reason },
       learned: summarizeOutcomes(analysis.outcomes),
     });
-    const draftKey = `staffdraft:${e.id}:${sha(`${draft ?? ""}|${reason}`)}`;
+    let draftKey = `staffdraft:${e.id}:${sha(`${draft ?? ""}|${reason}`)}`;
     const post = await withinDraftCap(e);
-    const outbox: OutboxInsert[] = post ? [staffDraftItem(ctx, message, draftKey)] : [];
+    const outbox: OutboxInsert[] = [];
+    if (settings.mode === "approval_pilot" && draft && reason === "not_authorized") {
+      // Approval Pilot: the draft built from the staff's information is a NEW DRAFT VERSION that must be approved
+      // with !approve (bound to this exact text). Nothing about it is sent by itself.
+      const version = await createDraftVersion({
+        escalation: e,
+        source: "staff_answer",
+        body: draft,
+        ready: safety.length === 0,
+        notes: noteTexts(safety),
+        createdBy: ctx.senderAuth.senderId ?? ctx.senderJid,
+        validUntil: analysis.validUntil,
+      });
+      message = buildPilotDraftPost({
+        refCode: e.ref_code,
+        customerLabel: customerLabel(e),
+        version: version.version,
+        body: draft,
+        ready: safety.length === 0,
+        notes: noteTexts(safety),
+        learned: summarizeOutcomes(analysis.outcomes),
+      });
+      draftKey = `${PILOT_DRAFT_KEY_PREFIX}${version.id}`;
+      if (post) outbox.push(draftPostItem(ctx, version, message));
+    } else if (post) {
+      outbox.push(staffDraftItem(ctx, message, draftKey));
+    }
 
     await finishStaffAnswer(answer, {
       state: "done",
@@ -382,6 +561,14 @@ async function handleSend(ctx: Ctx, body: string, resume?: StaffAnswerRow): Prom
   const { settings, escalation: e } = ctx;
   // A resumed answer keeps what it was: typed text, or the exact draft it approved.
   const exact = resume ? (resume.approves_answer_id ? "" : resume.body) : body.trim();
+  // Approval Pilot: !send is EXACT staff wording only. Approving a draft is !approve (bound to a draft version).
+  if (!exact && !resume && settings.mode === "approval_pilot") {
+    return {
+      outbox: canSendApproved(settings) ? [feedbackItem(ctx, PILOT_REFUSAL_TEXT.loose_approval(e.ref_code))] : [],
+      outcome: "matched:pilot:send_needs_text",
+      escalationId: e.id,
+    };
+  }
 
   let prior: StaffAnswerRow | null = null;
   let text: string;
@@ -396,7 +583,7 @@ async function handleSend(ctx: Ctx, body: string, resume?: StaffAnswerRow): Prom
     if (!approval.ok) {
       if (resume) await failStaffAnswer(resume, new Error("The draft this approval referred to is no longer available"));
       return {
-        outbox: canSendToCustomers(settings) ? [feedbackItem(ctx, NO_DRAFT_TEXT[approval.why](e.ref_code))] : [],
+        outbox: canSendApproved(settings) ? [feedbackItem(ctx, NO_DRAFT_TEXT[approval.why](e.ref_code))] : [],
         outcome: approval.why === "none" ? "matched:send_without_draft" : "matched:send_draft_unresolved",
         escalationId: e.id,
       };
@@ -478,6 +665,12 @@ async function handleSend(ctx: Ctx, body: string, resume?: StaffAnswerRow): Prom
     });
     if (prior && decision.send) {
       await finishStaffAnswer(prior, { customer_action: "sent", customer_dedupe_key: plan.relayKey });
+    }
+    // Evaluation: the staff's own wording replaced the AI's current pilot draft.
+    if (decision.send && exact && settings.mode === "approval_pilot") {
+      await recordStaffTextSent(e, text, ctx.senderAuth.senderId ?? ctx.senderJid).catch((err) =>
+        console.error("[aiAgent] recordStaffTextSent", err instanceof Error ? err.message : err)
+      );
     }
     await audit(e.business_slug, "staff", ctx.senderJid, "escalation.send", { type: "escalation", id: e.id }, {
       ref_code: e.ref_code,
@@ -611,6 +804,7 @@ export async function retryStaffAnswer(args: { businessSlug: string; answerId: s
     escalation,
     via: claimed.matched_via === "quote" ? "quote" : "ref",
     quotedDraft: null,
+    quotedNotice: false,
     senderAuth,
   };
   try {

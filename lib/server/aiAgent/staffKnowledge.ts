@@ -39,7 +39,7 @@ export function setStaffAnalyzerForTests(fn: StaffAnalyzer | null): void {
   analyzerOverride = fn;
 }
 
-async function analyze(input: StaffAnalysisInput): Promise<StaffAnalysisResult> {
+export async function analyze(input: StaffAnalysisInput): Promise<StaffAnalysisResult> {
   if (analyzerOverride) return analyzerOverride(input);
   const { analyzeStaffAnswer } = await import("@/lib/server/aiAgent/model");
   return analyzeStaffAnswer(input);

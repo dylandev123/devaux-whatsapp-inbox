@@ -46,7 +46,22 @@ function CandidateItem({ businessSlug, c, onDone }: { businessSlug: string; c: L
     <li className="px-3 py-3 text-sm">
       <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
         {c.ref_code && <span className="font-mono font-semibold text-zinc-900">#{c.ref_code}</span>}
-        <span>{durable ? "Suggested permanent knowledge" : "Staff answer"}</span>
+        <span>
+          {c.fact_expires_at
+            ? `Suggested temporary fact (expires ${formatWhen(c.fact_expires_at)})`
+            : durable
+              ? "Suggested permanent knowledge"
+              : "Staff answer"}
+        </span>
+        {c.source && c.source !== "staff_answer" && (
+          <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-700">
+            {c.source === "whatsapp_teach" ? "!teach" : c.source === "passive_staff_group" ? "noticed in the staff group" : "noticed in a customer chat"}
+            {c.short_code ? ` · ${c.short_code}` : ""}
+          </span>
+        )}
+        {c.sender_verified === false && (
+          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800">unverified sender — business account message</span>
+        )}
         <span>{formatWhen(c.source_message_at ?? c.created_at)}</span>
       </div>
       {c.source_message && (

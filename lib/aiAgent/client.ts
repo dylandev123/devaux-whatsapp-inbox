@@ -44,6 +44,10 @@ export interface SettingsPatch {
   staffAuthorizedSenders?: string[];
   /** Handling mode of every customer without their own setting. */
   defaultCustomerMode?: CustomerMode;
+  /** Passive learning from authorized staff messages: off, the staff group only, or also the business's own customer chats. */
+  passiveLearningScope?: NonNullable<AgentSettings["passive_learning_scope"]>;
+  /** Authorized senders may confirm knowledge candidates with !confirm. */
+  knowledgeConfirmViaWhatsapp?: boolean;
 }
 
 export interface ContactSearchResult {
@@ -269,8 +273,17 @@ export interface LearningCandidate {
   escalation_id: string | null;
   question: string | null;
   staff_answer: string;
-  status: "pending" | "approved" | "rejected";
+  status: "pending" | "approved" | "rejected" | "expired";
   created_at: string;
+  /** Where the suggestion came from; 'staff_answer' = a staff answer to an escalation. */
+  source?: "staff_answer" | "whatsapp_teach" | "passive_staff_group" | "passive_staff_chat";
+  /** false = from the business account's own messages: nobody can say who wrote it. */
+  sender_verified?: boolean;
+  /** The code staff use in WhatsApp (!confirm K-XXXX). */
+  short_code?: string | null;
+  /** Set for a temporary fact: the knowledge entry created from it expires then. */
+  fact_expires_at?: string | null;
+  proposal_expires_at?: string | null;
   /** 'durable' = a classified permanent fact; 'staff_answer' = a legacy raw answer. */
   category: string;
   suggested_kind: KnowledgeKind | null;
@@ -450,6 +463,21 @@ export const aiAgentApi = {
     api<{ ok: true }>("/api/ai-agent/memory", send("PATCH", { businessSlug: b, chatId, action: "clear_inference", fields })),
   forgetCustomer: (b: string, chatId: string, opts: { includeOrders: boolean; includeLogs: boolean }) =>
     api<{ result: Record<string, number> }>("/api/ai-agent/memory", send("POST", { businessSlug: b, chatId, action: "forget", confirm: "DELETE", ...opts })),
+
+  getEvaluation: (b: string, filters: { kind?: string; rating?: string } = {}) =>
+    api<import("@/lib/aiAgent/evaluation").EvaluationResponse>(
+      `/api/ai-agent/evaluation${q(b, `${filters.kind ? `&kind=${filters.kind}` : ""}${filters.rating ? `&rating=${filters.rating}` : ""}`)}`
+    ),
+  rateEvaluation: (b: string, id: string, rating: import("@/lib/aiAgent/evaluation").ShadowRating | null, feedback: string | null) =>
+    api<{ ok: true }>("/api/ai-agent/evaluation", send("PATCH", { businessSlug: b, id, rating, feedback })),
+  setEvaluationCapture: (b: string, enabled: boolean) =>
+    api<{ ok: true; enabled: boolean }>("/api/ai-agent/evaluation", send("PUT", { businessSlug: b, enabled })),
+  overridePilotVerdict: (b: string, escalationId: string, verdict: "correct" | "missing_information" | "factually_wrong", reason: string) =>
+    api<{ ok: true }>("/api/ai-agent/evaluation/verdict", send("POST", { businessSlug: b, escalationId, verdict, reason })),
+  testAgain: (b: string, escalationId: string) =>
+    api<import("@/lib/aiAgent/evaluation").SimulationOutcome>("/api/ai-agent/evaluation/simulate", send("POST", { businessSlug: b, escalationId })),
+  simulateTurn: (b: string, eventId: string) =>
+    api<import("@/lib/aiAgent/evaluation").SimulationOutcome>("/api/ai-agent/evaluation/simulate", send("POST", { businessSlug: b, eventId })),
 
   simulate: (b: string, text: string, chatId: string | null) =>
     api<SimulationView>("/api/ai-agent/test", send("POST", { businessSlug: b, text, chatId })),

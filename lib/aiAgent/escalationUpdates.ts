@@ -378,6 +378,8 @@ export interface StaffUpdateInput {
   afterStaffReply: boolean;
   /** Observe mode: nothing reaches the customer. */
   observeOnly?: boolean;
+  /** Approval Pilot: nothing is sent until an authorized person sends; the earlier AI suggestion may be out of date. */
+  pilot?: boolean;
 }
 
 const MAX_SHOWN_CHANGES = 6;
@@ -420,6 +422,14 @@ export function buildStaffUpdate(input: StaffUpdateInput): string {
   if (more > 0) lines.push(`• (+${more} more in the dashboard)`);
   lines.push("", "*Current request* (NOT confirmed)", ...currentRequestLines(input.current).map((l) => `• ${l}`));
   lines.push("", "*Action needed*", ...updateActions(input.changes, input.current, input.afterStaffReply).map((a) => `• ${a}`));
+  if (input.pilot) {
+    lines.push(
+      "",
+      `↩️ Reply to this message (or include #${input.refCode}). Any earlier AI draft is out of date and can't be approved — write a new one with !edit <text>.`,
+      "Commands: !edit <text> · !send <text> · !status · !teach <fact> · !note <text> · !close"
+    );
+    return lines.join("\n");
+  }
   lines.push(
     "",
     input.observeOnly

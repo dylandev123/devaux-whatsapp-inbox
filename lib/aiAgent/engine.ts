@@ -13,6 +13,7 @@
 import { BLOCK_REASONS, failureReason } from "./outboxStatus.ts";
 import type { RepeatResolution } from "./memory.ts";
 import { type CustomerMode, effectiveCustomerMode } from "./customerMode.ts";
+import type { PilotCommand } from "./pilot.ts";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -30,7 +31,10 @@ export const DEFAULT_AGENT_SETTINGS = {
 export const AGENT_DECISIONS = ["REPLY", "ASK", "ESCALATE", "NO_REPLY", "HUMAN"] as const;
 export type AgentDecision = (typeof AGENT_DECISIONS)[number];
 
-export const AGENT_MODES = ["observe", "assisted"] as const;
+// observe: never messages customers. approval_pilot: the AI never sends on its own; an explicitly
+// authorized staff member's !approve / !send (staff_relay) is the only way a customer is messaged.
+// assisted: the AI may also send its own verified replies.
+export const AGENT_MODES = ["observe", "approval_pilot", "assisted"] as const;
 export type AgentMode = (typeof AGENT_MODES)[number];
 
 export const CONTACT_SCOPES = ["none", "all", "selected"] as const;
@@ -80,7 +84,14 @@ export interface AgentSettings {
   staff_authorized_senders?: string[] | null;
   /** Mode of every customer without their own setting (lib/aiAgent/customerMode.ts). Absent/unknown = Staff First. */
   default_customer_mode?: CustomerMode | null;
+  /** Passive learning from authorized staff messages (lib/aiAgent/pilot.ts). Absent = "off". */
+  passive_learning_scope?: PassiveLearningScope | null;
+  /** Authorized senders may confirm knowledge candidates with !confirm. Absent/false = admins only. */
+  knowledge_confirm_via_whatsapp?: boolean | null;
 }
+
+export const PASSIVE_LEARNING_SCOPES = ["off", "staff_group", "staff_group_and_chats"] as const;
+export type PassiveLearningScope = (typeof PASSIVE_LEARNING_SCOPES)[number];
 
 export type ContactRule = "allow" | "exclude";
 
@@ -170,15 +181,23 @@ export function isCustomerBoundKind(kind: string): boolean {
   return !(STAFF_GROUP_KINDS as readonly string[]).includes(kind);
 }
 
-/** Customer-facing sends (replies, questions, holding replies, staff relays): Assisted mode only. */
+/** Autonomous customer-facing sends (the AI's own replies, questions, holding replies): Assisted mode only. */
 export function canSendToCustomers(settings: AgentSettings | null): boolean {
   return Boolean(settings?.enabled && settings.mode === "assisted");
+}
+
+/**
+ * Whether an explicitly authorized staff send (staff_relay: "!send", "!approve", the dashboard button) may reach a
+ * customer, and whether the staff group gets feedback messages. Assisted and Approval Pilot; never Observe.
+ */
+export function canSendApproved(settings: AgentSettings | null): boolean {
+  return Boolean(settings?.enabled && (settings.mode === "assisted" || settings.mode === "approval_pilot"));
 }
 
 /** Whether an escalation notice may be posted to the staff group right now. */
 export function canSendStaffNotice(settings: AgentSettings | null): boolean {
   if (!settings?.enabled || !settings.staff_group_jid) return false;
-  if (settings.mode === "assisted") return true;
+  if (settings.mode === "assisted" || settings.mode === "approval_pilot") return true;
   return settings.mode === "observe" && settings.staff_notices_enabled === true;
 }
 
@@ -189,6 +208,11 @@ const OBSERVE_STAFF_KINDS: readonly string[] = ["staff_notice", "staff_draft"];
 export function outboxAllowed(settings: AgentSettings | null, item: { kind: string; toJid: string }): boolean {
   if (!settings?.enabled) return false;
   if (settings.mode === "assisted") return true;
+  if (settings.mode === "approval_pilot") {
+    // Staff-group kinds to the staff group, or a staff_relay (an authorized staff send). Never the AI's own customer kinds.
+    if (item.toJid === settings.staff_group_jid) return (STAFF_GROUP_KINDS as readonly string[]).includes(item.kind) && canSendStaffNotice(settings);
+    return item.kind === "staff_relay";
+  }
   return OBSERVE_STAFF_KINDS.includes(item.kind) && canSendStaffNotice(settings) && item.toJid === settings.staff_group_jid;
 }
 
@@ -652,7 +676,7 @@ export interface MatchableEscalation {
 /** Commands that act on an escalation. "send" is explicit authorization to message the customer. */
 export type StaffCommand = "send" | "note" | "close" | "takeover" | "resume";
 /** What a staff-group message can mean: a command, or a plain answer (information, never authorization). */
-export type StaffGroupCommand = StaffCommand | "answer";
+export type StaffGroupCommand = StaffCommand | "answer" | PilotCommand | "loose_approval";
 
 export type StaffMatch =
   | {
@@ -688,6 +712,14 @@ export const AGENT_MESSAGE_MARKERS = [
   "Reply not sent for #",
 ] as const;
 
+/** Approval Pilot's own staff-group posts (a draft version, the AI suggestion block). */
+const PILOT_ECHO = /Draft v\d+ for #E-|AI suggestion v\d+ —|Nothing is sent until an authorized person sends/;
+
+/** True for text the agent itself posts in the staff group (an echo, a forward, a copy-paste). */
+export function looksLikeAgentMessage(text: string): boolean {
+  return AGENT_MESSAGE_MARKERS.some((m) => text.includes(m)) || PILOT_ECHO.test(text);
+}
+
 export function extractRefCodes(text: string): string[] {
   return Array.from(new Set(Array.from(text.matchAll(REF_PATTERN), (m) => `E-${m[1].toUpperCase()}`)));
 }
@@ -710,11 +742,12 @@ const AUTHORIZE_ONLY =
  */
 export function matchStaffReply(
   message: { text: string; quotedMessageId: string | null },
-  escalations: MatchableEscalation[]
+  escalations: MatchableEscalation[],
+  options: { explicitCommandsOnly?: boolean } = {}
 ): StaffMatch {
   // Anything shaped like our own messages (an echo, a forward, a copy-paste) is
   // never an answer — relaying it would send internal staff text to a customer.
-  if (AGENT_MESSAGE_MARKERS.some((m) => message.text.includes(m))) return { kind: "unmatched" };
+  if (AGENT_MESSAGE_MARKERS.some((m) => message.text.includes(m)) || PILOT_ECHO.test(message.text)) return { kind: "unmatched" };
   const refs = extractRefCodes(message.text);
   const byQuote = message.quotedMessageId
     ? escalations.filter((e) => e.notice_message_id && e.notice_message_id === message.quotedMessageId)
@@ -744,21 +777,22 @@ export function matchStaffReply(
   }
 
   const stripped = message.text.replace(REF_PATTERN, " ").replace(/\s+/g, " ").trim();
-  const cmd = stripped.match(/^!(send|note|close|takeover|resume)\b\s*/i);
+  const cmd = stripped.match(/^!(send|note|close|takeover|resume|approve|edit|reject|status|teach|confirm|discard)\b\s*/i);
   let command: StaffGroupCommand;
   let body: string;
   if (cmd) {
-    command = cmd[1].toLowerCase() as StaffCommand;
+    command = cmd[1].toLowerCase() as StaffGroupCommand;
     body = stripped.slice(cmd[0].length).trim();
   } else if (AUTHORIZE_ONLY.test(stripped)) {
-    command = "send";
+    // Approval Pilot: a casual "send it" is never a send. Only an explicit !command is.
+    command = options.explicitCommandsOnly ? "loose_approval" : "send";
     body = "";
   } else {
     command = "answer";
     body = stripped;
   }
   // "!send" alone is valid (it approves the draft); an answer or note needs text.
-  if ((command === "answer" || command === "note") && !body) {
+  if ((command === "answer" || command === "note" || command === "edit" || command === "teach") && !body) {
     return { kind: "empty", escalationId: target.id, refCode: target.ref_code };
   }
   return { kind: "matched", escalationId: target.id, refCode: target.ref_code, command, body, via };

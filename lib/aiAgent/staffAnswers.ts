@@ -406,7 +406,8 @@ export function decideCustomerSend(input: {
 }): SendDecision {
   const { settings } = input;
   if (!settings?.enabled) return { send: false, reason: "agent_disabled" };
-  if (settings.mode !== "assisted") return { send: false, reason: "observe_mode" };
+  // Assisted and Approval Pilot: the caller has an explicit, authorized request. Observe never messages customers.
+  if (settings.mode !== "assisted" && settings.mode !== "approval_pilot") return { send: false, reason: "observe_mode" };
   if (!input.gate.pass) return { send: false, reason: gateReasonToWithhold(input.gate.reasons) };
   if (!input.hasText) return { send: false, reason: input.noText ?? "draft_unavailable" };
   if (input.safetyCodes.length > 0) return { send: false, reason: "draft_needs_review" };

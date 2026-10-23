@@ -29,9 +29,22 @@ import {
   resolveDecision,
   Resolution,
   priorNoticeHold,
+  categorizeRequest,
+  customerMessageSegments,
+  missingOrderFields,
   staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
+import { assessDraftReadiness, buildPilotNotice } from "@/lib/aiAgent/pilot";
 import { type CustomerMode, customerModeAllowsKind, effectiveCustomerMode, modeAdjustedDecision } from "@/lib/aiAgent/customerMode";
+import {
+  buildShadowRecord,
+  historicalKey,
+  knowledgeVersion,
+  type ShadowUsage,
+  shadowCaptureSkip,
+  simulationKey,
+  SIMULATIONS_PER_HOUR,
+} from "@/lib/aiAgent/evaluation";
 import {
   buildStaffUpdate,
   diffSnapshots,
@@ -71,8 +84,18 @@ import {
   releaseBatch,
 } from "@/lib/server/aiAgent/batches";
 import { agentDb, audit, KnowledgeRow, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
+import {
+  countRecentSimulations,
+  findHistoricalForEvents,
+  findShadowByKey,
+  purgeShadowResults,
+  saveShadowRecord,
+  shadowCaptureEnabled,
+} from "@/lib/server/aiAgent/evaluation";
 import { loadGateData } from "@/lib/server/aiAgent/gateData";
 import { saveCustomerFacts } from "@/lib/server/aiAgent/memory";
+import { draftMetaFrom, ensureAiDraft, purgePilotDrafts } from "@/lib/server/aiAgent/pilot";
+import { maybeExtractPassive } from "@/lib/server/aiAgent/teach";
 import {
   canSend,
   createOrAppendEscalation,
@@ -176,6 +199,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
         quotedMessageId: input.quotedMessageId,
         senderJid: input.senderJid,
         senderPhone: input.senderPhone ?? null,
+        fromMe: input.fromMe,
         eventId,
         whatsappMessageId: input.whatsappMessageId,
         timestamp: input.timestamp,
@@ -184,6 +208,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
         decision: "NO_REPLY",
         reasons: [`staff_group_${staff.outcome}`],
         outbox: staff.outbox,
+        queued: staff.queued,
         escalationId: staff.escalationId,
       };
     } else if (input.fromMe) {
@@ -382,6 +407,23 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
       actorId: null,
     });
   }
+  // The business's own message in a customer chat may state a reusable fact. Only with the admin's explicit
+  // "staff chats" scope; stored as a PENDING suggestion (never knowledge), never customer text.
+  if (settings.passive_learning_scope === "staff_group_and_chats" && !input.chatId.endsWith("@g.us")) {
+    const passive = await maybeExtractPassive({
+      settings,
+      source: "staff_chat",
+      text: input.text,
+      senderAuth: null,
+      senderJid: null,
+      chatId: input.chatId,
+      contactNumber: input.contactNumber,
+      eventId: input.whatsappMessageId,
+      whatsappMessageId: input.whatsappMessageId,
+      timestamp: input.timestamp,
+    });
+    return { decision: "HUMAN", reasons: ["staff_message", ...(passive.outcome === "passive:skipped" ? [] : [passive.outcome.replace(":", "_")])], outbox: passive.outbox };
+  }
   return { decision: "HUMAN", reasons: ["staff_message"], outbox: [] };
 }
 
@@ -419,6 +461,8 @@ interface Pipeline {
   customerMode: CustomerMode;
   /** Every message of the turn is a thank-you / hello / ok: nothing for staff or the AI to act on. */
   trivialTurn: boolean;
+  /** Tokens of the model call the pipeline made (null when it made none). */
+  usage: ShadowUsage | null;
 }
 
 /**
@@ -441,6 +485,13 @@ async function runPipeline(args: {
   excludeMessageIds: string[];
   settings: AgentSettings | null;
   forceGatePass: boolean;
+  /**
+   * Re-running a PAST turn (admin simulation): only conversation from before `asOf` is shown to the model, and
+   * live state (open escalation, collected order, send rate) is ignored because it describes today, not then.
+   */
+  asOf?: string;
+  /** Simulations only: stop before any model call when the contact is not permitted for the agent. */
+  requirePermittedContact?: boolean;
 }): Promise<Pipeline> {
   const { businessSlug, chatId, settings } = args;
   const { matchedViaAlias, identity, ...gateData } = chatId
@@ -476,24 +527,26 @@ async function runPipeline(args: {
     hasOpenEscalation: false,
     customerMode,
     trivialTurn,
+    usage: null,
   };
   if (!gate.pass && !args.forceGatePass) return empty;
+  if (args.requirePermittedContact && !gate.pass && gate.reasons.some((c) => PERMISSION_CODES.includes(c))) return empty;
   if (!args.text.trim()) return empty;
 
   const [knowledge, context, openOrder, openEscalation, recentReplies] = await Promise.all([
     loadActiveKnowledge(businessSlug),
     chatId && identity
-      ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text)
+      ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text, { before: args.asOf })
       : Promise.resolve(null),
-    chatId ? loadOpenOrderRequest(businessSlug, chatId) : Promise.resolve(null),
-    chatId ? findOpenEscalation(businessSlug, chatId) : Promise.resolve(null),
-    chatId ? autoRepliesLastHour(businessSlug, chatId) : Promise.resolve(0),
+    chatId && !args.asOf ? loadOpenOrderRequest(businessSlug, chatId) : Promise.resolve(null),
+    chatId && !args.asOf ? findOpenEscalation(businessSlug, chatId) : Promise.resolve(null),
+    chatId && !args.asOf ? autoRepliesLastHour(businessSlug, chatId) : Promise.resolve(0),
   ]);
 
   const safeguards = detectSafeguards(args.text);
   // The request the customer is building: the collected order request, else what the escalation they
   // are following up on already holds (so the model returns a CUMULATIVE request, not a fragment).
-  const anchor = openEscalation ?? (chatId ? await findRecentAnsweredEscalation(businessSlug, chatId) : null);
+  const anchor = openEscalation ?? (chatId && !args.asOf ? await findRecentAnsweredEscalation(businessSlug, chatId) : null);
   const anchorOrder = (anchor?.context.order_request ?? null) as OrderRequestDraft | null;
   const priorOrder: OrderRequestDraft | null = openOrder
     ? {
@@ -562,8 +615,12 @@ async function runPipeline(args: {
     hasOpenEscalation: Boolean(openEscalation),
     customerMode,
     trivialTurn,
+    usage: modelResult.usage ?? null,
   };
 }
+
+/** Gate codes meaning "the agent may not engage with this contact". */
+const PERMISSION_CODES = ["contact_not_permitted", "contact_excluded", "unresolved_lid_identity"];
 
 interface TurnContext {
   businessSlug: string;
@@ -606,6 +663,10 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
   if (p.gate.pass && p.trivialTurn && (p.hasOpenEscalation || p.customerMode !== "auto_reply")) {
     return { decision: "NO_REPLY", reasons: ["trivial_acknowledgement"], outbox: [] };
   }
+
+  // Evaluation: keep what the AI proposed on its own, from the model call already made. Write-only evidence
+  // for admins; it can neither change this outcome nor reach the outbox.
+  await recordHistoricalShadow(p, turn, ctx, sendable);
 
   const r = p.resolution;
   const reasons = [...(p.gate.pass ? r!.reasons : p.gate.reasons), ...p.identityNotes];
@@ -681,6 +742,7 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
       orderRequest: r?.orderRequest ?? null,
       history: p.history,
       eventId,
+      ...pilotDraftInfo(settings, p, r, reasons),
     };
     const write = await createOrAppendEscalation(escalateInput);
     const { escalation, followUp } = write;
@@ -747,6 +809,90 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
   return { ...common, decision, reasons, outbox: outbox.filter((o) => customerModeAllowsKind(p.customerMode, o.kind)) };
 }
 
+const ORDER_FIELD_TEXT: Record<string, string> = {
+  items: "Which products the customer wants",
+  quantity: "How many of each",
+  delivery_address: "Delivery address",
+  delivery_preference: "Delivery day/time",
+};
+
+/**
+ * Approval Pilot only: how far the AI's draft can be trusted and what it could not work out — computed from the
+ * proposal the live pipeline already made (no extra model call) and kept on the escalation.
+ */
+function pilotDraftInfo(settings: AgentSettings, p: Pipeline, r: Resolution | null, reasons: string[]): Pick<EscalateInput, "draftMeta" | "missing"> {
+  if (settings.mode !== "approval_pilot") return {};
+  const reply = r?.reply ?? r?.draftReply ?? null;
+  const missing = [
+    ...(p.proposal?.escalation_reason ? [p.proposal.escalation_reason] : []),
+    ...(r?.orderRequest ? missingOrderFields(r.orderRequest).map((f) => ORDER_FIELD_TEXT[f]) : []),
+  ];
+  if (!reply || !p.proposal) return { missing };
+  const readiness = assessDraftReadiness({
+    reply,
+    proposal: p.proposal,
+    activeKnowledge: p.knowledge.map((k) => ({ id: k.id, content: k.content })),
+    safeguardCodes: p.safeguards,
+    reasonCodes: reasons,
+    requiredConfidence: r?.requiredConfidence ?? Number.POSITIVE_INFINITY,
+  });
+  return {
+    missing,
+    draftMeta: draftMetaFrom(
+      readiness,
+      p.proposal.knowledge_ids.filter((id) => p.knowledge.some((k) => k.id === id)),
+      knowledgeVersion(p.knowledge)
+    ),
+  };
+}
+
+/**
+ * Stores the AI's independent proposal for this turn (kind = historical). Free: it reuses the live model
+ * call, so duplicates, acknowledgements, injection attempts and turns staff already own cost nothing and
+ * store nothing. Best effort: a failure here is logged and never touches the decision.
+ */
+async function recordHistoricalShadow(p: Pipeline, turn: CustomerTurn, ctx: TurnContext, aiRepliesDirectly: boolean): Promise<void> {
+  try {
+    const skip = shadowCaptureSkip({
+      enabled: true,
+      gatePass: p.gate.pass,
+      aiRepliesDirectly,
+      trivialTurn: p.trivialTurn,
+      openEscalation: p.hasOpenEscalation,
+      safeguards: p.safeguards,
+      hasProposal: Boolean(p.proposal && p.resolution),
+    });
+    if (skip || !p.resolution || !p.proposal || !turn.primaryEventId) return;
+    if (!(await shadowCaptureEnabled(ctx.businessSlug))) return;
+    await saveShadowRecord(
+      buildShadowRecord({
+        kind: "historical",
+        businessSlug: ctx.businessSlug,
+        chatId: ctx.chatId,
+        sourceEventId: turn.primaryEventId,
+        customerQuestion: turn.segments.join("\n"),
+        turnAt: turn.lastAt && !Number.isNaN(Date.parse(turn.lastAt)) ? new Date(turn.lastAt).toISOString() : null,
+        resolution: p.resolution,
+        proposal: p.proposal,
+        category: categorizeRequest({
+          reasons: p.resolution.reasons,
+          intent: p.proposal.intent,
+          orderRequest: p.resolution.orderRequest,
+          messages: turn.segments,
+        }),
+        model: p.model,
+        knowledgeIds: p.proposal.knowledge_ids.filter((id) => p.knowledge.some((k) => k.id === id)),
+        knowledgeVersion: knowledgeVersion(p.knowledge),
+        knowledgeCount: p.knowledge.length,
+        memoryUsed: p.memory !== null,
+        usage: p.usage,
+      })
+    );
+  } catch (err) {
+    console.error("[aiAgent] recordHistoricalShadow", err instanceof Error ? err.message : err);
+  }
+}
+
 /**
  * Tells the staff group about an escalation — the ONE place a staff notice is composed and queued.
  *
@@ -780,7 +926,18 @@ async function notifyStaff(args: {
 
     let body: string;
     let urgent = false;
-    if (first) {
+    if (first && settings.mode === "approval_pilot") {
+      // Approval Pilot: concise notice with the AI's independent suggestion (version 1), made before any staff input.
+      const draft = await ensureAiDraft(escalation);
+      body = buildPilotNotice({
+        refCode: escalation.ref_code,
+        priority: escalation.priority,
+        customerLabel: [escalation.customer_name, escalation.contact_number].filter(Boolean).join(" · ") || escalation.chat_id,
+        messages: customerMessageSegments(escalation.customer_message ?? escalateInput.customerMessage),
+        draft: draft ? { version: draft.version, body: draft.body, ready: draft.ready, notes: draft.confirm_notes } : null,
+        missing: escalateInput.missing ?? [],
+      });
+    } else if (first) {
       body = staffNoticeFor(escalation, write.followUp ? originalEscalationInput(escalation, escalateInput) : escalateInput, false, observeOnly);
     } else {
       const baseline = parseSnapshot(escalation.notified_snapshot) ?? write.previous;
@@ -794,7 +951,8 @@ async function notifyStaff(args: {
         current,
         changes,
         afterStaffReply: Boolean(escalation.answered_at),
-        observeOnly,
+        observeOnly: observeOnly && settings.mode !== "approval_pilot",
+        pilot: settings.mode === "approval_pilot",
       });
     }
 
@@ -1003,7 +1161,11 @@ export async function processDueBatches(options: { budgetMs?: number; concurrenc
     const results = await Promise.all(batches.map((b) => processClaimedBatch(b, worker)));
     for (const r of results) summary[r] += 1;
   }
-  if (summary.claimed === 0 && Math.random() < 0.02) await purgeFinishedBatches();
+  if (summary.claimed === 0 && Math.random() < 0.02) {
+    await purgeFinishedBatches();
+    await purgeShadowResults();
+    await purgePilotDrafts();
+  }
   return summary;
 }
 
@@ -1065,24 +1227,25 @@ export interface SimulationResult {
   customerMode: CustomerMode;
 }
 
+async function contactNumberFor(businessSlug: string, chatId: string): Promise<string | null> {
+  const { data } = await agentDb()
+    .from("whatsapp_messages")
+    .select("contact_number")
+    .eq("business_slug", businessSlug)
+    .eq("chat_id", chatId)
+    .not("contact_number", "is", null)
+    .limit(1)
+    .maybeSingle();
+  return data?.contact_number ?? null;
+}
+
 export async function simulateMessage(input: {
   businessSlug: string;
   chatId: string | null;
   text: string;
 }): Promise<SimulationResult> {
   const settings = await loadSettings(input.businessSlug);
-  let contactNumber: string | null = null;
-  if (input.chatId) {
-    const { data } = await agentDb()
-      .from("whatsapp_messages")
-      .select("contact_number")
-      .eq("business_slug", input.businessSlug)
-      .eq("chat_id", input.chatId)
-      .not("contact_number", "is", null)
-      .limit(1)
-      .maybeSingle();
-    contactNumber = data?.contact_number ?? null;
-  }
+  const contactNumber = input.chatId ? await contactNumberFor(input.businessSlug, input.chatId) : null;
 
   const p = await runPipeline({
     businessSlug: input.businessSlug,
@@ -1129,4 +1292,170 @@ export async function simulateMessage(input: {
     mode: settings?.mode ?? null,
     customerMode: p.customerMode,
   };
+}
+
+// ── Evaluation: admin-triggered simulation of a past turn ────────────────────
+
+export type HistoricalSimulationResult =
+  | { status: "simulated" | "cached" | "historical_exists"; id: string }
+  | { status: "skipped"; reason: string };
+
+/**
+ * Re-runs ONE past customer turn through the same pipeline (same prompt, same engine, same model) using
+ * TODAY's approved knowledge, and stores it as kind = 'simulation'. It is never mixed into historical
+ * results and is flagged with the knowledge entries that changed since the turn.
+ *
+ * Cost guards, all before any model call: a turn that already has a historical result is returned as is;
+ * the same turn with unchanged knowledge is returned from the earlier simulation; acknowledgements,
+ * prompt-injection attempts, contacts the agent may not engage with and an exhausted hourly limit are
+ * refused. Writes only ai_agent_shadow_results; nothing is ever queued or sent.
+ */
+export async function simulateHistoricalTurn(input: {
+  businessSlug: string;
+  eventId: string;
+  adminId: string;
+  /** Approval Pilot "Test Again": simulate even though a historical result exists (the label keeps them apart). */
+  ignoreHistorical?: boolean;
+}): Promise<HistoricalSimulationResult> {
+  const { businessSlug } = input;
+  const db = agentDb();
+  const settings = await loadSettings(businessSlug);
+  if (!settings) return { status: "skipped", reason: "agent_not_configured" };
+
+  const { data: event, error } = await db
+    .from("ai_agent_events")
+    .select("id, kind, chat_id, whatsapp_message_id, message_excerpt, batch_id, created_at")
+    .eq("business_slug", businessSlug)
+    .eq("id", input.eventId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!event) return { status: "skipped", reason: "not_found" };
+  if (event.kind !== "customer_inbound") return { status: "skipped", reason: "not_a_customer_message" };
+
+  // The turn: every message of the batch it was decided with, or the message alone.
+  let turnEvents = [event];
+  if (event.batch_id) {
+    const { data: siblings, error: siblingError } = await db
+      .from("ai_agent_events")
+      .select("id, kind, chat_id, whatsapp_message_id, message_excerpt, batch_id, created_at")
+      .eq("business_slug", businessSlug)
+      .eq("batch_id", event.batch_id)
+      .eq("kind", "customer_inbound")
+      .order("created_at");
+    if (siblingError) throw new Error(siblingError.message);
+    if ((siblings ?? []).length > 0) turnEvents = siblings!;
+  }
+  const eventIds = turnEvents.map((e) => e.id);
+  const primaryEventId = turnEvents[turnEvents.length - 1].id;
+
+  const existing = input.ignoreHistorical ? null : await findHistoricalForEvents(businessSlug, eventIds);
+  if (existing) return { status: "historical_exists", id: existing.id };
+
+  // The words as they were sent (stored messages are retention-limited; the event excerpt is the fallback).
+  const { data: stored } = await db
+    .from("whatsapp_messages")
+    .select("whatsapp_message_id, message_body, timestamp")
+    .eq("business_slug", businessSlug)
+    .eq("chat_id", event.chat_id)
+    .in("whatsapp_message_id", turnEvents.map((e) => e.whatsapp_message_id));
+  const storedById = new Map((stored ?? []).map((m) => [m.whatsapp_message_id, m]));
+  const turn = buildCustomerTurn(
+    turnEvents.map((e, position) => {
+      const m = storedById.get(e.whatsapp_message_id);
+      return {
+        id: e.whatsapp_message_id,
+        whatsappMessageId: e.whatsapp_message_id,
+        eventId: e.id,
+        text: (m?.message_body ?? e.message_excerpt ?? "").trim(),
+        hasMedia: false,
+        messageAt: m?.timestamp ?? null,
+        receivedAt: e.created_at,
+        position,
+      };
+    })
+  );
+  if (!turn.text.trim()) return { status: "skipped", reason: "no_text" };
+  if (isTrivialTurn(turn.segments)) return { status: "skipped", reason: "acknowledgement" };
+  if (detectSafeguards(turn.text).includes("prompt_injection")) return { status: "skipped", reason: "prompt_injection" };
+
+  const knowledge = await loadActiveKnowledge(businessSlug);
+  const version = knowledgeVersion(knowledge);
+  const cached = await findShadowByKey(businessSlug, simulationKey(primaryEventId, version));
+  if (cached) return { status: "cached", id: cached.id };
+  if ((await countRecentSimulations(businessSlug)) >= SIMULATIONS_PER_HOUR) return { status: "skipped", reason: "simulation_limit" };
+
+  const asOf = turn.firstAt && !Number.isNaN(Date.parse(turn.firstAt)) ? new Date(turn.firstAt).toISOString() : event.created_at;
+  const p = await runPipeline({
+    businessSlug,
+    chatId: event.chat_id,
+    contactNumber: await contactNumberFor(businessSlug, event.chat_id),
+    text: turn.text,
+    transcript: turn.transcript,
+    segments: turn.segments,
+    hasMedia: false,
+    excludeMessageIds: turn.whatsappMessageIds,
+    settings,
+    // Live-only gate checks (takeover, staff active, business off) say nothing about a past turn;
+    // contact permission still applies and is enforced before any model call.
+    forceGatePass: true,
+    requirePermittedContact: true,
+    asOf,
+  });
+  if (!p.gate.pass && p.gate.reasons.some((c) => PERMISSION_CODES.includes(c))) return { status: "skipped", reason: "contact_not_permitted" };
+  if (p.modelError) return { status: "skipped", reason: "model_error" };
+  if (!p.proposal || !p.resolution) return { status: "skipped", reason: "no_model_call" };
+
+  const turnAt = turn.lastAt && !Number.isNaN(Date.parse(turn.lastAt)) ? new Date(turn.lastAt).toISOString() : null;
+  const changedSince = turnAt ? p.knowledge.filter((k) => Date.parse(k.updated_at) > Date.parse(turnAt)).map((k) => k.id) : [];
+  const saved = await saveShadowRecord(
+    buildShadowRecord({
+      kind: "simulation",
+      businessSlug,
+      chatId: event.chat_id,
+      sourceEventId: primaryEventId,
+      customerQuestion: turn.segments.join("\n"),
+      turnAt,
+      resolution: p.resolution,
+      proposal: p.proposal,
+      category: categorizeRequest({
+        reasons: p.resolution.reasons,
+        intent: p.proposal.intent,
+        orderRequest: p.resolution.orderRequest,
+        messages: turn.segments,
+      }),
+      model: p.model,
+      knowledgeIds: p.proposal.knowledge_ids.filter((id) => p.knowledge.some((k) => k.id === id)),
+      knowledgeVersion: knowledgeVersion(p.knowledge),
+      knowledgeCount: p.knowledge.length,
+      postTurnKnowledgeIds: changedSince,
+      memoryUsed: p.memory !== null,
+      usage: p.usage,
+      simulatedBy: input.adminId,
+    })
+  );
+  // A concurrent identical click stored it first.
+  const row = saved ?? (await findShadowByKey(businessSlug, simulationKey(primaryEventId, knowledgeVersion(p.knowledge))));
+  if (!row) throw new Error("Simulation could not be stored");
+  await audit(businessSlug, "admin", input.adminId, "evaluation.simulate", { type: "shadow_result", id: row.id }, { event_id: primaryEventId });
+  return { status: saved ? "simulated" : "cached", id: row.id };
+}
+
+/**
+ * Approval Pilot "Test Again": re-runs the customer turn behind one pilot request with TODAY's approved knowledge,
+ * through the same simulation (same cost guards, cache by knowledge version, hourly limit, nothing sent) and stores
+ * it as a SIMULATION. The historical draft staff saw is never touched.
+ */
+export async function simulatePilotRequest(input: { businessSlug: string; escalationId: string; adminId: string }): Promise<HistoricalSimulationResult> {
+  const { data, error } = await agentDb()
+    .from("ai_agent_events")
+    .select("id")
+    .eq("business_slug", input.businessSlug)
+    .eq("escalation_id", input.escalationId)
+    .eq("kind", "customer_inbound")
+    .order("created_at", { ascending: true })
+    .limit(1);
+  if (error) throw new Error(error.message);
+  const eventId = ((data ?? [])[0] as { id: string } | undefined)?.id;
+  if (!eventId) return { status: "skipped", reason: "not_found" };
+  return simulateHistoricalTurn({ businessSlug: input.businessSlug, eventId, adminId: input.adminId, ignoreHistorical: true });
 }

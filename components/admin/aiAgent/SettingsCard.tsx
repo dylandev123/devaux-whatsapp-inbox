@@ -31,6 +31,8 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
   const [memoryCapture, setMemoryCapture] = useState(s.customer_memory_enabled);
   const [defaultCustomerMode, setDefaultCustomerMode] = useState(effectiveCustomerMode(s, null));
   const [senders, setSenders] = useState((s.staff_authorized_senders ?? []).join("\n"));
+  const [passiveScope, setPassiveScope] = useState(s.passive_learning_scope ?? "off");
+  const [confirmViaWhatsapp, setConfirmViaWhatsapp] = useState(s.knowledge_confirm_via_whatsapp === true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -71,17 +73,19 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
       customerMemoryEnabled: memoryCapture,
       defaultCustomerMode,
       staffAuthorizedSenders: senders.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
+      passiveLearningScope: passiveScope,
+      knowledgeConfirmViaWhatsapp: confirmViaWhatsapp,
     });
   }
 
   return (
-    <Card title="Agent" subtitle="Customers are only messaged when the agent is ON and in Assisted mode. Observe mode can post escalation notices to the staff group if enabled below.">
+    <Card title="Agent" subtitle="Customers are only messaged when the agent is ON and in Approval Pilot (only a staff member you authorize sends) or Assisted mode. Observe mode can post escalation notices to the staff group if enabled below.">
       <div className="flex flex-col gap-4">
         {!data.aiKeyConfigured && <Notice tone="warn">No OpenAI key is saved on the AI Settings page — every message will be escalated.</Notice>}
         {!data.bridgeConfigured && (
           <Notice tone="warn">AI_AGENT_BRIDGE_SECRET is not set on this deployment — the bridge cannot reach the agent.</Notice>
         )}
-        {enabled && mode === "assisted" && !s.staff_group_jid && (
+        {enabled && mode !== "observe" && !s.staff_group_jid && (
           <Notice tone="warn">No staff escalation group selected — escalations will only appear on this page.</Notice>
         )}
 
@@ -96,7 +100,11 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
             onClick={() =>
               save(
                 { enabled: !enabled },
-                enabled ? undefined : `Turn the AI agent ON in ${mode === "assisted" ? "ASSISTED (it will send messages)" : "OBSERVE (no messages sent)"} mode?`
+                enabled
+                  ? undefined
+                  : `Turn the AI agent ON in ${
+                      mode === "assisted" ? "ASSISTED (it will send messages)" : mode === "approval_pilot" ? "APPROVAL PILOT (it only sends what an authorized staff member approves)" : "OBSERVE (no messages sent)"
+                    } mode?`
               )
             }
             className={`cursor-pointer rounded-full px-4 py-1.5 text-sm font-semibold disabled:opacity-50 ${
@@ -109,8 +117,8 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
 
         <div>
           <label className="mb-1 block text-xs font-medium text-zinc-500">Mode</label>
-          <div className="flex gap-2">
-            {(["observe", "assisted"] as const).map((m) => (
+          <div className="flex flex-wrap gap-2">
+            {(["observe", "approval_pilot", "assisted"] as const).map((m) => (
               <button
                 key={m}
                 type="button"
@@ -119,7 +127,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
                   mode === m ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-zinc-200 text-zinc-600"
                 }`}
               >
-                {m === "observe" ? "Observe — record decisions only" : "Assisted — reply, ask & escalate"}
+                {m === "observe" ? "Observe — record decisions only" : m === "approval_pilot" ? "Approval Pilot — staff approve every reply in WhatsApp" : "Assisted — reply, ask & escalate"}
               </button>
             ))}
           </div>
@@ -231,9 +239,27 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
             The dashboard&apos;s &quot;Send to customer&quot; button is not affected.
           </p>
           <textarea value={senders} onChange={(e) => setSenders(e.target.value)} rows={3} placeholder="17585550001" className={inputClass} />
-          {enabled && mode === "assisted" && senders.trim() === "" && (
-            <p className="mt-1 text-xs text-amber-700">No one is authorized: staff-group replies will only ever produce drafts.</p>
+          {enabled && mode !== "observe" && senders.trim() === "" && (
+            <p className="mt-1 text-xs text-amber-700">No one is authorized: nobody can approve or send a customer reply, teach, or confirm from WhatsApp.</p>
           )}
+        </div>
+
+        <div className="rounded-md border border-zinc-200 p-3">
+          <label className="mb-1 block text-sm font-medium text-zinc-900">Learning from WhatsApp</label>
+          <p className="mb-2 text-xs text-zinc-500">
+            Staff can teach the AI with <code>!teach &lt;fact&gt;</code>. Anything learned is only a suggestion until it is confirmed (here on the Review tab, or from WhatsApp if enabled below).
+            Customer messages are never used.
+          </p>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">Notice facts staff mention on their own</label>
+          <select value={passiveScope} onChange={(e) => setPassiveScope(e.target.value as typeof passiveScope)} className={inputClass}>
+            <option value="off">Off — only !teach</option>
+            <option value="staff_group">The staff group — messages from authorized senders</option>
+            <option value="staff_group_and_chats">The staff group, plus the business account&apos;s own messages (unverified suggestions only)</option>
+          </select>
+          <label className="mt-3 flex items-center gap-2 text-sm text-zinc-700">
+            <input type="checkbox" checked={confirmViaWhatsapp} onChange={(e) => setConfirmViaWhatsapp(e.target.checked)} />
+            Authorized senders can confirm suggestions from WhatsApp (<code>!confirm K-XXXX</code>)
+          </label>
         </div>
 
         <label className="flex items-center gap-2 text-sm text-zinc-700">
