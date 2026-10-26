@@ -471,8 +471,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal((await orderEvents(o.id)).at(-1)!.kind, "customer_replied_yes");
 
     const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(report, /1 order · 0 confirmed · 1 to review/);
-    assert.match(report, /⚠️ Customer said yes — staff to confirm/);
+    assert.match(report, /1 order · 0 confirmed · 1 open/);
+    assert.doesNotMatch(report, /Customer said yes|Needs confirmation/, "the recorded yes lives in the dashboard and !moreinfo, not the report");
 
     // Saying yes again does not pile up events.
     await customerSays(JANE, "yes");
@@ -485,8 +485,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(row.confirmed_by, "admin:u1");
     assert.equal(row.attention, null);
     const after = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(after, /CONFIRMED\* \(1\)/);
-    assert.match(after, /1 order · 1 confirmed · 0 to review/);
+    assert.match(after, /✅ \*CONFIRMED\*/);
+    assert.match(after, /1 order · 1 confirmed · 0 open/);
     assert.doesNotMatch(after, /⚠️/, "a confirmed order carries no warning");
   });
 
@@ -497,7 +497,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     modelOrders(draft(), { order_target: o.ref_code });
     await customerSays(JANE, "confirmed");
     const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(report, /1 order · 1 confirmed · 0 to review/);
+    assert.match(report, /1 order · 1 confirmed · 0 open/);
     assert.equal((await allOrders())[0].confirmed_by, "customer");
   });
 
@@ -679,10 +679,11 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(item.to_jid, GROUP);
     assert.equal(item.status, "pending");
     assert.equal(item.dedupe_key, "ordersummary:dog_food:2026-10-27:1");
-    assert.match(item.body, /CONFIRMED\* \(1\)/);
-    assert.match(item.body, /NEEDS ATTENTION\* \(1\)/);
-    assert.match(item.body, /Jane · #[A-Z2-9]{5}\*\nPhone: 555-0101/);
-    assert.match(item.body, /Marcus · #[A-Z2-9]{5}\*[\s\S]*⚠️ Needs delivery address/);
+    assert.match(item.body, /✅ \*CONFIRMED\*/);
+    assert.match(item.body, /📦 \*OPEN ORDERS\*/);
+    assert.match(item.body, /Jane · #[A-Z2-9]{5}\*\n555-0101/);
+    assert.match(item.body, /Marcus · #[A-Z2-9]{5}\*/);
+    assert.doesNotMatch(item.body, /Needs delivery address|Needs confirmation/);
     const [run] = await runs();
     assert.deepEqual([run.status, run.local_date.slice(0, 10), run.confirmed_count, run.attention_count, run.carried_count], ["queued", "2026-10-27", 1, 1, 1]);
     assert.equal(run.outbox_id, item.id);
@@ -851,10 +852,11 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-25T15:00:00Z', last_message_at = '2026-10-26T15:00:00Z' where chat_id = ${lit(MARCUS.chat)};`);
     const text = await reportText();
     for (const part of [
-      "Jane Doe · #", "Phone: 555-0101", "2 × Monello Chicken 15kg", "Delivery: 12 Main St Gros Islet · ", "(Friday morning)",
-      "Note: Gate code 1234, ring twice", "⚠️ Needs confirmation",
-      "555-0102 · #", "4 × Dog Treats", "⚠️ Needs delivery address",
+      "Jane Doe · #", "\n555-0101\n", "2 × Monello Chicken 15kg", "Delivery: 12 Main St Gros Islet · ", "(Friday morning)",
+      "Note: Gate code 1234, ring twice",
+      "555-0102 · #", "4 × Dog Treats",
     ]) assert.ok(text.includes(part), part);
+    assert.doesNotMatch(text, /Needs |Phone:/, "known facts only: no placeholders, no 'needs' lines, no labels");
   });
 
   test("a delivery update from the customer changes the same order; cancelled and fulfilled orders drop out of the report", async () => {

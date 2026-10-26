@@ -326,6 +326,14 @@ function quantityGrounded(quantity: string, corpus: Set<string>, corpusDigits: S
   return words.map(stem).every((w) => corpus.has(w));
 }
 
+/** Whether the customer's own words state this quantity (a digit or a number word). */
+export function quantityStated(quantity: string, customerTexts: string[]): boolean {
+  const words = customerTexts.flatMap(wordsOf);
+  const corpus = new Set(words.map(stem));
+  const digits = new Set(words.map((w) => NUMBER_WORDS[w] ?? w).filter((w) => /^\d+(\.\d+)?$/.test(w)));
+  return quantityGrounded(quantity, corpus, digits);
+}
+
 /**
  * Drops from the model's order draft anything the customer never said: a product none of whose
  * words appear in their messages, a quantity they did not state, an address or delivery time

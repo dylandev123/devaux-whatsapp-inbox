@@ -588,7 +588,7 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     const text = await reportText();
     assert.match(text, /Monello Chicken/);
     assert.match(text, /Dog Treats/);
-    assert.match(text, /2 orders · 0 confirmed · 2 to review/);
+    assert.match(text, /2 orders · 0 confirmed · 2 open/);
     assert.doesNotMatch(text, /⚠️ May be incomplete|OFF/, "nothing is missing, so nothing is flagged");
     assert.doesNotMatch(text, /selected for the AI/);
   });

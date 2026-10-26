@@ -62,6 +62,13 @@ const ORDER_LANGUAGE_RULES = `Reading customer wording (only what the customer w
 - Removing items: "just the Monello bags" or "only X" means the order now holds only the Monello items: return only those in "items" (the server records what was removed). If the customer did not remove anything, keep every earlier item.
 - A question about products, prices or availability is an enquiry (intent "question"), not an order. Only wording that asks for something to be supplied is an order. Never describe an order as confirmed.`;
 
+// Added only when the customer HAS verified earlier orders. The server fills "same as last time", "the usual" and "same
+// location" itself from the customer's own records; the model's one extra job is to recognise a generic product name.
+const ORDER_HISTORY_RULES = `
+- CUSTOMER HISTORY lists this customer's earlier verified orders (reference, items, delivery address) and the products they repeat. The server resolves "same as last time", "the usual" and "same location" by itself: do not copy history into "order_request" for those.
+- When the customer names a product only generically ("a bag of dog food") and exactly ONE history product clearly fits, return that item with the history product's exact "product", "variant" and "size" and add "from_history": "<reference of the order it appears in>". If several history products could fit, or none, return the customer's own words and leave "from_history" out. The quantity still comes only from the customer's words.
+- Never use history for anything the customer did not refer to. Never invent a product, size, address or quantity.`;
+
 // Appended to the instructions only when the business has order tracking on. Same single model call: it adds fields
 // to the JSON the call already returns, never a second call.
 const ORDER_TRACKING_RULES = `
@@ -100,6 +107,8 @@ export interface ProposeReplyInput {
   reviewMode?: boolean;
   /** Order tracking on: the customer's open orders (reference + content), for "order_target". Undefined = tracking off. */
   openOrders?: unknown[];
+  /** historyForModel() of the customer's verified earlier orders (order tracking on). Omitted when there are none. */
+  orderHistory?: unknown;
 }
 
 type ReplyProposer = (input: ProposeReplyInput) => Promise<ModelCallResult>;
@@ -128,6 +137,7 @@ export async function proposeReply(input: ProposeReplyInput): Promise<ModelCallR
       : `Staff escalation: ${input.openEscalation ? "OPEN — staff own this conversation" : "none"}`,
     `Pending order request: ${input.pendingOrder ? data(JSON.stringify(input.pendingOrder)) : "none"}`,
     ...(input.openOrders ? [`OPEN ORDERS (reference, status and content):\n${input.openOrders.length > 0 ? data(JSON.stringify(input.openOrders)) : "none"}`] : []),
+    ...(input.openOrders && input.orderHistory ? [`CUSTOMER HISTORY (verified earlier orders):\n${data(JSON.stringify(input.orderHistory))}`] : []),
     ctx && ctx.transcript.length > 0
       ? `Recent conversation (oldest first):\n${data(ctx.transcript.map((t) => `${t.who}: ${t.text}`).join("\n"))}`
       : "Recent conversation: none",
@@ -138,7 +148,7 @@ export async function proposeReply(input: ProposeReplyInput): Promise<ModelCallR
     const client = new OpenAI({ apiKey: settings.api_key });
     const response = await client.responses.create({
       model: settings.model,
-      instructions: input.openOrders ? SYSTEM_PROMPT + ORDER_TRACKING_RULES : SYSTEM_PROMPT,
+      instructions: input.openOrders ? SYSTEM_PROMPT + ORDER_TRACKING_RULES + (input.orderHistory ? ORDER_HISTORY_RULES : "") : SYSTEM_PROMPT,
       input: sections.join("\n\n"),
       max_output_tokens: input.openOrders ? 1200 : 900,
     });
@@ -189,6 +199,8 @@ export interface OrderUpdateInput {
   customerName: string;
   /** ordersForModel() of the chat's open orders. */
   openOrders: unknown[];
+  /** historyForModel() of the customer's verified earlier orders. Omitted when there are none. */
+  orderHistory?: unknown;
   /** The last few messages before the new ones, labelled. Never the whole history. */
   transcript: { who: "Customer" | "Staff"; text: string }[];
   /** The new message(s), already rendered with timestamps. */
@@ -222,6 +234,7 @@ export async function proposeOrderUpdate(input: OrderUpdateInput): Promise<Order
     `Business: ${businessLabel(input.businessSlug)}`,
     `Customer: ${input.customerName}`,
     `OPEN ORDERS (reference, status and content):\n${input.openOrders.length > 0 ? data(JSON.stringify(input.openOrders)) : "none"}`,
+    ...(input.orderHistory ? [`CUSTOMER HISTORY (verified earlier orders):\n${data(JSON.stringify(input.orderHistory))}`] : []),
     input.transcript.length > 0 ? `Recent messages (oldest first):\n${data(input.transcript.map((t) => `${t.who}: ${t.text}`).join("\n"))}` : "Recent messages: none",
     input.author === "history"
       ? `NEW messages, a replay of the stored conversation (oldest first; each line says who wrote it):\n${data(input.newMessages.slice(0, 6000))}`
@@ -231,7 +244,7 @@ export async function proposeOrderUpdate(input: OrderUpdateInput): Promise<Order
     const client = new OpenAI({ apiKey: settings.api_key });
     const response = await client.responses.create({
       model: modelName,
-      instructions: ORDER_MONITOR_PROMPT,
+      instructions: input.orderHistory ? ORDER_MONITOR_PROMPT + ORDER_HISTORY_RULES : ORDER_MONITOR_PROMPT,
       input: sections.join("\n\n"),
       max_output_tokens: 700,
     });

@@ -225,7 +225,7 @@ export function searchReply(query: string, found: TrackedOrder[], names?: OrderN
   const shown = found.slice(0, 5);
   return [
     `🔎 ${found.length} active ${found.length === 1 ? "order" : "orders"} for "${clip(query, 40)}":`,
-    ...shown.map((o) => `${orderBlock(o, null, names)}`),
+    ...shown.map((o) => orderBlock(o, null, names, { status: true })),
     ...(found.length > shown.length ? [`…and ${found.length - shown.length} more — narrow the search.`] : []),
     "Details: !moreinfo #REF",
   ].join("\n\n");
@@ -247,7 +247,7 @@ function valueText(field: string, v: unknown): string {
 
 function changeText(changes: OrderEventLine["changes"]): string {
   const parts = Object.entries(changes)
-    .filter(([field]) => !["staff_message", "removed_items"].includes(field))
+    .filter(([field]) => !["staff_message", "removed_items", "inferred"].includes(field))
     .slice(0, 3)
     .map(([field, c]) => `${field.replace(/_/g, " ")} ${valueText(field, c?.before)} → ${valueText(field, c?.after)}`);
   return parts.join("; ") || "noted";
@@ -289,6 +289,18 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     ...(o.manual_locked_fields.length > 0 ? [`Edited by staff: ${o.manual_locked_fields.join(", ").replace(/_/g, " ")}`] : []),
     ...(o.status === "cancelled" ? [`Cancelled ${when(o.cancelled_at) ?? ""}${o.cancel_reason ? ` — ${clip(o.cancel_reason, 80)}` : ""}`.trim()] : []),
   ];
+  // Values taken from the customer's earlier orders rather than from this conversation, so staff can check them.
+  const from = (ref: unknown) => displayRef(String(ref));
+  const inferred = events
+    .map((e) => e.changes?.inferred?.after as { items?: string[]; delivery_address?: string; unresolved?: string[] } | undefined)
+    .filter((i): i is NonNullable<typeof i> => Boolean(i));
+  const filled = [
+    ...(inferred.some((i) => i.items?.length) ? [`products from ${[...new Set(inferred.flatMap((i) => i.items ?? []))].map(from).join(", ")}`] : []),
+    ...(inferred.some((i) => i.delivery_address) ? [`address from ${[...new Set(inferred.flatMap((i) => (i.delivery_address ? [i.delivery_address] : [])))].map(from).join(", ")}`] : []),
+  ];
+  if (filled.length > 0) lines.push(`ℹ️ From earlier orders: ${filled.join("; ")} — not stated in this chat`);
+  const unresolved = [...new Set(inferred.flatMap((i) => i.unresolved ?? []))];
+  if (unresolved.length > 0) lines.push(`ℹ️ Not resolved from history: ${unresolved.map((u) => clip(u, 60)).join("; ")}`);
   const recent = events.slice(0, 5).map((e) => `• ${when(e.created_at) ?? ""} ${e.actor_kind}: ${clip(e.kind.replace(/_/g, " "), 24)} — ${clip(changeText(e.changes), 90)}`);
   if (recent.length > 0) lines.push("Recent changes:", ...recent);
   return lines.join("\n");

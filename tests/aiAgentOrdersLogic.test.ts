@@ -286,30 +286,45 @@ describe("the morning report", () => {
   const stale = order({ id: "s1", ref_code: "O-STALE", status: "possible", last_message_at: "2026-10-10T14:00:00Z", first_message_at: "2026-10-10T14:00:00Z" });
   const input = { businessLabel: "Dog Food", timezone: "America/St_Lucia", now: NOW, trigger: "scheduled" as const };
 
-  test("groups Confirmed and Needs Attention, numbers the orders, shows the one thing to do", () => {
+  test("groups Confirmed and Open orders, numbers them, and prints only what is known", () => {
     const r = buildOrderSummary({ ...input, orders: [confirmed, carried, needs] });
     assert.equal(r.confirmed, 2);
     assert.equal(r.attention, 1);
     assert.equal(r.carriedForward, 1);
-    assert.match(r.text, /^📋 \*DAILY ORDERS — 27 OCT\*\n3 orders · 2 confirmed · 1 to review/);
-    assert.match(r.text, /✅ \*CONFIRMED\* \(2\)/);
-    assert.match(r.text, /⚠️ \*NEEDS ATTENTION\* \(1\)/);
+    assert.match(r.text, /^📋 \*DAILY ORDERS — 27 OCT\*\n3 orders · 2 confirmed · 1 open/);
+    assert.match(r.text, /✅ \*CONFIRMED\*\n/);
+    assert.match(r.text, /📦 \*OPEN ORDERS\*\n/);
     assert.match(r.text, /\*3\. Priya · #NEED1\*/);
-    assert.match(r.text, /\*[12]\. Marcus · #CARRY\*\nPhone: \+1 758-555-0102|\*[12]\. Marcus · #CARRY\*\nPhone: 555-0102/);
+    assert.match(r.text, /\*[12]\. Marcus · #CARRY\*\n\+1 758-555-0102|\*[12]\. Marcus · #CARRY\*\n555-0102/);
     assert.match(r.text, /2 × Monello Chicken 15kg/);
-    // Priya: only the most actionable warning, no technical statuses, no empty placeholders.
+    // Priya lacks an address and a phone: nothing is said about either.
     const priya = r.text.slice(r.text.indexOf("*3. Priya"));
-    assert.match(priya, /⚠️ Needs delivery address/);
-    assert.doesNotMatch(r.text, /Status:|Missing:|phone not verified|carried forward|Unnamed|none|None/i);
-    assert.equal((priya.match(/⚠️/g) ?? []).length, 1);
+    assert.doesNotMatch(r.text, /Needs |Status:|Missing:|Phone:|phone not verified|carried forward|Unnamed|none|None|⚠️|quantity needed/i);
+    assert.equal((priya.match(/\n/g) ?? []).length, 2, "name line, one product line, delivery");
   });
-  test("with nothing confirmed there are no section headings; with nothing to review there is no review section", () => {
-    const onlyReview = buildOrderSummary({ ...input, orders: [needs] });
-    assert.doesNotMatch(onlyReview.text, /CONFIRMED|NEEDS ATTENTION/);
-    assert.match(onlyReview.text, /1 order · 0 confirmed · 1 to review/);
+  test("an unknown quantity shows only the product name", () => {
+    const o = order({ ref_code: "O-NOQTY", status: "possible", items: [{ product: "Pool Salt", quantity: null, variant: null, size: null }, { product: "Bandit", quantity: "2", variant: null, size: "15kg" }] });
+    const text = buildOrderSummary({ ...input, orders: [o] }).text;
+    assert.match(text, /\nPool Salt\n2 × Bandit 15kg\n/);
+    assert.doesNotMatch(text, /\?|needed/);
+  });
+  test("headings appear only for sections that have orders", () => {
+    const onlyOpen = buildOrderSummary({ ...input, orders: [needs] });
+    assert.doesNotMatch(onlyOpen.text, /CONFIRMED/);
+    assert.match(onlyOpen.text, /1 order · 0 confirmed · 1 open/);
     const onlyConfirmed = buildOrderSummary({ ...input, orders: [confirmed] });
-    assert.match(onlyConfirmed.text, /CONFIRMED\* \(1\)/);
-    assert.doesNotMatch(onlyConfirmed.text, /NEEDS ATTENTION|⚠️/);
+    assert.match(onlyConfirmed.text, /✅ \*CONFIRMED\*/);
+    assert.doesNotMatch(onlyConfirmed.text, /OPEN ORDERS|⚠️/);
+  });
+  test("only warnings that prevent a wrong fulfilment appear: a change after confirmation, a contradicted staff value, a possible cancellation", () => {
+    const changed = order({ id: "w1", ref_code: "O-CHNG1", status: "awaiting_confirmation", attention: "changed_after_confirmation" });
+    const contradicted = order({ id: "w2", ref_code: "O-CNFL2", status: "confirmed", field_conflicts: { items: { proposed: [], current: [], at: "2026-10-26T10:00:00Z" } } });
+    const yes = order({ id: "w3", ref_code: "O-YES33", status: "awaiting_confirmation", attention: "customer_replied_yes", missing_fields: ["quantity"] });
+    const text = buildOrderSummary({ ...input, orders: [changed, contradicted, yes] }).text;
+    assert.match(text, /O-?CHNG1|#CHNG1\*[\s\S]*⚠️ Changed after confirmation — re-confirm/);
+    assert.match(text, /✅ \*CONFIRMED\*[\s\S]*#CNFL2\*[\s\S]*⚠️ Customer asked for a change — check before fulfilling/);
+    assert.equal(text.slice(text.indexOf("#YES33")).includes("⚠️"), false);
+    assert.doesNotMatch(text, /staff set|proposed/);
   });
   test("a stale unconfirmed enquiry drops out and is counted; a confirmed order never does", () => {
     const r = buildOrderSummary({ ...input, orders: [stale, order({ ...confirmed, first_message_at: "2026-10-01T00:00:00Z", last_message_at: "2026-10-01T00:00:00Z" })] });

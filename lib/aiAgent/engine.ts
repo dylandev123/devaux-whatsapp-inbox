@@ -139,6 +139,11 @@ export interface OrderItem {
   /** Daily order tracking only (lib/aiAgent/orders.ts). Present only when the customer stated it. */
   variant?: string | null;
   size?: string | null;
+  /**
+   * Daily order tracking only, from the model: the reference of an earlier verified order whose product this line names
+   * (a generic "dog food" → that customer's usual bag). Unvalidated; the server accepts it only against the customer's own history.
+   */
+  from_history?: string | null;
 }
 
 export interface OrderRequestDraft {
@@ -684,9 +689,15 @@ function parseItems(value: unknown): OrderItem[] {
       quantity: cleanText(typeof item?.quantity === "number" ? String(item.quantity) : item?.quantity, 50),
       variant: cleanText(item?.variant, 100),
       size: cleanText(item?.size, 50),
+      from_history: cleanText(item?.from_history, 40),
     }))
     .filter((item) => item.product)
-    .map(({ variant, size, ...item }) => ({ ...item, ...(variant ? { variant } : {}), ...(size ? { size } : {}) }))
+    .map(({ variant, size, from_history, ...item }) => ({
+      ...item,
+      ...(variant ? { variant } : {}),
+      ...(size ? { size } : {}),
+      ...(from_history ? { from_history } : {}),
+    }))
     .slice(0, 20);
 }
 

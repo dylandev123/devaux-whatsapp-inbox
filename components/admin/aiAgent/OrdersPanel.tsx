@@ -107,6 +107,17 @@ function EditForm({ order, onSave, onCancel, busy }: { order: OrderView; busy: b
   );
 }
 
+/** "products from #K3PD7; address from #K3PD7; not resolved: items: no verified earlier order". */
+function inferredText(value: unknown): string {
+  const v = (value ?? {}) as { items?: string[]; delivery_address?: string; unresolved?: string[] };
+  const parts = [
+    ...(v.items?.length ? [`products from ${v.items.map(displayRef).join(", ")}`] : []),
+    ...(v.delivery_address ? [`address from ${displayRef(v.delivery_address)}`] : []),
+    ...(v.unresolved?.length ? [`not resolved: ${v.unresolved.join("; ")}`] : []),
+  ];
+  return parts.join("; ") || "—";
+}
+
 function History({ businessSlug, orderId }: { businessSlug: string; orderId: string }) {
   const [events, setEvents] = useState<OrderEventView[] | null>(null);
   useEffect(() => {
@@ -129,11 +140,17 @@ function History({ businessSlug, orderId }: { businessSlug: string; orderId: str
             {(e.actor_kind === "admin" || e.actor_kind === "staff") && e.actor_id ? ` (${e.actor_id.slice(0, 8)})` : ""} · {formatWhen(e.created_at)}
             {e.whatsapp_message_ids.length > 0 ? ` · ${e.whatsapp_message_ids.length} message${e.whatsapp_message_ids.length === 1 ? "" : "s"}` : ""}
           </span>
-          {Object.entries(e.changes).map(([field, c]) => (
-            <p key={field} className="mt-0.5 text-zinc-600">
-              {field.replace(/_/g, " ")}: {typeof c?.before === "object" ? "…" : String(c?.before ?? "—")} → {typeof c?.after === "object" ? "updated" : String(c?.after ?? "—")}
-            </p>
-          ))}
+          {Object.entries(e.changes).map(([field, c]) =>
+            field === "inferred" ? (
+              <p key={field} className="mt-0.5 text-zinc-600">
+                From earlier orders (not said in this chat): {inferredText(c?.after)}
+              </p>
+            ) : (
+              <p key={field} className="mt-0.5 text-zinc-600">
+                {field.replace(/_/g, " ")}: {typeof c?.before === "object" ? "…" : String(c?.before ?? "—")} → {typeof c?.after === "object" ? "updated" : String(c?.after ?? "—")}
+              </p>
+            )
+          )}
         </li>
       ))}
     </ul>

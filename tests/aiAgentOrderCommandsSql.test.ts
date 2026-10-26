@@ -274,7 +274,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     await makeOrder(MARCUS, ORDER_TEXT);
     const search = reply(await groupSays("!order jane"));
     assert.match(search, /1 active order for "jane"/);
-    assert.match(search, /\*Jane Doe · #[A-Z2-9]{5}\*\nPhone: 286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate\n⚠️ Needs confirmation/);
+    assert.match(search, /\*Jane Doe · #[A-Z2-9]{5}\*\nOpen\n286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate$/m);
     assert.doesNotMatch(search, /5550102/);
     assert.match(reply(await groupSays("!order 555-0102")), /1 active order/);
     assert.match(reply(await groupSays("!order nobody")), /No active order matches "nobody"/);
@@ -477,7 +477,8 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.equal(after.field_conflicts.items.current[0].quantity, "3");
     assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "locked_field_conflict").length, 1);
     const report = reply(await groupSays("!update"));
-    assert.match(report, /⚠️ Customer now says products: 5 × Monello Chicken 25kg \(staff set 3 × Monello Chicken 25kg\) — check/);
+    assert.match(report, /⚠️ Customer asked for a change — check before fulfilling/);
+    assert.doesNotMatch(report, /staff set|5 × Monello/, "the report carries no technical conflict explanation");
     assert.match(reply(await groupSays(`!moreinfo ${ref(o)}`)), /⚠️ Customer now says products: 5 × Monello Chicken 25kg \(staff set 3 ×/);
     // The same stale cumulative draft on an unrelated later message adds nothing.
     await customerSays(JANE, "thanks");
@@ -499,7 +500,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "5", size: "25kg" }] }), { order_target: o.ref_code });
     await customerSays(JANE, "make it 5 bags of Monello Chicken 25kg");
     await groupSays(`!update ${ref(o)} confirmed`);
-    assert.match(reply(await groupSays("!update")), /Customer now says products/, "a confirmed order with an open discrepancy still needs action");
+    assert.match(reply(await groupSays("!update")), /✅ \*CONFIRMED\*[\s\S]*Customer asked for a change/, "a confirmed order with an open discrepancy still shows the warning");
     // Staff keep their value.
     let [cur] = await allOrders();
     const kept = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "keep", expectedVersion: cur.version });
@@ -507,7 +508,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     [cur] = await allOrders();
     assert.deepEqual(cur.field_conflicts, {});
     assert.equal(cur.items[0].quantity, "3");
-    assert.doesNotMatch(reply(await groupSays("!update")), /Customer now says/);
+    assert.doesNotMatch(reply(await groupSays("!update")), /Customer asked for a change/);
     // A second "keep" has nothing to settle.
     const again = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "keep", expectedVersion: cur.version });
     assert.equal(again.ok, false);
@@ -549,8 +550,8 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     const o = await makeOrder(MARCUS, "some Monello please, deliver", draft({ items: [{ product: "Monello", quantity: null }], delivery_address: "Rodney Bay" }));
     assert.equal(o.items[0].quantity, null);
     const text = reply(await groupSays("!update"));
-    assert.match(text, /Monello — quantity needed/);
-    assert.doesNotMatch(text, /\?/);
+    assert.match(text, /\nMonello\n/, "an unknown quantity is just the product name");
+    assert.doesNotMatch(text, /\?|quantity needed|Needs quantity/);
     assert.match(reply(await groupSays(`!moreinfo ${ref(o)}`)), /• Monello — quantity needed/);
     assert.equal((await allOrders())[0].items[0].quantity, null);
   });
@@ -564,7 +565,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     const res = await groupSays("!update");
     assert.equal(res.outbox.length, 1);
     const text = res.outbox[0].body;
-    assert.match(text, /^📋 \*DAILY ORDERS — \d{1,2} [A-Z]{3}\*\n2 orders · 0 confirmed · 2 to review\n\n\*1\. Jane Doe · #[A-Z2-9]{5}\*\nPhone: 286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate\n⚠️ Needs confirmation\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\*\n2 × Monello\nDelivery\n⚠️ Needs delivery address$/);
+    assert.match(text, /^📋 \*DAILY ORDERS — \d{1,2} [A-Z]{3}\*\n2 orders · 0 confirmed · 2 open\n\n📦 \*OPEN ORDERS\*\n\*1\. Jane Doe · #[A-Z2-9]{5}\*\n286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\*\n2 × Monello\nDelivery$/);
     assert.equal(await customerBound(), 0);
   });
 

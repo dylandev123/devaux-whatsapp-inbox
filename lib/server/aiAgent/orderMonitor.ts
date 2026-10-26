@@ -19,7 +19,8 @@ import { loadCustomerDisplayName, loadRecentMessages } from "@/lib/server/aiAgen
 import { agentDb, audit } from "@/lib/server/aiAgent/db";
 import { loadIdentity } from "@/lib/server/aiAgent/identity";
 import { proposeOrderUpdate } from "@/lib/server/aiAgent/model";
-import { flagOrderFromStaff, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
+import { historyForModel, type HistoryOrder } from "@/lib/aiAgent/orderHistory";
+import { flagOrderFromStaff, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
 
 export interface MonitorResult {
   /** Reason codes for the event. Never empty. */
@@ -88,6 +89,8 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
     let proposal: Parameters<typeof trackOrders>[0]["proposal"] = null;
     let intent: string | null = null;
     const recent = await loadRecentMessages(businessSlug, chatId, a.messageIds);
+    // The customer's earlier orders: shown to the model in compact form and used by the server to resolve "same as last time".
+    const history: HistoryOrder[] = plan.action === "analyse" ? await loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => []) : [];
     if (plan.action === "analyse") {
       if (monitorBudgetExceeded(await callsLastHour(businessSlug, chatId))) {
         await audit(businessSlug, "system", null, "orders.monitor_rate_limited", { type: "chat", id: chatId }, {});
@@ -99,6 +102,7 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
         businessSlug,
         customerName,
         openOrders: ordersForModel(open),
+        orderHistory: historyForModel(history) ?? undefined,
         transcript: recent,
         newMessages: a.transcript,
         author: "customer",
@@ -121,6 +125,8 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
       segments: a.segments,
       // Grounding: the customer's own words only (this turn, and their earlier messages in the stored history).
       customerWords: [...a.segments, ...recent.filter((m) => m.who === "Customer").map((m) => m.text)],
+      chatIds: identity.chatIds,
+      history,
       messageIds: a.messageIds,
       firstAt: a.firstAt,
       lastAt: a.lastAt,

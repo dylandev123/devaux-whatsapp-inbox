@@ -20,7 +20,7 @@ import {
   OrderRequestDraft,
   outboxAllowed,
 } from "@/lib/aiAgent/engine";
-import { groundOrderDraft } from "@/lib/aiAgent/escalationUpdates";
+import { groundOrderDraft, quantityStated } from "@/lib/aiAgent/escalationUpdates";
 import { SenderAuthorization } from "@/lib/aiAgent/identity";
 import {
   moreInfoReply,
@@ -31,7 +31,18 @@ import {
   searchOrders,
   searchReply,
 } from "@/lib/aiAgent/orderCommands";
-import { anchorRequestedFor, guardRemovedItems, messageTimeFor, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
+import {
+  acceptModelHistoryLine,
+  cueActive,
+  detectHistoryCue,
+  type HistoryFill,
+  type HistoryOrder,
+  HISTORY_LOAD_LIMIT,
+  reliableHistory,
+  resolveFromHistory,
+  upgradeGenericLines,
+} from "@/lib/aiAgent/orderHistory";
+import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
 import {
   buildOrderSummary,
   type Coverage,
@@ -42,6 +53,7 @@ import {
   EditableOrderField,
   FieldChange,
   type FieldConflicts,
+  fulfilmentMethod,
   groundDeliveryPreference,
   isComplete,
   isOpenStatus,
@@ -57,7 +69,9 @@ import {
   pickCustomerName,
   planOrderUpdate,
   resolveOrderTarget,
+  sameLineProduct,
   scheduleState,
+  toLine,
   TrackedOrder,
   turnDrafts,
   turnIsConfirmation,
@@ -124,6 +138,26 @@ export async function loadOutstandingOrders(businessSlug: string): Promise<Track
     .limit(500);
   if (error) throw new Error(error.message);
   return (data ?? []) as TrackedOrder[];
+}
+
+/**
+ * The customer's own earlier orders, newest first, bounded: the business's rows for this chat, its known @lid/phone chats
+ * and (only when verified) this phone number. The business filter is the isolation boundary; a customer is never matched
+ * by name, and an unverified @lid only ever matches its own chat.
+ */
+export async function loadCustomerHistory(businessSlug: string, chatIds: string[], phone: string | null): Promise<HistoryOrder[]> {
+  const columns = "id, ref_code, status, items, fulfilment_method, delivery_address, manual_locked_fields, last_message_at";
+  const base = () =>
+    agentDb().from("ai_agent_orders").select(columns).eq("business_slug", businessSlug).neq("status", "cancelled").order("last_message_at", { ascending: false }).limit(HISTORY_LOAD_LIMIT);
+  const [byChat, byPhone] = await Promise.all([
+    chatIds.length > 0 ? base().in("chat_id", chatIds.slice(0, 10)) : Promise.resolve({ data: [], error: null }),
+    phone ? base().eq("contact_number", phone) : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (byChat.error) throw new Error(byChat.error.message);
+  if (byPhone.error) throw new Error(byPhone.error.message);
+  const rows = new Map<string, HistoryOrder>();
+  for (const r of [...(byChat.data ?? []), ...(byPhone.data ?? [])] as unknown as HistoryOrder[]) rows.set(r.id, r);
+  return [...rows.values()].sort((a, b) => Date.parse(b.last_message_at) - Date.parse(a.last_message_at)).slice(0, HISTORY_LOAD_LIMIT);
 }
 
 /** What the model sees of the customer's open orders. */
@@ -444,6 +478,12 @@ export interface TrackArgs {
   dedupeBase: string;
   /** False when replaying history (backfill): a "yes" then is not an answer to anything staff just wrote, so it records nothing. Default true. */
   allowConfirmation?: boolean;
+  /** Every chat id known to be this customer (ChatIdentity.chatIds), for the order memory. Defaults to this chat. */
+  chatIds?: string[];
+  /** The customer's earlier orders (loadCustomerHistory), when the caller already loaded them for the model. null/undefined = load only if the customer points back at one. */
+  history?: HistoryOrder[] | null;
+  /** False when replaying (backfill): history from "now" must not leak into a past turn. Default true. */
+  useHistory?: boolean;
   now?: Date;
 }
 
@@ -529,7 +569,24 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   }
 
   // 2. Orders the customer is building. A question about products is not an order unless one is already open.
-  const withItems = drafts.filter((d) => d.draft.items.length > 0 && (args.intent === "order" || open.length > 0));
+  let withItems = drafts.filter((d) => d.draft.items.length > 0 && (args.intent === "order" || open.length > 0));
+
+  // Customer order memory: "same as last time", "the usual", "same location" point at the customer's own earlier orders.
+  // A question ("is it the usual price?") never edits an order: the model must call the turn an order, or say nothing and ask nothing.
+  const asks = segments.some((t) => t.includes("?"));
+  const intentOk = args.intent === "order" || (args.intent == null && !asks);
+  const cue = args.useHistory === false || !intentOk ? detectHistoryCue([]) : detectHistoryCue(segments);
+  const pointsBack = cueActive(cue);
+  let history: HistoryOrder[] = args.useHistory === false ? [] : (args.history ?? []);
+  if (args.useHistory !== false && args.history === undefined && pointsBack) {
+    history = await loadCustomerHistory(businessSlug, args.chatIds ?? [chatId], args.phone).catch(() => []);
+  }
+
+  // A turn that only points back ("same as last time") or only adjusts a quantity ("another bag") has no draft of its own:
+  // it still updates the order, from the customer's records and words.
+  if (withItems.length === 0 && !segments.some(isWholeOrderCancellation) && (pointsBack || (!asks && quantityAdjustments(segments).length > 0 && open.length > 0))) {
+    withItems = [{ target: args.proposal?.order_target ?? null, draft: { items: [], delivery_address: null, delivery_preference: null, notes: null } }];
+  }
   if (withItems.length === 0) {
     // 3. No products this turn: a cancellation can still arrive ("cancel my order").
     if (!segments.some((t) => /\bcancel\w*\b/i.test(t))) return result;
@@ -557,24 +614,99 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   for (const [index, { target, draft }] of withItems.entries()) {
     const resolved = resolveOrderTarget(open, target, draft);
     const existing = resolved.kind === "merge" ? resolved.order : null;
+    // The customer's records, used only where their words leave a gap and only from reliable orders.
+    const pool = reliableHistory(history, existing ? [existing.id] : []);
+    // A history line the model nominated for a generic phrase is judged against those records, not the customer's words. One that
+    // fails the check is just what the model said: it stays only if the customer's own words ground it.
+    const inferredLines: OrderItem[] = [];
+    const nominatedRefs: string[] = [];
+    const plainItems: OrderItem[] = [];
+    for (const item of draft.items) {
+      if (!item.from_history) {
+        plainItems.push(item);
+        continue;
+      }
+      const { from_history: _unused, ...rest } = item;
+      void _unused;
+      const ok = acceptModelHistoryLine(item, pool);
+      const held = [...(existing?.items ?? []), ...inferredLines.map(toLine)];
+      if (!ok) plainItems.push(rest);
+      else if (!held.some((h) => sameLineProduct(h, ok.line))) {
+        const quantity = item.quantity && quantityStated(item.quantity, args.customerWords) ? item.quantity : null;
+        inferredLines.push({ product: ok.line.product, quantity, ...(ok.line.variant ? { variant: ok.line.variant } : {}), ...(ok.line.size ? { size: ok.line.size } : {}) });
+        nominatedRefs.push(ok.ref);
+      }
+    }
     // The model may only restate what the customer wrote: ground against the order it targets, not another.
-    const grounded = groundOrderDraft(draft, existing ? asDraft(existing) : null, args.customerWords);
-    if (!grounded || (grounded.items.length === 0 && !existing)) continue;
+    const grounded = groundOrderDraft({ ...draft, items: plainItems }, existing ? asDraft(existing) : null, args.customerWords);
+    if (!grounded) continue;
     // The customer's own delivery/collection words win, so "I'll collect instead" can replace "delivery".
     grounded.delivery_preference = groundDeliveryPreference(draft.delivery_preference, args.customerWords) ?? grounded.delivery_preference;
     // A whole-order cancellation in the same breath as a (re-stated) order must not create a new one.
     if (!existing && segments.some(isWholeOrderCancellation)) continue;
+
+    const upgraded = upgradeGenericLines(grounded.items.map(toLine), pool, existing?.items ?? []);
+    const upgradedRefs = upgraded.sources.map((x) => x.ref);
+    grounded.items = [
+      ...upgraded.lines
+        .map((l) => ({ product: l.product, quantity: l.quantity, ...(l.variant ? { variant: l.variant } : {}), ...(l.size ? { size: l.size } : {}) }))
+        .filter((l) => !inferredLines.some((i) => sameLineProduct(toLine(i), toLine(l)))),
+      ...inferredLines,
+    ];
     // Plainly stated quantities and delivery/collection are recorded even when the model left them out.
     const refined = refineOrderDraft(grounded, segments, args.customerWords);
+
+    const fillFor = (cur: TrackedOrder | null): HistoryFill =>
+      pointsBack
+        ? resolveFromHistory(history, cue, segments, {
+            current: cur ? { id: cur.id, items: cur.items, delivery_address: cur.delivery_address, fulfilment_method: cur.fulfilment_method } : null,
+            draftItems: refined.items.map(toLine),
+            draftAddress: refined.delivery_address,
+          })
+        : { items: [], address: null, setDelivery: false, clearAddress: false, sources: {}, unresolved: [] };
+    const planned = fillFor(existing);
+    const hasContent = refined.items.length > 0 || planned.items.length > 0 || Boolean(existing);
+    const noteOnly = !hasContent && cue.repeat !== null && planned.unresolved.length > 0;
+    // Nothing the customer said or their records can answer, and nothing to attach it to: no order is invented.
+    if (!hasContent && !noteOnly) {
+      if (pointsBack) result.reasons.push("order_history_unresolved");
+      continue;
+    }
 
     await write(`${args.dedupeBase}:${index}`, existing, (cur) => {
       // "Tomorrow" counts from when the customer WROTE it, in the business's timezone: a later retry or backfill cannot move it.
       const when = refined.requested_for ? anchorRequestedFor(refined.requested_for, cur?.requested_for, messageTimeFor(refined.requested_for, segments, args.segmentTimes, args.lastAt), tz) : null;
+      // A turn without lines of its own starts from what the order already says.
+      const baseDraft: OrderRequestDraft = refined.items.length === 0 && cur ? { ...refined, items: asDraft(cur).items } : refined;
+      // "Another bag", "2 more", "make that 3": numbers the words give but the model's draft could not be grounded on.
+      const adjusted = applyQuantityAdjustments(cur?.items ?? [], baseDraft, segments);
       // A product the model left out is dropped only if the customer withdrew it ("just the Monello bags").
-      const removal = cur ? guardRemovedItems<OrderItem>(cur.items, refined.items, segments) : null;
+      const removal = cur ? guardRemovedItems<OrderItem>(cur.items, adjusted.items, segments) : null;
       if (removal && removal.restored.length > 0 && !result.reasons.includes("order_item_removal_unconfirmed")) result.reasons.push("order_item_removal_unconfirmed");
-      const forMerge: OrderRequestDraft = { ...refined, ...(when ? { requested_for: when } : {}), ...(removal ? { items: removal.items } : {}) };
+      const fill = fillFor(cur);
+      const kept = removal ? removal.items : adjusted.items;
+      const fillItems: OrderItem[] = fill.items
+        .filter((l) => !kept.some((i) => sameLineProduct(toLine(i), l)) && !(cur?.items ?? []).some((i) => sameLineProduct(i, l)))
+        .map((l) => ({ product: l.product, quantity: l.quantity, ...(l.variant ? { variant: l.variant } : {}), ...(l.size ? { size: l.size } : {}) }));
+      const historyAddress = fill.address && !adjusted.delivery_address && !cur?.delivery_address ? fill.address : null;
+      const noMethod = !fulfilmentMethod(adjusted.delivery_preference) && !cur?.fulfilment_method;
+      const forMerge: OrderRequestDraft = {
+        ...adjusted,
+        ...(when ? { requested_for: when } : {}),
+        items: [...kept, ...fillItems],
+        ...(historyAddress ? { delivery_address: historyAddress } : {}),
+        ...(historyAddress && fill.setDelivery && noMethod ? { delivery_preference: "delivery" } : {}),
+        ...(noteOnly && !cur ? { notes: segments.join(" ").replace(/\s+/g, " ").trim().slice(0, 160) } : {}),
+      };
       const merged = mergeDraft(cur ? fieldsOf(cur) : null, forMerge, cur?.manual_locked_fields ?? [], name, (field, proposed) => statedThisTurn(field, proposed, segments, cur?.items ?? []));
+      // "Deliver somewhere else": the address on the order is no longer right; the customer will give the new one.
+      if (cur && fill.clearAddress && merged.fields.delivery_address) {
+        if (cur.manual_locked_fields.includes("delivery_address")) merged.conflicts.push({ field: "delivery_address", before: cur.delivery_address, after: null });
+        else {
+          merged.changes.push({ field: "delivery_address", before: merged.fields.delivery_address, after: null });
+          merged.fields.delivery_address = null;
+        }
+      }
       const fields = merged.fields;
       const changed = cur ? merged.changes.length > 0 : true;
       // A customer contradicting a staff-locked field: the staff value stays, the proposal is recorded for a person.
@@ -582,18 +714,33 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       for (const c of merged.conflicts) conflicts[c.field] = { proposed: c.after, current: c.before, at: args.lastAt };
       const conflictsChanged = merged.conflicts.some((c) => JSON.stringify(cur?.field_conflicts?.[c.field]?.proposed ?? null) !== JSON.stringify(c.after));
       const plan = planOrderUpdate({ existing: cur, fields, contentChanged: changed, customerTexts: segments, outboundSinceAwaiting: false, now });
-      const attention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : plan.attention;
-      if (cur && plan.event === "no_change" && !changed && !conflictsChanged) return null;
+      // Pointing at an earlier order that could not be matched safely is for a person to look at; never guessed.
+      const unresolvedFlag = fill.unresolved.length > 0 && !plan.attention ? "history_unresolved" : null;
+      const attention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : (unresolvedFlag ?? plan.attention);
+      const flagged = Boolean(cur) && unresolvedFlag !== null;
+      if (cur && plan.event === "no_change" && !changed && !conflictsChanged && !flagged) return null;
       const finalPlan = { ...plan, attention };
+      const itemsChanged = merged.changes.some((c) => c.field === "items");
+      const inferredItems = [...(fillItems.length > 0 && fill.sources.items ? [fill.sources.items] : []), ...nominatedRefs, ...upgradedRefs];
+      const inferred = {
+        ...(itemsChanged && inferredItems.length > 0 ? { items: [...new Set(inferredItems)] } : {}),
+        ...(historyAddress && fill.sources.delivery_address && merged.changes.some((c) => c.field === "delivery_address") ? { delivery_address: fill.sources.delivery_address } : {}),
+        ...(fill.unresolved.length > 0 ? { unresolved: fill.unresolved } : {}),
+      };
+      if (Object.keys(inferred).length > 0) {
+        const code = fill.unresolved.length > 0 ? "order_history_unresolved" : "order_history_used";
+        if (!result.reasons.includes(code)) result.reasons.push(code);
+      }
       return {
         row: rowFrom(cur, fields, finalPlan, { ...ctx, conflicts }),
-        event: cur && !changed && conflictsChanged && finalPlan.event === "no_change" ? "locked_field_conflict" : finalPlan.event,
+        event: cur && !changed && conflictsChanged && finalPlan.event === "no_change" ? "locked_field_conflict" : cur && !changed && flagged && finalPlan.event === "no_change" ? "attention_flagged" : finalPlan.event,
         actorKind: finalPlan.event === "customer_cancelled" ? "customer" : "ai",
         changes: {
           ...diff(merged.changes),
           ...(conflictsChanged ? { field_conflicts: { before: cur?.field_conflicts ?? {}, after: conflicts } } : {}),
           ...(removal && removal.removed.length > 0 && merged.changes.some((c) => c.field === "items") ? { removed_items: { before: removal.removed.map((i) => i.product), after: null } } : {}),
           ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}),
+          ...(Object.keys(inferred).length > 0 ? { inferred: { before: null, after: inferred } } : {}),
         },
       };
     });
@@ -1360,7 +1507,7 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
   const order = found.order;
 
   if (command.kind === "info") {
-    const events = (await listOrderEvents(slug, order.id)).slice(0, 5) as never[];
+    const events = (await listOrderEvents(slug, order.id)) as never[];
     await audit(slug, "staff", senderAuth.senderId, "orders.lookup", { type: "order", id: order.id }, { command: "info" });
     return reply(moreInfoReply({ order, name: names[order.id], events, timezone: tz }), "cmd_info");
   }

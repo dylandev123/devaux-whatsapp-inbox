@@ -83,6 +83,85 @@ export function fillStatedQuantities(draft: OrderRequestDraft, customerTexts: st
   return { ...draft, items };
 }
 
+// ── "Another bag", "2 more", "make that 3" ───────────────────────────────────
+
+const COUNT_WORD = String.raw`\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten`;
+const INCREMENT = new RegExp(
+  String.raw`\b(?:(another|an extra|an additional|a further)|(${COUNT_WORD})\s+(?:more|extra|additional))\b\s*(?:x\s*)?(?:(?:${UNITS})\b)?(?:\s+of)?((?:(?!\b(?:and|plus|with|then|also|but|for|to|at|on|please|too)\b)[^,.;!?\n])*)`,
+  "gi"
+);
+const SET_TO = new RegExp(String.raw`\bmake\s+(?:that|it|them)(?:\s+be)?\s+(${COUNT_WORD})\b`, "gi");
+const FILLER = new Set(["one", "ones", "of", "as", "well", "thanks", "thank", "you"]);
+
+const countOf = (word: string): number => {
+  const w = word.toLowerCase();
+  return w in QUANTITY_WORDS ? QUANTITY_WORDS[w].n : Number(w);
+};
+
+export interface QuantityAdjustment {
+  /** "more": add `n` to the current quantity ("another bag", "2 more"). "set": the new quantity ("make that 3"). */
+  kind: "more" | "set";
+  n: number;
+  /** The product words that followed ("of Bandit"), normalised. */
+  tail: string[];
+}
+
+/** Every "another bag", "2 more bags of X" and "make that 3" in the customer's words, in order. */
+export function quantityAdjustments(texts: string[]): QuantityAdjustment[] {
+  const out: QuantityAdjustment[] = [];
+  for (const text of texts) {
+    for (const m of text.matchAll(INCREMENT)) {
+      const n = m[1] ? 1 : countOf(m[2]);
+      if (!Number.isFinite(n) || n < 1) continue;
+      out.push({ kind: "more", n, tail: normalizeText(m[3] ?? "").split(" ").filter((w) => w && !FILLER.has(w)) });
+    }
+    for (const m of text.matchAll(SET_TO)) {
+      const n = countOf(m[1]);
+      if (Number.isFinite(n) && n >= 1) out.push({ kind: "set", n, tail: [] });
+    }
+  }
+  return out;
+}
+
+/**
+ * Deterministic quantity changes the model's draft cannot be trusted with, because the number is not written in the
+ * customer's words ("another bag" has no digit, so grounding would throw the model's "2" away). Applied after
+ * grounding, to the lines the order already holds:
+ *   - "another bag", "2 more bags", "one more": the current quantity plus that many, for the one line it clearly means
+ *     (named, or the only line); nothing when the line has no numeric quantity or the target is unclear.
+ *   - "another bag of Bandit" for a product the order does not hold yet: that line, quantity 1.
+ *   - "make that 3": only on an order with a single line (otherwise the model's grounded reading stands).
+ */
+export function applyQuantityAdjustments(prior: OrderItem[], draft: OrderRequestDraft, turnTexts: string[]): OrderRequestDraft {
+  const adjustments = quantityAdjustments(turnTexts);
+  if (adjustments.length === 0) return draft;
+  const items = draft.items.map((i) => ({ ...i }));
+  const quantities = new Map(prior.map((i) => [productKey(i.product), i.quantity]));
+  const touch = (line: OrderItem, quantity: number) => {
+    const key = productKey(line.product);
+    const at = items.findIndex((i) => productKey(i.product) === key);
+    if (at >= 0) items[at] = { ...items[at], quantity: String(quantity) };
+    else items.push({ ...line, quantity: String(quantity) });
+    quantities.set(key, String(quantity));
+  };
+  for (const a of adjustments) {
+    const named = a.tail.length > 0 ? prior.filter((i) => mentions(i, a.tail)) : [];
+    const target = named.length === 1 ? named[0] : a.tail.length === 0 && prior.length === 1 ? prior[0] : null;
+    if (target) {
+      const current = quantities.get(productKey(target.product));
+      if (a.kind === "set") touch(target, a.n);
+      else if (current && /^\d+$/.test(current.trim())) touch(target, Number(current) + a.n);
+      continue;
+    }
+    if (a.kind === "more" && a.tail.length > 0) {
+      // Not on the order yet: the model's line for it, with the quantity the words give.
+      const fresh = draft.items.filter((i) => !quantities.has(productKey(i.product)) && mentions(i, a.tail));
+      if (fresh.length === 1 && !fresh[0].quantity) touch(fresh[0], a.n);
+    }
+  }
+  return { ...draft, items };
+}
+
 // ── Delivery or collection ───────────────────────────────────────────────────
 
 const DELIVERY =

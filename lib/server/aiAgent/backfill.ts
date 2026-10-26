@@ -219,6 +219,8 @@ async function backfillChat(settings: AgentSettings, run: BackfillRun, chatId: s
       lastAt: customer[customer.length - 1].at,
       dedupeBase: key,
       allowConfirmation: false,
+      // Replaying a past window: today's records must not answer "same as last time" for a message from before them.
+      useHistory: false,
       now: new Date(run.window_end),
     });
     out.touched += tracked.applied;

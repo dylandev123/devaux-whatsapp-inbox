@@ -188,14 +188,15 @@ describe("selecting exactly one order", () => {
 });
 
 describe("one actionable warning", () => {
-  test("flags a person must act on come first, then the first missing required detail, then confirmation", () => {
-    const base = { status: "awaiting_confirmation" as const, attention: null, missing_fields: [] as string[] };
-    assert.equal(orderWarning({ ...base, attention: "cancellation_requested", missing_fields: ["quantity"] }), "Customer may want to cancel");
-    assert.equal(orderWarning({ ...base, missing_fields: ["fulfilment_method", "quantity"] }), "Needs quantity");
-    assert.equal(orderWarning({ ...base, missing_fields: ["delivery_address", "requested_for"] }), "Needs delivery address");
-    assert.equal(orderWarning({ ...base, missing_fields: ["requested_for"] }), "Needs confirmation", "a missing day never blocks");
-    assert.equal(orderWarning({ ...base, status: "confirmed" }), null);
-    assert.equal(orderWarning({ ...base, status: "confirmed", attention: "changed_after_confirmation" }), "Changed after confirmation — re-confirm");
+  test("only warnings that could cause a wrong fulfilment appear; missing details and statuses never do", () => {
+    const base = { attention: null as string | null };
+    assert.equal(orderWarning({ ...base, attention: "cancellation_requested" }), "Customer may want to cancel");
+    assert.equal(orderWarning({ ...base, attention: "changed_after_confirmation" }), "Changed after confirmation — re-confirm");
+    assert.equal(orderWarning({ ...base, attention: "staff_cancelled_in_chat" }), "Staff cancelled in chat — verify");
+    for (const quiet of ["customer_replied_yes", "staff_confirmed_in_chat", "other_customer_note"]) assert.equal(orderWarning({ ...base, attention: quiet }), null, quiet);
+    assert.equal(orderWarning(base), null);
+    const conflict = { field_conflicts: { items: { proposed: [], current: [], at: "2026-10-26T10:00:00Z" } } };
+    assert.equal(orderWarning({ ...base, ...conflict, attention: "cancellation_requested" }), "Customer asked for a change — check before fulfilling", "a contradicted staff value outranks other flags");
   });
 });
 
@@ -209,7 +210,7 @@ describe("replies", () => {
   test("search results and details stay short and never leak the raw state", () => {
     const text = searchReply("jane", [order()]);
     assert.match(text, /1 active order for "jane"/);
-    assert.match(text, /\*Jane Doe · #QU6U9\*\nPhone: 286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate\n⚠️ Needs confirmation/);
+    assert.match(text, /\*Jane Doe · #QU6U9\*\nOpen\n286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate$/m);
     const info = moreInfoReply({
       order: order({ manual_locked_fields: ["items"] }),
       name: { name: "Jane Doe", source: "saved", all: ["Jane Doe"] },

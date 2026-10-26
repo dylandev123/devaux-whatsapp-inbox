@@ -113,11 +113,12 @@ import {
   setConversationControl,
   staffNoticeFor,
 } from "@/lib/server/aiAgent/escalations";
-import { proposeReply } from "@/lib/server/aiAgent/model";
+import { proposeOrderUpdate, proposeReply } from "@/lib/server/aiAgent/model";
 import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
 import type { TrackedOrder } from "@/lib/aiAgent/orders";
 import { refineOrderDraft } from "@/lib/aiAgent/orderText";
-import { handleOrderCommand, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
+import { historyForModel, type HistoryOrder } from "@/lib/aiAgent/orderHistory";
+import { handleOrderCommand, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
 import { monitorCustomerTurn, monitorStaffMessage } from "@/lib/server/aiAgent/orderMonitor";
 import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
 import {
@@ -515,7 +516,7 @@ interface Pipeline {
   usage: ShadowUsage | null;
   /** Daily order tracking: present only when the business has it on and this is a live turn. */
   orderTrackingFailed?: boolean;
-  orderTracking: { open: TrackedOrder[]; rawProposal: Pick<ModelProposal, "order_request" | "order_target" | "other_orders"> | null; customerWords: string[] } | null;
+  orderTracking: { open: TrackedOrder[]; rawProposal: Pick<ModelProposal, "order_request" | "order_target" | "other_orders"> | null; customerWords: string[]; history: HistoryOrder[]; intent?: ModelProposal["intent"] | null } | null;
 }
 
 /**
@@ -588,7 +589,7 @@ async function runPipeline(args: {
   if (!args.text.trim()) return empty;
 
   const tracking = Boolean(settings?.orders_tracking_enabled) && Boolean(chatId) && !args.asOf;
-  const [knowledge, context, openOrder, openEscalation, recentReplies, trackedOpen] = await Promise.all([
+  const [knowledge, context, openOrder, openEscalation, recentReplies, trackedOpen, orderHistory] = await Promise.all([
     loadActiveKnowledge(businessSlug),
     chatId && identity
       ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text, { before: args.asOf })
@@ -598,6 +599,8 @@ async function runPipeline(args: {
     chatId && !args.asOf ? autoRepliesLastHour(businessSlug, chatId) : Promise.resolve(0),
     // A failure to read the orders must not stop the customer turn; it is recorded so the report can say so.
     tracking ? loadOpenOrders(businessSlug, chatId!).catch(() => "failed" as const) : Promise.resolve(null),
+    // The customer's earlier orders (same business, stable identity). A failure only means "no history".
+    tracking && identity ? loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => [] as HistoryOrder[]) : Promise.resolve([] as HistoryOrder[]),
   ]);
 
   const safeguards = detectSafeguards(args.text);
@@ -638,6 +641,7 @@ async function runPipeline(args: {
         reviewMode: settings?.mode === "approval_pilot",
         // Same call, two extra JSON fields: which open order the turn belongs to, and any further distinct order.
         openOrders: Array.isArray(trackedOpen) ? ordersForModel(trackedOpen) : undefined,
+        orderHistory: Array.isArray(trackedOpen) ? (historyForModel(orderHistory) ?? undefined) : undefined,
       });
 
   // The model may only restate what the customer actually wrote: ungrounded products, quantities,
@@ -645,7 +649,25 @@ async function runPipeline(args: {
   let proposal = modelResult.proposal;
   const customerWords = [args.text, ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? [])];
   // The raw drafts are kept for order tracking, which grounds them against the order they target (not the legacy request).
-  const rawProposal = proposal ? { order_request: proposal.order_request, order_target: proposal.order_target, other_orders: proposal.other_orders } : null;
+  let rawProposal = proposal ? { order_request: proposal.order_request, order_target: proposal.order_target, other_orders: proposal.other_orders } : null;
+  // "Same as usual, plus 4 pool salt" can make the reply path hand the turn to staff without asking the model anything. The order book
+  // still needs the new part, so the small order-only call (the one monitoring uses, never a reply) reads it. Decisions are unchanged.
+  let orderOnlyIntent: ModelProposal["intent"] | null = null;
+  if (!modelResult.proposal && repeatDecided && tracking && Array.isArray(trackedOpen) && !safeguards.includes("prompt_injection") && !trivialTurn) {
+    const res = await proposeOrderUpdate({
+      businessSlug,
+      customerName: context?.customerName ?? "customer",
+      openOrders: ordersForModel(trackedOpen),
+      orderHistory: historyForModel(orderHistory) ?? undefined,
+      transcript: (context?.transcript ?? []).map((t) => ({ who: t.who, text: t.text })),
+      newMessages: args.transcript ?? args.text,
+      author: "customer",
+    }).catch(() => null);
+    if (res?.proposal) {
+      rawProposal = { order_request: res.proposal.order_request, order_target: res.proposal.order_target, other_orders: res.proposal.other_orders };
+      orderOnlyIntent = res.proposal.intent;
+    }
+  }
   if (proposal?.order_request) {
     const grounded = groundOrderDraft(proposal.order_request, priorOrder, customerWords);
     // What the customer plainly said (a quantity, delivery or collection) is recorded even if the model left it out,
@@ -683,7 +705,7 @@ async function runPipeline(args: {
     customerMode,
     trivialTurn,
     usage: modelResult.usage ?? null,
-    orderTracking: Array.isArray(trackedOpen) ? { open: trackedOpen, rawProposal, customerWords } : null,
+    orderTracking: Array.isArray(trackedOpen) ? { open: trackedOpen, rawProposal, customerWords, history: orderHistory, intent: orderOnlyIntent } : null,
     orderTrackingFailed: trackedOpen === "failed",
   };
 }
@@ -768,10 +790,12 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
         chatId,
         phone: p.identity?.phone ?? null,
         customerName: p.customerName,
-        intent: p.proposal?.intent ?? null,
+        intent: p.proposal?.intent ?? p.orderTracking.intent ?? null,
         proposal: p.orderTracking.rawProposal,
         segments: turn.segments,
         customerWords: p.orderTracking.customerWords,
+        chatIds: p.identity?.chatIds,
+        history: p.orderTracking.history,
         messageIds: turn.whatsappMessageIds,
         firstAt: turn.firstAt,
         lastAt: turn.lastAt,

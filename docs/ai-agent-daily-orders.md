@@ -32,7 +32,7 @@ There are two kinds of confirmed order, and the report and dashboard say which:
 * **Staff-verified**: a person pressed *Confirm* in the dashboard (recorded with their user id). Always allowed.
 * **Customer-confirmed**: the customer's own yes finalized it. **Off by default** (`orders_customer_confirms`).
   While it is off (the initial rollout) a customer's yes is only **recorded** (`customer_confirmed_at`, a
-  *Customer replied yes — staff to verify* flag, listed under Needs attention) and staff verify it. A staff
+  *Customer replied yes — staff to verify* flag, shown in the dashboard and `!moreinfo`, not in the report) and staff verify it. A staff
   Confirm afterwards reads "verified by staff (customer also replied yes)".
 
 Even when a yes is recorded or may finalize, **all** of these must hold, otherwise nothing changes:
@@ -55,11 +55,14 @@ whole order; on a confirmed or ambiguous case it is **flagged for staff**, not a
   (join only on a shared product, else a flagged new order). An identical order is merged, never copied.
 * Every AI/customer change carries an idempotency key (`<batch or event id>:<n>`), so a retried batch or
   message changes nothing the second time. Writes are version-checked (`apply_ai_agent_order`).
-* Anything a person edited is locked: later AI updates never overwrite it. If the customer's NEW message (not older
-  words the cumulative draft repeats) states a different value for a locked field, it is stored in
-  `ai_agent_orders.field_conflicts` (`{ proposed, current, at }`), never applied. It shows in the dashboard (Use
-  customer's / Keep staff's), in `!moreinfo`, and as a `Customer now says …` warning in the report, even for a
-  confirmed order. It clears when staff edit that field (dashboard or `!update`) or choose Keep staff's. No extra model call.
+* Anything a person edited is locked: later AI updates never overwrite it. **Locks protect values, not the whole order.** With the products locked, a *new*
+  product (or a detail staff left blank, such as a missing quantity) is still added automatically and is not a conflict. Only a *contradiction* is
+  recorded: a different quantity for a locked product the customer restated in THIS message, or a product they withdrew. A contradiction is stored in
+  `ai_agent_orders.field_conflicts` (`{ proposed, current, at }`), never applied. It shows in the dashboard (Use customer's / Keep staff's), in `!moreinfo`, and
+  as one short `Customer asked for a change` warning in the report, even for a confirmed order. It clears when staff edit that field (dashboard or `!update`)
+  or choose Keep staff's. No extra model call. Other locked fields (address, day, method, note) behave as before.
+* A material change to a **confirmed** order (a product added or changed, a new address) sends it back to `awaiting_confirmation`, clears the staff
+  confirmation and flags it *changed after confirmation*, whether the change came from the customer's words or from their history.
 * Unknown quantities stay `null` in the database and read `Product — quantity needed` everywhere (never `? ×`).
 * Every successful `!update #REF …` answers once in the group with the reference and the change. Confirm/cancel say
   they are internal and that the customer was not messaged. The notice is keyed to the WhatsApp message, so a
@@ -68,34 +71,39 @@ whole order; on a confirmed or ambiguous case it is **flagged for staff**, not a
 
 ### The report
 
-Built from the database at send time (no stored AI text), the same for the 8 AM job and `!update`:
+Built from the database at send time (no stored AI text), the same for the 8 AM job and `!update`. It shows **only what is known**:
 
 ```
 📋 *DAILY ORDERS — 26 OCT*
-5 orders · 1 confirmed · 4 to review
+5 orders · 1 confirmed · 4 open
 
-✅ *CONFIRMED* (1)
+✅ *CONFIRMED*
 *1. Jane Doe · #K3PD7*
-Phone: 555-0101
-2 × Monello Beef 15kg
-1 × Dog Treats
+555-0101
+1 × Monello Beef 15kg
 Delivery: 12 Main St, Gros Islet · Tue 27 Oct (tomorrow)
 
-⚠️ *NEEDS ATTENTION* (4)
+📦 *OPEN ORDERS*
 *2. Marie Joseph · #QU6U9*
-Phone: 286-7466
-1 × Monello Chicken 25kg
+286-7466
+2 × Monello Chicken 25kg
+Pool Salt
 Delivery: Cap Estate
-⚠️ Needs confirmation
+Note: Pay on delivery, EC$ cash
 ```
 
 * One block per order: best name · compact reference, readable phone (St Lucia numbers as `286-7466`), `quantity × product variant size`, delivery or
-  collection with address and day, a note, and **only the most actionable warning** (a flag a person must check, else the first missing required
-  detail, else "Needs confirmation"). Nothing is printed for what is unknown or empty. Confirmed orders are listed apart (the heading appears when
-  there is at least one; with none confirmed the summary line already says everything needs review).
+  collection with address and day, and the customer's note (including credit/payment instructions). A missing field is simply not printed: there is no
+  "Needs quantity", "Needs confirmation", "Phone:" label or `?`; an unknown quantity is just the product name.
+* **Confirmed** = status `confirmed`, nothing else. Everything else that is open (possible, awaiting confirmation) is under **Open orders**. A heading appears
+  only for a section that has orders.
+* A `⚠️` line appears **only** when ignoring it could cause a wrong fulfilment: the customer changed the order after it was confirmed, the customer asked to
+  change something staff locked ("Customer asked for a change — check before fulfilling", on a confirmed order too), a possible cancellation, a possible
+  duplicate, staff wrote in the chat that it was cancelled/changed, or the customer pointed at an earlier order that could not be matched safely. The detail
+  (what they asked for, what staff set, history, fields staff edited, where a value came from) lives in the dashboard and `!moreinfo #REF`.
 * The reference is the order's `ref_code` shown without its prefix (`O-QU6U9` → `#QU6U9`). It is created once and never changes.
 * A report that does not fit in one message (~3,500 characters) is split on order boundaries into numbered messages, `(1/3)`, `(2/3)`…, sent in order
-  (at most 6; beyond that the count of orders not shown is stated). Everything stays in the dashboard.
+  (at most 6; beyond that the count of orders not shown is stated). A section that runs on says `(cont.)`. Everything stays in the dashboard.
 * Unconfirmed enquiries with no customer activity for 7 days are left out and counted in one line. Confirmed orders never expire. Customer text is
   sanitised so it can never start a line that looks like a command.
 * The only coverage line is a warning when something is wrong: tracking is OFF, conversations failed analysis or hit the hourly limit, or messages never
@@ -148,6 +156,51 @@ if someone changed the order while it was being applied (version conflict); unau
 ignored (and audited) in any other group; another business's references simply do not exist. `!moreinfo` **without** an order reference, and `!moreinfo #E-…`,
 still belong to the escalation / Approval Pilot logic untouched. Anything starting `!update …` that is not a recognised command stays ordinary staff chatter.
 
+## Maintaining an order from short messages
+
+A customer message is an update to an ongoing order, not a new request. The model returns the cumulative order as before; the server adds a deterministic
+safety net (`lib/aiAgent/orderText.ts`) for numbers the model's draft cannot be checked against the customer's words:
+
+* "Add 4 pool salt" → appended. "Another bag", "one more", "2 more bags" → the line's current quantity plus that many, for the one line it clearly means (named,
+  or the only line); a line with no numeric quantity is never guessed. "Another bag of Bandit" for a product not on the order → 1 × Bandit. "Make that 3" →
+  the quantity of a single-line order (with several lines the model's grounded reading stands). "A bag" → 1.
+* "Remove the Bandit" / "Just the Monello" → removed only when the customer's words withdraw something (otherwise a product the model dropped is restored).
+* "Bring it to Cap" → Delivery: Cap. "I'll collect" → Collection. The latest statement wins.
+* A turn with no draft of its own (the model returned no order for "Another bag") still updates the open order.
+* Every write carries the batch/event id as an idempotency key, so a retried message or batch adds nothing twice; repeated pointers ("same as last time" twice)
+  never duplicate a line either.
+
+## Customer order memory
+
+Repeat customers are understood from **their own earlier orders in `ai_agent_orders`** (staff corrections included), found by the same stable identity as the rest
+of the agent (the verified phone and the chats known to be that contact, including a verified `@lid` mapping; an `@lid` without a verified phone only ever matches
+its own chat) and **always inside the business**. No new table, store or model.
+
+| Customer says | What happens |
+|---|---|
+| "Same as last time" | The most recent *reliable* order's products and quantities are added where the order lacks them. |
+| "Same dog food as last time" | Only the lines of that order that match what they named. No match → unresolved. |
+| "The usual" / "same as usual, plus 4 pool salt" | The order that clearly repeats (the same basket at least twice, strictly more often than any other; else the same products with a quantity only where it never varied). The customer's own extra line is kept. No clear usual → unresolved. |
+| "Two bags this time" | The last order's product with quantity 2, only when that order had one product. |
+| "Same location" | The most recent *verified* delivery address (reliable delivery order, or one staff typed), only when the order has no address and the customer gave none. |
+| "Deliver somewhere else" | No address is reused; an address the order holds is dropped (or, if staff locked it, recorded as a conflict) until the customer gives a new one. |
+| "A bag of dog food" | The customer's words stand unless exactly one history product fits (every word they wrote appears in it) or one clearly dominates (seen ≥2 times and ≥3× the next). The model may also *nominate* a history product for a generic phrase (`from_history`); the server accepts it only if that order was shown to it, really holds that product, and the product is the sole or clearly dominant one. A made-up reference is ignored. |
+
+Rules: explicit current words always beat history; only **reliable** orders are sources (fulfilled, confirmed, or products a person corrected; never an
+unconfirmed enquiry or a cancelled order); a quantity or address is never invented; ambiguity is left **unresolved**. An unresolved pointer flags the
+order *Refers to an earlier order — check* (and, with no order open, records a note-only order carrying the customer's own words) instead of guessing. A
+question ("is it the usual price?") never edits an order. Nothing taken from history confirms anything: the order stays *possible* / *awaiting confirmation*
+for a person to verify. Backfill replays never use history.
+
+Where it came from is tracked internally: the order's event carries `inferred: { items: [refs], delivery_address: ref, unresolved: [...] }`, shown in the
+dashboard's History and in `!moreinfo` ("From earlier orders: products from #K3PD7"). Staff corrections improve later interpretations automatically because the
+source is the corrected order row.
+
+Cost: the existing reply/monitoring call gains a compact `CUSTOMER HISTORY` block (≤3 recent reliable orders, ≤5 repeated products, ≤3 addresses; roughly
+150–250 input tokens) **only for customers who have reliable history**, plus ~120 tokens of rules. Resolution itself is deterministic (no call). One narrow
+extra call: when the reply path's older "same as last time" check hands a turn to staff *without* asking the reply model, the small order-only call that
+monitoring already uses reads the rest of the message ("…plus 4 pool salt") so the order book is not blind to it. Decisions and replies are unchanged.
+
 ## Monitoring every conversation
 
 With `orders_tracking_enabled` on, **every genuine 1:1 customer conversation** the bridge forwards is read for orders, whether or not the AI may reply there:
@@ -161,7 +214,7 @@ ever sent stays with the existing gate and send policy.
 |---|---|
 | Customer, AI may answer | The existing single model call also fills the order (unchanged, no extra cost). |
 | Customer, AI may not answer | Joins the same batch as any other (rapid messages are analysed together, in order). Then: a free **pre-filter** (`lib/aiAgent/orderMonitor.ts`) skips pleasantries, media-only and messages with no order wording while no order is open; a bare "yes" or short "cancel it" for an open order is handled by the rules (no model call); everything else, **always when an order is open** (a follow-up may change it), makes **one small model call** that sees only the open orders, the last 8 messages and the new message(s). |
-| The business's own message in the chat (business phone / inbox) | Read only when an order is open and the wording could matter. It can only **flag** that order for a person (*staff wrote a confirmation / cancellation / change*, listed under Needs attention): it never creates an order, edits one, confirms or cancels one (the business phone cannot say *who* wrote, and staff verification stays a person's Confirm click), and does not count as customer activity. Never read: the agent's own sends coming back, and AI drafts (they are not messages). |
+| The business's own message in the chat (business phone / inbox) | Read only when an order is open and the wording could matter. It can only **flag** that order for a person (*staff wrote a confirmation / cancellation / change*; the report shows only the cancellation and change flags): it never creates an order, edits one, confirms or cancels one (the business phone cannot say *who* wrote, and staff verification stays a person's Confirm click), and does not count as customer activity. Never read: the agent's own sends coming back, and AI drafts (they are not messages). |
 
 Safeguards: every write is keyed by the batch/event id (a retried message changes nothing and costs no model call), writes are version-checked, staff-edited
 fields stay locked, and products/quantities/addresses/times survive only if the customer wrote them. Budget: at most **20 monitoring calls per chat and 300
@@ -217,7 +270,7 @@ Approval Pilot group), `orders_timezone`, `orders_summary_hour`. Tracking is **i
 
 ## Deployment
 
-**This release needs one more small migration (`20261103000000_ai_agent_order_field_conflicts.sql`: a `field_conflicts` column and the same `apply_ai_agent_order`, now writing it) and no bridge change.** Run it after the two below, before deploying the app.
+**This release needs one more small migration (`20261103000000_ai_agent_order_field_conflicts.sql`: a `field_conflicts` column and the same `apply_ai_agent_order`, now writing it) and no bridge change.** Run it after the two below, before deploying the app. The report simplification, order maintenance and customer order memory need **no further migration** (history lives in existing columns and event rows).
 
 **Migration (run in the Supabase SQL editor, in this order, before deploying the app):**
 `supabase/migrations/20261101000000_ai_agent_daily_orders.sql` (needs 20261022–20261031 applied), then
@@ -266,6 +319,10 @@ until the bridge is deployed.
 * A customer's yes counts only if a person wrote to them (inbox, `!send`) in the last 48 h and exactly one order is open; a phone confirmation is a *Confirm* click.
 * A staff message in the chat can raise a flag but never creates an order, so an order the customer only described in a voice note and staff then wrote out is
   recorded only once the customer says it in text (or staff add it in the dashboard).
+* Customer memory reads `ai_agent_orders`, which starts filling when daily orders are switched on. Earlier orders only in the older `customer_orders` analysis
+  table, or only in stored WhatsApp messages, are not used until "Recover missed orders" has brought them into the order book (history within the retention window).
+* A generic phrase ("dog food") can only be mapped to a history product the model recognises and the server finds dominant; with several equally likely products it stays as written.
+* "Usual" needs the same basket twice; a customer who varies every time has no usual order and is flagged for a person.
 * Voice notes, images and stickers are not transcribed: media-only messages are counted (filtered) but carry no order text.
 * Cost: AI-eligible turns carry ~350 extra instruction tokens and the open-order list; monitoring-only turns make one small call (~760 instruction tokens +
   open orders + 8 context lines, typically 1.2–1.5k input and 100–200 output tokens), capped per chat/business per hour.

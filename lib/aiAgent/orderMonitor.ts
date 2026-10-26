@@ -41,7 +41,7 @@ export function monitorEligibleChat(chatId: string): boolean {
 
 /** Words that suggest someone is ordering, changing or cancelling something. Deliberately broad: a miss is worse than a call. */
 const ORDER_SIGNAL =
-  /\d|\b(order\w*|want\w*|need\w*|bags?|kg|kilos?|lbs?|pounds?|box(?:es)?|cartons?|cases?|dozen|deliver\w*|collect\w*|pick\s?up|buy\w*|get me|send\w*|bring\w*|drop\s?off|cancel\w*|can i|could i|i'?ll take|i'?d like|would like|add|change|instead|also|another|more|less|same as)\b/i;
+  /\d|\b(order\w*|want\w*|need\w*|bags?|kg|kilos?|lbs?|pounds?|box(?:es)?|cartons?|cases?|dozen|deliver\w*|collect\w*|pick\s?up|buy\w*|get me|send\w*|bring\w*|drop\s?off|cancel\w*|can i|could i|i'?ll take|i'?d like|would like|add|change|instead|also|another|more|less|same|usual|last time|as before|again|this time|somewhere else|different (?:place|address|location))\b/i;
 
 /** Words a staff message may use about an existing order. */
 const STAFF_SIGNAL =

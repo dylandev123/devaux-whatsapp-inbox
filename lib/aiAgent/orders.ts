@@ -98,6 +98,7 @@ export const ATTENTION_TEXT: Record<string, string> = {
   staff_confirmed_in_chat: "Staff wrote a confirmation in WhatsApp — verify it and press Confirm",
   staff_cancelled_in_chat: "Staff wrote in WhatsApp that this was cancelled — verify and cancel it here",
   staff_changed_in_chat: "Staff wrote about changes to this order in WhatsApp — check the order",
+  history_unresolved: "Customer referred to an earlier order or place that could not be matched safely — please check",
   other_customer_note: "Needs a staff look",
 };
 
@@ -146,6 +147,13 @@ export function sameLines(a: OrderLine[], b: OrderLine[]): boolean {
   const left = a.map(key).sort();
   const right = b.map(key).sort();
   return left.every((k, i) => k === right[i]);
+}
+
+const compatible = (a: string | null | undefined, b: string | null | undefined) => !a || !b || norm(a) === norm(b);
+
+/** The same product line: same product, and variant/size that do not contradict each other (a blank one is compatible). */
+export function sameLineProduct(a: OrderLine, b: OrderLine): boolean {
+  return productKey(a.product) === productKey(b.product) && compatible(a.variant, b.variant) && compatible(a.size, b.size);
 }
 
 const SOFT_FIELDS = new Set(["requested_for"]);
@@ -208,7 +216,24 @@ export function mergeDraft(
 
   if (draft.items.length > 0) {
     const lines = draft.items.map(toLine);
-    set("items", lines, sameLines(lines, base.items));
+    if (!isLocked("items")) set("items", lines, sameLines(lines, base.items));
+    else {
+      // Staff locked the products. A product that is simply new, or a detail staff left blank, is still added: that is
+      // not a contradiction. Only a changed quantity or a withdrawn product contradicts the staff value.
+      const filled = base.items.map((b) => {
+        const d = lines.find((l) => sameLineProduct(b, l));
+        return d ? { product: b.product, quantity: b.quantity ?? d.quantity, variant: b.variant ?? d.variant, size: b.size ?? d.size } : b;
+      });
+      const added = lines.filter((l) => !base.items.some((b) => sameLineProduct(b, l)));
+      const next = [...filled, ...added];
+      if (!sameLines(next, base.items)) {
+        changes.push({ field: "items", before: base.items, after: next });
+        fields.items = next;
+      }
+      const changedQuantity = base.items.some((b) => lines.some((l) => sameLineProduct(b, l) && b.quantity && l.quantity && norm(b.quantity) !== norm(l.quantity)));
+      const withdrawn = base.items.some((b) => !lines.some((l) => sameLineProduct(b, l)));
+      if (withdrawn || (changedQuantity && statedNow?.("items", lines))) conflicts.push({ field: "items", before: next, after: lines });
+    }
   }
   if (draft.delivery_address) set("delivery_address", draft.delivery_address, norm(draft.delivery_address) === norm(base.delivery_address));
   if (draft.requested_for) set("requested_for", draft.requested_for, norm(draft.requested_for) === norm(base.requested_for));
@@ -496,10 +521,6 @@ export function isStale(o: Pick<TrackedOrder, "status" | "last_message_at" | "up
   return !Number.isNaN(last) && now.getTime() - last > STALE_AFTER_DAYS * 86_400_000;
 }
 
-export function needsAttention(o: TrackedOrder): boolean {
-  return o.status !== "confirmed" || Boolean(o.attention) || !isComplete(o.missing_fields) || conflictFields(o).length > 0;
-}
-
 /** What the report can honestly claim to cover. */
 export interface Coverage {
   trackingOn: boolean;
@@ -632,23 +653,18 @@ const titleDate = (dateKey: string) => {
   return `${d} ${MONTH_NAMES[m - 1]}`;
 };
 
-/** One short line per reason a person must look. */
-const SHORT_ATTENTION: Record<string, string> = {
+/**
+ * The only reasons the WhatsApp report interrupts a block: each could make someone fulfil the wrong thing. Everything else
+ * (missing details, "needs confirmation", a recorded yes, technical conflict wording) lives in the dashboard and !moreinfo.
+ */
+const REPORT_ATTENTION: Record<string, string> = {
   changed_after_confirmation: "Changed after confirmation — re-confirm",
   cancellation_requested: "Customer may want to cancel",
   check_if_duplicate: "May be a duplicate order",
-  customer_replied_yes: "Customer said yes — staff to confirm",
-  staff_confirmed_in_chat: "Staff confirmed in chat — verify",
   staff_cancelled_in_chat: "Staff cancelled in chat — verify",
   staff_changed_in_chat: "Staff changed it in chat — check",
-  other_customer_note: "Needs a staff look",
+  history_unresolved: "Refers to an earlier order — check",
 };
-const SHORT_MISSING: [string, string][] = [
-  ["items", "Needs products"],
-  ["quantity", "Needs quantity"],
-  ["fulfilment_method", "Needs delivery or collection"],
-  ["delivery_address", "Needs delivery address"],
-];
 
 export const CONFLICT_LABEL: Record<EditableOrderField, string> = {
   customer_name: "name",
@@ -676,17 +692,10 @@ export function conflictText(field: EditableOrderField, c: FieldConflict, max = 
   return `${CONFLICT_LABEL[field]}: ${conflictValueText(field, c.proposed, max)} (staff set ${conflictValueText(field, c.current, max)})`;
 }
 
-/** The single most actionable thing about an order, or null when there is nothing to do. */
-export function orderWarning(o: Pick<TrackedOrder, "status" | "attention" | "missing_fields"> & Partial<Pick<TrackedOrder, "field_conflicts">>): string | null {
-  const fields = o.field_conflicts ? conflictFields({ field_conflicts: o.field_conflicts }) : [];
-  if (fields.length > 0) {
-    const more = fields.length > 1 ? ` +${fields.length - 1} more` : "";
-    return `Customer now says ${conflictText(fields[0], o.field_conflicts![fields[0]]!, 40)}${more} — check`;
-  }
-  if (o.attention) return SHORT_ATTENTION[o.attention] ?? SHORT_ATTENTION.other_customer_note;
-  const missing = SHORT_MISSING.find(([field]) => o.missing_fields.includes(field));
-  if (missing) return missing[1];
-  return o.status === "confirmed" ? null : "Needs confirmation";
+/** The one warning the report may show for an order, or null. A contradicted staff value outranks everything else. */
+export function orderWarning(o: Pick<TrackedOrder, "attention"> & Partial<Pick<TrackedOrder, "field_conflicts">>): string | null {
+  if (o.field_conflicts && conflictFields({ field_conflicts: o.field_conflicts }).length > 0) return "Customer asked for a change — check before fulfilling";
+  return o.attention ? (REPORT_ATTENTION[o.attention] ?? null) : null;
 }
 
 /** "1 × Monello Chicken 25kg": product, variant and size read as one product name. */
@@ -721,17 +730,23 @@ export function orderDisplayName(o: Pick<TrackedOrder, "id" | "customer_name">, 
   return names?.[o.id]?.name ?? cleanName(o.customer_name);
 }
 
-/** One order as it reads in the staff group. */
-export function orderBlock(o: TrackedOrder, index: number | null, names?: OrderNames): string {
+/** A product line as the report reads it: only what is known, so an unknown quantity is just the product name. */
+export function reportItemText(l: OrderLine): string {
+  return l.quantity ? `${safe(l.quantity, 20)} × ${orderProductText(l)}` : orderProductText(l);
+}
+
+/** One order as it reads in the staff group: known facts only. `status` adds a Confirmed/Open line (used by search, not the report). */
+export function orderBlock(o: TrackedOrder, index: number | null, names?: OrderNames, opts: { status?: boolean } = {}): string {
   const phone = formatPhone(o.contact_number);
   const name = orderDisplayName(o, names);
   const lead = index === null ? "" : `${index}. `;
   const lines = [`*${lead}${name ?? phone ?? "Unknown customer"} · ${displayRef(o.ref_code)}*`];
-  if (name && phone) lines.push(`Phone: ${phone}`);
-  if (o.items.length > 0) lines.push(...o.items.map(orderItemText));
+  if (opts.status) lines.push(o.status === "confirmed" ? "Confirmed" : "Open");
+  if (name && phone) lines.push(phone);
+  if (o.items.length > 0) lines.push(...o.items.map(reportItemText));
   const how = fulfilmentLine(o);
   if (how) lines.push(how);
-  if (o.notes) lines.push(`Note: ${safe(o.notes, 120)}`);
+  if (o.notes) lines.push(`Note: ${safe(o.notes, 160)}`);
   const warning = orderWarning(o);
   if (warning) lines.push(`⚠️ ${warning}`);
   return lines.join("\n");
@@ -781,27 +796,23 @@ export function buildOrderSummary(input: SummaryInput): SummaryResult {
   const live = all.filter((o) => !isStale(o, now));
   const omittedStale = all.length - live.length;
   const byAge = (a: TrackedOrder, b: TrackedOrder) => Date.parse(a.first_message_at) - Date.parse(b.first_message_at);
-  const confirmed = live.filter((o) => !needsAttention(o)).sort(byAge);
-  const attention = live.filter(needsAttention).sort(byAge);
+  // "Confirmed" means a person (or the customer's own yes, when allowed) confirmed it: nothing else, whatever the warnings.
+  const confirmed = live.filter((o) => o.status === "confirmed").sort(byAge);
+  const open = live.filter((o) => o.status !== "confirmed").sort(byAge);
   const carriedForward = live.filter((o) => localParts(new Date(o.first_message_at), tz).dateKey < today).length;
 
   const title = `📋 *DAILY ORDERS — ${titleDate(today)}*`;
   const count = (n: number) => `${n} ${n === 1 ? "order" : "orders"}`;
-  const summaryLine = live.length === 0 ? "No outstanding orders." : `${count(live.length)} · ${confirmed.length} confirmed · ${attention.length} to review`;
+  const summaryLine = live.length === 0 ? "No outstanding orders." : `${count(live.length)} · ${confirmed.length} confirmed · ${open.length} open`;
 
   const footer: string[] = [];
   if (omittedStale > 0) footer.push(`${omittedStale} older unconfirmed ${omittedStale === 1 ? "enquiry" : "enquiries"} (${STALE_AFTER_DAYS}+ days) not shown.`);
   const gap = coverageWarning(input.coverage);
   if (gap) footer.push(gap);
 
-  type Section = "confirmed" | "attention";
-  const entries = [...confirmed.map((o) => ({ o, section: "confirmed" as Section })), ...attention.map((o) => ({ o, section: "attention" as Section }))];
-  // Confirmed orders get their own heading; with none confirmed, the summary line already says everything needs review.
-  const headings = confirmed.length > 0;
-  const headingFor = (section: Section, cont: boolean) => {
-    const n = section === "confirmed" ? confirmed.length : attention.length;
-    return `${section === "confirmed" ? "✅ *CONFIRMED*" : "⚠️ *NEEDS ATTENTION*"} ${cont ? "(cont.)" : `(${n})`}`;
-  };
+  type Section = "confirmed" | "open";
+  const entries = [...confirmed.map((o) => ({ o, section: "confirmed" as Section })), ...open.map((o) => ({ o, section: "open" as Section }))];
+  const headingFor = (section: Section, cont: boolean) => `${section === "confirmed" ? "✅ *CONFIRMED*" : "📦 *OPEN ORDERS*"}${cont ? " (cont.)" : ""}`;
 
   const base = title.length + 10;
   const bodies: string[][] = [[]];
@@ -810,7 +821,7 @@ export function buildOrderSummary(input: SummaryInput): SummaryResult {
   let truncated = 0;
   for (const [i, e] of entries.entries()) {
     const block = orderBlock(e.o, i + 1, input.names);
-    const heading = headings && e.section !== current ? headingFor(e.section, false) : null;
+    const heading = e.section !== current ? headingFor(e.section, false) : null;
     if (size + block.length + (heading?.length ?? 0) + 3 > MAX_PART_CHARS && bodies[bodies.length - 1].length > 0) {
       if (bodies.length >= MAX_REPORT_PARTS) {
         truncated = entries.length - i;
@@ -821,7 +832,7 @@ export function buildOrderSummary(input: SummaryInput): SummaryResult {
       // A section that continues onto the next message says so.
       current = null;
     }
-    const lead = headings && e.section !== current ? (heading ?? headingFor(e.section, true)) : null;
+    const lead = e.section !== current ? (heading ?? headingFor(e.section, true)) : null;
     const body = bodies[bodies.length - 1];
     if (lead) {
       body.push(lead);
@@ -838,8 +849,8 @@ export function buildOrderSummary(input: SummaryInput): SummaryResult {
   const parts = bodies.map((body, i) => {
     const head = `${title}${total > 1 ? ` (${i + 1}/${total})` : ""}`;
     // Heading and blocks are separated by a single line break, blocks from each other by a blank line.
-    const joined = body.map((chunk, j) => (j > 0 && /^(✅|⚠️) \*(CONFIRMED|NEEDS ATTENTION)\*/.test(body[j - 1]) ? `\n${chunk}` : `\n\n${chunk}`)).join("");
+    const joined = body.map((chunk, j) => (j > 0 && /^(✅|📦) \*(CONFIRMED|OPEN ORDERS)\*/.test(body[j - 1]) ? `\n${chunk}` : `\n\n${chunk}`)).join("");
     return `${head}${i === 0 ? `\n${summaryLine}` : ""}${joined}`.trim();
   });
-  return { text: parts.join("\n\n"), parts, confirmed: confirmed.length, attention: attention.length, carriedForward, omittedStale, truncated };
+  return { text: parts.join("\n\n"), parts, confirmed: confirmed.length, attention: open.length, carriedForward, omittedStale, truncated };
 }
