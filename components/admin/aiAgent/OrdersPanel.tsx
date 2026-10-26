@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { Coverage } from "@/lib/aiAgent/orders";
 import { aiAgentApi, BackfillRunView, OrderEventView, OrderRunView, OrderView } from "@/lib/aiAgent/client";
 import type { AgentSettings } from "@/lib/aiAgent/engine";
-import { ATTENTION_TEXT, confirmationLabel, coverageLines, formatLine, MISSING_TEXT, ORDER_STATUSES, type OrderLine, type OrderStatus } from "@/lib/aiAgent/orders";
+import { ATTENTION_TEXT, CONFLICT_LABEL, conflictFields, conflictValueText, confirmationLabel, coverageLines, displayRef, formatLine, MISSING_TEXT, ORDER_STATUSES, type OrderLine, type OrderStatus } from "@/lib/aiAgent/orders";
 import { useDebounced } from "@/components/admin/aiAgent/useDebounced";
 import { Badge, Card, dangerButton, formatWhen, inputClass, Notice, primaryButton, secondaryButton } from "@/components/admin/aiAgent/ui";
 
@@ -126,7 +126,7 @@ function History({ businessSlug, orderId }: { businessSlug: string; orderId: str
           <span className="text-zinc-500">
             {" "}
             · {e.actor_kind}
-            {e.actor_kind === "admin" && e.actor_id ? ` (${e.actor_id.slice(0, 8)})` : ""} · {formatWhen(e.created_at)}
+            {(e.actor_kind === "admin" || e.actor_kind === "staff") && e.actor_id ? ` (${e.actor_id.slice(0, 8)})` : ""} · {formatWhen(e.created_at)}
             {e.whatsapp_message_ids.length > 0 ? ` · ${e.whatsapp_message_ids.length} message${e.whatsapp_message_ids.length === 1 ? "" : "s"}` : ""}
           </span>
           {Object.entries(e.changes).map(([field, c]) => (
@@ -148,7 +148,7 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
   const open = order.status === "possible" || order.status === "awaiting_confirmation" || order.status === "confirmed";
   const missing = order.missing_fields.filter((m) => m in MISSING_TEXT);
 
-  async function act(action: "edit" | "confirm" | "cancel" | "fulfil", extra: { patch?: Record<string, unknown>; reason?: string } = {}) {
+  async function act(action: "edit" | "confirm" | "cancel" | "fulfil" | "keep", extra: { patch?: Record<string, unknown>; conflictFields?: string[]; reason?: string } = {}) {
     setBusy(true);
     setError(null);
     try {
@@ -165,9 +165,9 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
   return (
     <li className="px-4 py-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-xs font-semibold text-zinc-900">{order.ref_code}</span>
+        <span className="font-mono text-xs font-semibold text-zinc-900">{displayRef(order.ref_code)}</span>
         <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${STATUS_STYLE[order.status]}`}>{STATUS_LABEL[order.status]}</span>
-        <span className="font-medium text-zinc-900">{order.customer_name ?? "Unnamed customer"}</span>
+        <span className="font-medium text-zinc-900">{order.display_name ?? order.customer_name ?? "Unnamed customer"}</span>
         <span className="text-xs text-zinc-500">{order.contact_number ? `+${order.contact_number}` : "phone not verified"}</span>
         <span className="ml-auto text-xs text-zinc-400">
           {formatWhen(order.first_message_at)} · updated {formatWhen(order.updated_at)}
@@ -181,6 +181,25 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
       </p>
       {order.notes && <p className="text-xs text-zinc-600">Note: {order.notes}</p>}
       {missing.length > 0 && <p className="mt-1 text-xs text-amber-700">Missing: {missing.map((m) => MISSING_TEXT[m]).join(", ")}</p>}
+      {conflictFields(order).map((field) => {
+        const c = order.field_conflicts[field]!;
+        return (
+          <div key={field} className="mt-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-900">
+            <p className="font-medium">⚠ Customer now says {CONFLICT_LABEL[field]}: {conflictValueText(field, c.proposed, 200)}</p>
+            <p>Staff set: {conflictValueText(field, c.current, 200)} (kept — not changed automatically) · {formatWhen(c.at)}</p>
+            {open && (
+              <div className="mt-1 flex gap-2">
+                <button type="button" className={secondaryButton} disabled={busy} onClick={() => void act("edit", { patch: { [field]: c.proposed } })}>
+                  Use customer's
+                </button>
+                <button type="button" className={secondaryButton} disabled={busy} onClick={() => void act("keep", { conflictFields: [field] })}>
+                  Keep staff's
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
       {order.attention && <p className="mt-1 text-xs font-medium text-amber-800">⚠ {ATTENTION_TEXT[order.attention] ?? order.attention}</p>}
       {order.status === "confirmed" && <p className="mt-1 text-xs text-zinc-500">Confirmed — {confirmationLabel(order)} · {formatWhen(order.confirmed_at)}</p>}
       {order.status !== "confirmed" && order.customer_confirmed_at && <p className="mt-1 text-xs text-zinc-500">Customer replied yes {formatWhen(order.customer_confirmed_at)} — not yet verified by staff</p>}

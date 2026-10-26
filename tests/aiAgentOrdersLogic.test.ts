@@ -14,6 +14,8 @@ import {
   isWholeOrderCancellation,
   localParts,
   mergeDraft,
+  orderItemText,
+  formatLine,
   planOrderUpdate,
   resolveOrderTarget,
   scheduleState,
@@ -52,6 +54,7 @@ const order = (over: Partial<TrackedOrder> = {}): TrackedOrder => ({
   last_message_at: "2026-10-26T14:00:00Z",
   awaiting_since: "2026-10-26T14:00:00Z",
   manual_locked_fields: [],
+  field_conflicts: {},
   confirmed_by: null,
   confirmed_at: null,
   customer_confirmed_at: null,
@@ -283,19 +286,30 @@ describe("the morning report", () => {
   const stale = order({ id: "s1", ref_code: "O-STALE", status: "possible", last_message_at: "2026-10-10T14:00:00Z", first_message_at: "2026-10-10T14:00:00Z" });
   const input = { businessLabel: "Dog Food", timezone: "America/St_Lucia", now: NOW, trigger: "scheduled" as const };
 
-  test("groups Confirmed and Needs Attention, marks carried forward, shows missing information", () => {
+  test("groups Confirmed and Needs Attention, numbers the orders, shows the one thing to do", () => {
     const r = buildOrderSummary({ ...input, orders: [confirmed, carried, needs] });
     assert.equal(r.confirmed, 2);
     assert.equal(r.attention, 1);
     assert.equal(r.carriedForward, 1);
-    assert.match(r.text, /CONFIRMED\* \(2\)/);
-    assert.match(r.text, /NEEDS ATTENTION\* \(1\)/);
-    assert.match(r.text, /O-CARRY[\s\S]*carried forward from Sun 25 Oct/);
-    assert.equal((r.text.match(/carried forward/g) ?? []).length, 1);
-    assert.match(r.text, /Missing: delivery address, day\/time wanted/);
-    assert.match(r.text, /Priya \(phone not verified\)/);
-    assert.match(r.text, /Marcus \(\+17585550102\)/);
-    assert.match(r.text, /2 × Monello Chicken \(15kg\)/);
+    assert.match(r.text, /^📋 \*DAILY ORDERS — 27 OCT\*\n3 orders · 2 confirmed · 1 to review/);
+    assert.match(r.text, /✅ \*CONFIRMED\* \(2\)/);
+    assert.match(r.text, /⚠️ \*NEEDS ATTENTION\* \(1\)/);
+    assert.match(r.text, /\*3\. Priya · #NEED1\*/);
+    assert.match(r.text, /\*[12]\. Marcus · #CARRY\*\nPhone: \+1 758-555-0102|\*[12]\. Marcus · #CARRY\*\nPhone: 555-0102/);
+    assert.match(r.text, /2 × Monello Chicken 15kg/);
+    // Priya: only the most actionable warning, no technical statuses, no empty placeholders.
+    const priya = r.text.slice(r.text.indexOf("*3. Priya"));
+    assert.match(priya, /⚠️ Needs delivery address/);
+    assert.doesNotMatch(r.text, /Status:|Missing:|phone not verified|carried forward|Unnamed|none|None/i);
+    assert.equal((priya.match(/⚠️/g) ?? []).length, 1);
+  });
+  test("with nothing confirmed there are no section headings; with nothing to review there is no review section", () => {
+    const onlyReview = buildOrderSummary({ ...input, orders: [needs] });
+    assert.doesNotMatch(onlyReview.text, /CONFIRMED|NEEDS ATTENTION/);
+    assert.match(onlyReview.text, /1 order · 0 confirmed · 1 to review/);
+    const onlyConfirmed = buildOrderSummary({ ...input, orders: [confirmed] });
+    assert.match(onlyConfirmed.text, /CONFIRMED\* \(1\)/);
+    assert.doesNotMatch(onlyConfirmed.text, /NEEDS ATTENTION|⚠️/);
   });
   test("a stale unconfirmed enquiry drops out and is counted; a confirmed order never does", () => {
     const r = buildOrderSummary({ ...input, orders: [stale, order({ ...confirmed, first_message_at: "2026-10-01T00:00:00Z", last_message_at: "2026-10-01T00:00:00Z" })] });
@@ -310,12 +324,24 @@ describe("the morning report", () => {
     const text = buildOrderSummary({ ...input, orders: [sneaky] }).text;
     assert.equal(text.split("\n").some((l) => /^\s*!/.test(l)), false);
   });
-  test("a very large day is truncated with a count, within WhatsApp's limit", () => {
-    const many = Array.from({ length: 80 }, (_, i) => order({ id: `m${i}`, ref_code: `O-M${String(i).padStart(4, "0")}`, status: "confirmed", notes: "x".repeat(120) }));
-    const r = buildOrderSummary({ ...input, orders: many });
-    assert.ok(r.text.length <= 4000);
-    assert.ok(r.truncated > 0);
-    assert.match(r.text, /more not shown/);
+  test("a large day is split into clearly numbered messages, each within the limit; a huge one is counted", () => {
+    const many = (n: number) => Array.from({ length: n }, (_, i) => order({ id: `m${i}`, ref_code: `O-M${String(i).padStart(4, "0")}`, status: "confirmed", notes: "x".repeat(120) }));
+    const some = buildOrderSummary({ ...input, orders: many(40) });
+    assert.ok(some.parts.length > 1 && some.parts.length <= 6);
+    some.parts.forEach((p, i) => {
+      assert.ok(p.length <= 3800, `part ${i + 1} fits`);
+      assert.match(p, new RegExp(`^📋 \\*DAILY ORDERS — 27 OCT\\* \\(${i + 1}/${some.parts.length}\\)`));
+    });
+    assert.equal(some.truncated, 0);
+    assert.equal((some.text.match(/· #M\d{4}\*/g) ?? []).length, 40, "every order appears exactly once");
+    // The section heading is repeated when a section runs on into the next message.
+    assert.match(some.parts[1], /CONFIRMED\* \(cont\.\)/);
+    const huge = buildOrderSummary({ ...input, orders: many(200) });
+    assert.equal(huge.parts.length, 6);
+    assert.ok(huge.truncated > 0);
+    assert.match(huge.parts[5], /…and \d+ more orders — see the Orders page/);
+    // A single message report carries no number.
+    assert.doesNotMatch(buildOrderSummary({ ...input, orders: [confirmed] }).text, /\(1\/1\)/);
   });
 });
 
@@ -359,5 +385,24 @@ describe("who may receive the order summary", () => {
     assert.equal(outboxAllowed(base, { kind: "staff_notice", toJid: "staff@g.us" }), true);
     assert.equal(outboxAllowed(s({ mode: "observe" }), { kind: "staff_notice", toJid: "staff@g.us" }), false);
     assert.equal(canPostOrderSummary(s({ orders_group_jid: null, staff_group_jid: null })), false);
+  });
+});
+
+describe("locked fields and incomplete products", () => {
+  const base: OrderFields = { customer_name: null, items: [{ product: "Monello", quantity: "3", variant: null, size: null }], fulfilment_method: "delivery", delivery_preference: "delivery", delivery_address: "Cap Estate", requested_for: null, notes: null };
+  test("a locked field is kept and the contradiction is returned only when stated this turn", () => {
+    const d = draft({ items: [{ product: "Monello", quantity: "5" }], delivery_address: "Cap Estate", requested_for: null });
+    const kept = mergeDraft(base, d, ["items"], null, () => true);
+    assert.equal(kept.fields.items[0].quantity, "3");
+    assert.deepEqual(kept.changes, []);
+    assert.deepEqual(kept.conflicts.map((c) => c.field), ["items"]);
+    assert.deepEqual(mergeDraft(base, d, ["items"], null, () => false).conflicts, []);
+    assert.deepEqual(mergeDraft(base, d, ["items"]).conflicts, []);
+  });
+  test("a quantity-less product reads 'quantity needed', never '? ×'", () => {
+    const line = { product: "Monello", quantity: null, variant: null, size: "25kg" };
+    assert.equal(orderItemText(line), "Monello 25kg — quantity needed");
+    assert.equal(formatLine(line), "Monello (25kg) — quantity needed");
+    assert.equal(orderItemText({ ...line, quantity: "2" }), "2 × Monello 25kg");
   });
 });

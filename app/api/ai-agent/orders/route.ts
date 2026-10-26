@@ -7,6 +7,7 @@ import {
   listOrders,
   listSummaryRuns,
   loadCoverage,
+  loadOrderNames,
   type ManualAction,
   sendSummaryNow,
   updateOrderManually,
@@ -35,21 +36,22 @@ export async function GET(request: Request) {
       listSummaryRuns(businessSlug),
       ensureSettings(businessSlug).then((s) => loadCoverage(s, new Date())),
     ]);
-    return NextResponse.json({ orders, runs, coverage });
+    const names = await loadOrderNames(businessSlug, orders);
+    return NextResponse.json({ orders: orders.map((o) => ({ ...o, display_name: names[o.id]?.name ?? null, name_source: names[o.id]?.source ?? null })), runs, coverage });
   } catch (err) {
     return jsonError(err instanceof Error ? err.message : "Failed to load orders", 500);
   }
 }
 
-const ACTIONS: readonly ManualAction[] = ["edit", "confirm", "cancel", "fulfil"];
+const ACTIONS: readonly ManualAction[] = ["edit", "confirm", "cancel", "fulfil", "keep"];
 
 export async function PATCH(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;
-  const body = await readJson<{ businessSlug?: unknown; orderId?: unknown; action?: unknown; version?: unknown; patch?: unknown; reason?: unknown }>(request);
+  const body = await readJson<{ businessSlug?: unknown; orderId?: unknown; action?: unknown; version?: unknown; patch?: unknown; conflictFields?: unknown; reason?: unknown }>(request);
   const businessSlug = await resolveBusinessSlug(body?.businessSlug);
   if (!body || !businessSlug || typeof body.orderId !== "string") return jsonError("businessSlug and orderId are required", 400);
-  if (typeof body.action !== "string" || !(ACTIONS as readonly string[]).includes(body.action)) return jsonError("action must be edit, confirm, cancel or fulfil", 400);
+  if (typeof body.action !== "string" || !(ACTIONS as readonly string[]).includes(body.action)) return jsonError("action must be edit, confirm, cancel, fulfil or keep", 400);
   if (body.patch !== undefined && (typeof body.patch !== "object" || body.patch === null || Array.isArray(body.patch))) return jsonError("patch must be an object", 400);
 
   try {
@@ -60,6 +62,7 @@ export async function PATCH(request: Request) {
       action: body.action as ManualAction,
       expectedVersion: typeof body.version === "number" ? body.version : null,
       patch: body.patch as Partial<Record<EditableOrderField, unknown>> | undefined,
+      conflictFields: Array.isArray(body.conflictFields) ? body.conflictFields.filter((f): f is string => typeof f === "string") : undefined,
       reason: typeof body.reason === "string" ? body.reason : null,
     });
     if (!result.ok) return jsonError(result.error, result.status);

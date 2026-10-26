@@ -114,8 +114,10 @@ import {
   staffNoticeFor,
 } from "@/lib/server/aiAgent/escalations";
 import { proposeReply } from "@/lib/server/aiAgent/model";
-import { isUpdateCommand, type TrackedOrder } from "@/lib/aiAgent/orders";
-import { handleUpdateCommand, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
+import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
+import type { TrackedOrder } from "@/lib/aiAgent/orders";
+import { refineOrderDraft } from "@/lib/aiAgent/orderText";
+import { handleOrderCommand, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
 import { monitorCustomerTurn, monitorStaffMessage } from "@/lib/server/aiAgent/orderMonitor";
 import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
 import {
@@ -184,9 +186,9 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
     await recordIgnored(input, isStaffGroup || isOrdersGroup ? "staff_group" : "staff_outbound", "agent_echo", settings);
     return ignored("agent_echo");
   }
-  // "!update" is honoured in the configured group only. From any other group it is refused, silently (the agent
-  // never posts into a group it was not given) and on the record.
-  if (!isStaffGroup && !isOrdersGroup && input.chatId.endsWith("@g.us") && isUpdateCommand(input.text)) {
+  // Order commands ("!update", "!order", "!moreinfo #REF") are honoured in the configured group only. From any other
+  // group they are refused, silently (the agent never posts into a group it was not given) and on the record.
+  if (!isStaffGroup && !isOrdersGroup && input.chatId.endsWith("@g.us") && parseOrderCommand(input.text)) {
     await audit(input.businessSlug, "staff", input.senderJid, "orders.update_rejected", { type: "chat", id: input.chatId }, { reason: "wrong_group" });
     await recordIgnored(input, "other_group", "orders_update_wrong_group", settings);
     return ignored("orders_update_wrong_group");
@@ -306,15 +308,19 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   }
 }
 
-/** A message in the separate Orders group: only "!update" does anything; it never reaches the escalation logic. */
+/** A message in the separate Orders group: only the order commands do anything; it never reaches the escalation logic. */
 async function processOrdersGroupMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
-  if (!isUpdateCommand(input.text)) return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
-  const result = await handleUpdateCommand({
+  const command = parseOrderCommand(input.text);
+  if (!command) return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
+  const result = await handleOrderCommand({
     settings,
     fromGroup: input.chatId,
+    command,
     senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone ?? null),
     senderJid: input.senderJid,
     eventId,
+    whatsappMessageId: input.whatsappMessageId,
+    timestamp: input.timestamp,
   });
   return { decision: "NO_REPLY", reasons: [result.outcome], outbox: result.outbox, queued: result.queued };
 }
@@ -641,7 +647,10 @@ async function runPipeline(args: {
   // The raw drafts are kept for order tracking, which grounds them against the order they target (not the legacy request).
   const rawProposal = proposal ? { order_request: proposal.order_request, order_target: proposal.order_target, other_orders: proposal.other_orders } : null;
   if (proposal?.order_request) {
-    proposal = { ...proposal, order_request: groundOrderDraft(proposal.order_request, priorOrder, customerWords) };
+    const grounded = groundOrderDraft(proposal.order_request, priorOrder, customerWords);
+    // What the customer plainly said (a quantity, delivery or collection) is recorded even if the model left it out,
+    // so they are never asked again for something they already told us.
+    proposal = { ...proposal, order_request: grounded ? refineOrderDraft(grounded, [args.text], customerWords) : grounded };
   }
 
   const resolution = resolveDecision({
@@ -766,6 +775,7 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
         messageIds: turn.whatsappMessageIds,
         firstAt: turn.firstAt,
         lastAt: turn.lastAt,
+        segmentTimes: turn.messages.length === turn.segments.length ? turn.messages.map((m) => m.messageAt ?? turn.firstAt) : undefined,
         dedupeBase: ctx.dedupeBase,
       });
       trackingReasons.push(...tracked.reasons);

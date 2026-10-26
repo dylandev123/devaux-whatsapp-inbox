@@ -923,7 +923,7 @@ function clip(text: string | null | undefined, max: number): string {
 
 export function formatOrderRequest(request: OrderRequestDraft | null): string | null {
   if (!request || request.items.length === 0) return null;
-  const items = request.items.map((i) => `${i.quantity ?? "?"} × ${i.product}`).join(", ");
+  const items = request.items.map((i) => (i.quantity ? `${i.quantity} × ${i.product}` : `${i.product} — quantity needed`)).join(", ");
   return [
     items,
     `Address: ${request.delivery_address ?? "—"}`,

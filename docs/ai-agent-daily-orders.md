@@ -15,7 +15,7 @@ outbox kind, and every customer reply still needs explicit staff approval.
 | Rules (pure, tested) | `lib/aiAgent/orders.ts` |
 | Server logic | `lib/server/aiAgent/orders.ts` (hooked into `handleCustomerTurn` in `decide.ts`) |
 | Scheduler | One mechanism: the bridge's outbox poll (`/api/bridge/ai-agent/outbox/claim`) runs `runDueOrderSummaries()` at most once a minute. No cron job to configure. |
-| `!update` | `processStaffGroupMessage` (staff group) and `processOrdersGroupMessage` (separate Orders group) |
+| Order commands (`!update …`, `!order`, `!moreinfo #REF`) | parsed in `lib/aiAgent/orderCommands.ts`; run by `handleOrderCommand` from `processStaffGroupMessage` (staff group) and `processOrdersGroupMessage` (separate Orders group) |
 | Dashboard | Admin → AI agent → **Orders** tab; routes under `/api/ai-agent/orders` (admin-only, like every `/api/ai-agent/*` route) |
 
 `ai_agent_order_requests` (the Approval Pilot's collected request) and `customer_orders` (the analysis engine)
@@ -55,27 +55,57 @@ whole order; on a confirmed or ambiguous case it is **flagged for staff**, not a
   (join only on a shared product, else a flagged new order). An identical order is merged, never copied.
 * Every AI/customer change carries an idempotency key (`<batch or event id>:<n>`), so a retried batch or
   message changes nothing the second time. Writes are version-checked (`apply_ai_agent_order`).
-* Anything a person edited is locked: later AI updates never overwrite it.
+* Anything a person edited is locked: later AI updates never overwrite it. If the customer's NEW message (not older
+  words the cumulative draft repeats) states a different value for a locked field, it is stored in
+  `ai_agent_orders.field_conflicts` (`{ proposed, current, at }`), never applied. It shows in the dashboard (Use
+  customer's / Keep staff's), in `!moreinfo`, and as a `Customer now says …` warning in the report, even for a
+  confirmed order. It clears when staff edit that field (dashboard or `!update`) or choose Keep staff's. No extra model call.
+* Unknown quantities stay `null` in the database and read `Product — quantity needed` everywhere (never `? ×`).
+* Every successful `!update #REF …` answers once in the group with the reference and the change. Confirm/cancel say
+  they are internal and that the customer was not messaged. The notice is keyed to the WhatsApp message, so a
+  redelivery cannot post it twice.
 * Products, quantities, variants, sizes, addresses and times are kept only if the customer wrote them.
 
 ### The report
 
-Built from the database at send time. Sections **Confirmed** and **Needs attention** (anything not confirmed, with
-missing information, or flagged). Each order: reference, customer name, verified phone (or "phone not
-verified"), items, delivery/collection + address + day/time, notes, missing details, and
-*carried forward from <day>* when created on an earlier local day. Unconfirmed enquiries with no customer activity
-for 7 days drop out (they are counted, and stay in the dashboard); confirmed orders never expire. Customer text is
-sanitised so it can never start a line that looks like a command. Limited to ~3,800 characters; overflow is
-counted, not silently cut.
+Built from the database at send time (no stored AI text), the same for the 8 AM job and `!update`:
+
+```
+📋 *DAILY ORDERS — 26 OCT*
+5 orders · 1 confirmed · 4 to review
+
+✅ *CONFIRMED* (1)
+*1. Jane Doe · #K3PD7*
+Phone: 555-0101
+2 × Monello Beef 15kg
+1 × Dog Treats
+Delivery: 12 Main St, Gros Islet · Tue 27 Oct (tomorrow)
+
+⚠️ *NEEDS ATTENTION* (4)
+*2. Marie Joseph · #QU6U9*
+Phone: 286-7466
+1 × Monello Chicken 25kg
+Delivery: Cap Estate
+⚠️ Needs confirmation
+```
+
+* One block per order: best name · compact reference, readable phone (St Lucia numbers as `286-7466`), `quantity × product variant size`, delivery or
+  collection with address and day, a note, and **only the most actionable warning** (a flag a person must check, else the first missing required
+  detail, else "Needs confirmation"). Nothing is printed for what is unknown or empty. Confirmed orders are listed apart (the heading appears when
+  there is at least one; with none confirmed the summary line already says everything needs review).
+* The reference is the order's `ref_code` shown without its prefix (`O-QU6U9` → `#QU6U9`). It is created once and never changes.
+* A report that does not fit in one message (~3,500 characters) is split on order boundaries into numbered messages, `(1/3)`, `(2/3)`…, sent in order
+  (at most 6; beyond that the count of orders not shown is stated). Everything stays in the dashboard.
+* Unconfirmed enquiries with no customer activity for 7 days are left out and counted in one line. Confirmed orders never expire. Customer text is
+  sanitised so it can never start a line that looks like a command.
+* The only coverage line is a warning when something is wrong: tracking is OFF, conversations failed analysis or hit the hourly limit, or messages never
+  reached the agent. A healthy report carries none (the dashboard still shows the full coverage detail).
 
 ### What the report claims to cover
 
-The report is never presented as exhaustive. Every report ends with a coverage note built from the agent's own
-event log and batch queue (last 36 hours): tracking switched **off** → "Incomplete … do not treat it as complete";
-no / selected-only contact scope; conversations whose processing **failed** (⚠️, orders there may be missing);
-conversations deliberately **not read** (excluded contact, manual-only, staff took over); and when tracking
-started ("earlier conversations were not analysed"). The Orders tab shows the same notes. A report with a
-problem never carries the "lists only orders found in analysed conversations" reassurance.
+The report is never presented as exhaustive, but it no longer explains its own plumbing: a single warning line appears **only** when coverage is known to be
+incomplete (tracking switched OFF; conversations whose processing failed or hit the hourly limit; customer messages the bridge stored but never forwarded).
+The Orders tab shows the full coverage notes (including when tracking started and which conversations were deliberately not read).
 
 ### Scheduling and delivery safety
 
@@ -91,13 +121,32 @@ problem never carries the "lists only orders found in analysed conversations" re
 * The summary is a `staff_notice` (a kind the bridge already knows) and passes the same final gate
   (`outboxAllowed`) as every staff-group message. Observe mode posts it only when "post escalation notices" is on.
 
-### `!update`
+### Order commands (staff group / Orders group)
 
-Exactly `!update` (case/spacing tolerant) in the **configured orders group**, from a sender on the existing
-authorized-senders list (the same verified identity rule as `!send`). The report is rebuilt from the database
-with **no model call**. Refusals: unauthorized sender (answered in the group), feature off, wrong group (the
-staff group when a separate Orders group exists), and a 30-second cooldown. In any other group the command is
-ignored silently and audited (`orders.update_rejected`). A retried bridge message cannot post twice.
+Typed by an **authorized sender** (the same verified allow-list as `!send`) in the **configured orders group** (the staff group unless a separate Orders group is
+set). All of them are deterministic: no model call, resolved server-side inside the business, answered with a short message to that group only. Nothing here
+can message a customer.
+
+| Command | Does |
+|---|---|
+| `!update` | The current report (read-only; 30 s cooldown; a retried message cannot post twice). |
+| `!update #QU6U9 confirmed` | Staff-confirms the order (same rule as the dashboard: needs products, quantity, delivery/collection and an address for delivery). |
+| `!update #QU6U9 cancelled` | Cancels it. |
+| `!update #QU6U9 2 bags` | Sets the quantity (orders with exactly one product; otherwise "use the dashboard"). Needs a unit (`2 bags`, `x2`, `qty 2`). |
+| `!update #QU6U9 delivery tomorrow` | Sets the requested delivery day. "tomorrow"/weekdays are turned into a calendar day from when the command was written, in the business's timezone. |
+| `!order <name or phone>` | Lists matching **active** orders (up to 5). |
+| `!moreinfo #QU6U9` or `!order #QU6U9` | Full details: status, phone, name and where it came from, items, delivery, who edited what, the last 5 changes. |
+
+Rules: a selector (`#REF`, a phone number of 6+ digits, or a name) must identify exactly **one** active order; with two or more nothing changes and the
+choices are listed. References also find closed orders (to say "already cancelled"). A change goes through the **same function as the dashboard's buttons**
+(`updateOrderManually` → `apply_ai_agent_order`): version-checked, the edited field is locked against the AI, full history (`staff_whatsapp_*` events, actor
+`staff`) and an audit entry (`order.*`, `via: whatsapp`). Staff can overwrite a field they locked earlier; the AI cannot.
+
+Safety: the same WhatsApp message applied twice changes the order once (idempotency key `wa:<business>:<message id>`); a command is refused if the customer, the AI
+or the dashboard changed the order **after the command was written** (two staff commands typed seconds apart both apply), if it is more than 2 hours old, or
+if someone changed the order while it was being applied (version conflict); unauthorized senders get a refusal and an audit entry; the commands are
+ignored (and audited) in any other group; another business's references simply do not exist. `!moreinfo` **without** an order reference, and `!moreinfo #E-…`,
+still belong to the escalation / Approval Pilot logic untouched. Anything starting `!update …` that is not a recognised command stays ordinary staff chatter.
 
 ## Monitoring every conversation
 
@@ -135,6 +184,31 @@ conversations (the rest is reported on the run), reads at most 150 messages per 
 `backfill:<run>:<chat>:<chunk>`), and `ai_agent_order_backfill_runs` plus the audit log record who started it, the window, counts and failures. It reads
 stored messages and writes order records only. Retention of `whatsapp_messages` bounds how far back it can see.
 
+## Reading customer wording
+
+The model still does the main reading; `lib/aiAgent/orderText.ts` is the deterministic net around it, applied on both the reply path and the monitoring path:
+
+* **Quantities**: "a bag of Monello", "one bag" = 1, "two bags" = 2, "a couple of bags" = 2 only when the order has one product or the phrase names the product.
+  A product with two lines and an unnamed "two bags" stays "Needs quantity". A value the customer did not write is dropped (grounding), never invented.
+* **Delivery vs collection**: "bring it to Cap", "deliver tomorrow", "drop it off" are recorded as **Delivery** immediately (the customer is not asked again);
+  "I'll collect", "I'll pick up" as **Collection**. The latest statement wins; "don't deliver", "do you deliver?" and "delivery or collection?" record nothing.
+* **Relative dates**: "tomorrow", "tonight", "Friday" are resolved from the **timestamp of the message that said them**, in the business's timezone
+  (America/St_Lucia), and stored as `Tue 27 Oct (tomorrow)`. A retry, a backfill or the model repeating "tomorrow" in a later turn cannot move the date.
+  Ambiguous wording ("next Friday", a weekday said on that weekday, two days named) stays as the customer's words.
+* **Withdrawn items**: "just the Monello bags" keeps Monello and records the dropped products in the order's history (`removed_items`). If the model drops a
+  product the customer never withdrew, it is restored and the turn is marked `order_item_removal_unconfirmed`.
+* **Enquiry vs order** is unchanged: a product question is not an order unless one is already open; a customer's "yes" only confirms under the existing
+  strict rules; staff-confirmed (`confirmed_by = staff:<id>` / `admin:<id>`) and customer-confirmed (`customer`) stay distinguishable in the dashboard and `!moreinfo`.
+* Staff corrections and field locks are untouched: anything a person edited stays theirs.
+
+## Customer names
+
+Read fresh at report time (nothing is copied onto the order), best first: the name staff entered (the order's own name when edited, else first + last name on the
+customer's profile) → the name saved for the contact on the business phone (`customers.business_contact_name`, else the latest
+`whatsapp_messages.business_contact_name` of that chat) → the customer's own WhatsApp profile name (`customers.whatsapp_name` / `whatsapp_messages.contact_name`)
+→ the name the order recorded when it was created → the phone number. Numbers, JIDs, placeholders ("Unknown"), symbols-only and very long values are never used as a
+name. `!moreinfo` says which kind of name is shown. The Orders tab shows the same name.
+
 ## Settings (per business, Setup → "Daily orders"; all OFF by default)
 
 `orders_tracking_enabled`, `orders_summary_enabled`, `orders_group_jid` (empty = the staff group, e.g. the
@@ -142,6 +216,8 @@ Approval Pilot group), `orders_timezone`, `orders_summary_hour`. Tracking is **i
 (see "Monitoring every conversation"); it needs the agent switched on for the business.
 
 ## Deployment
+
+**This release needs one more small migration (`20261103000000_ai_agent_order_field_conflicts.sql`: a `field_conflicts` column and the same `apply_ai_agent_order`, now writing it) and no bridge change.** Run it after the two below, before deploying the app.
 
 **Migration (run in the Supabase SQL editor, in this order, before deploying the app):**
 `supabase/migrations/20261101000000_ai_agent_daily_orders.sql` (needs 20261022–20261031 applied), then
@@ -174,15 +250,18 @@ until the bridge is deployed.
    order, *Awaiting confirmation*, phone shown. No customer message is sent.
 3. Send "make it 3 bags": same order, quantity 3, History shows before/after. Send a second, different order: two orders.
 4. Reply "yes" with no staff message in between: still *Awaiting*. Have staff write to the customer, then "yes please": the order stays *Awaiting*, flagged *Customer replied yes*; press *Confirm* → "verified by staff".
-5. In the staff group, an authorized sender types `!update`: a report appears with both sections. A non-authorized
-   sender gets a refusal; `!update` in another group does nothing.
+5. In the staff group, an authorized sender types `!update`: the compact report appears. Then `!update #REF confirmed`, `!update #REF 2 bags`,
+   `!update #REF delivery tomorrow`, `!order <name>` and `!moreinfo #REF` each answer in the group and change the Orders tab. A non-authorized
+   sender gets a refusal; the commands in another group do nothing; no message ever reaches a customer.
 6. Orders tab → *Send summary now* behaves like `!update`. Edit an order (e.g. the address), `!update` again (after 30 s): the change is in the report.
 7. At 8:00 St Lucia time one summary arrives (within a minute or so of the bridge's next poll); nothing further follows. The "Daily summary" card shows the run and its delivery state. Switch tracking off and `!update`: the report says it is incomplete.
 8. Kill the bridge before 8:00, restart within 6 hours: the summary arrives once after restart.
 
 ## Known limits / follow-ups
 
-* Customer names come from the saved contact; otherwise the report says "Unnamed customer" next to the phone.
+* A saved contact name exists only if the business phone has the contact saved and the bridge has seen it (it reads contact events after connecting); until then the profile name, then the phone, is shown.
+* A quantity set by command locks the order's products against the AI: if the customer later changes the quantity in WhatsApp, a person must update it (dashboard or `!update`).
+* Dates: only "today / tonight / tomorrow / day after tomorrow / a named weekday" are turned into calendar days; "next Friday", dates like "28th" and times stay as written.
 * No retention job for fulfilled/cancelled orders yet (deleting a customer via the Memory tab does remove theirs).
 * A customer's yes counts only if a person wrote to them (inbox, `!send`) in the last 48 h and exactly one order is open; a phone confirmation is a *Confirm* click.
 * A staff message in the chat can raise a flag but never creates an order, so an order the customer only described in a voice note and staff then wrote out is

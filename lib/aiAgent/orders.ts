@@ -53,6 +53,14 @@ export const EDITABLE_ORDER_FIELDS = [
 ] as const;
 export type EditableOrderField = (typeof EDITABLE_ORDER_FIELDS)[number];
 
+/** A customer message that contradicts a staff-locked field: the value they proposed beside the value staff set. */
+export interface FieldConflict {
+  proposed: unknown;
+  current: unknown;
+  at: string;
+}
+export type FieldConflicts = Partial<Record<EditableOrderField, FieldConflict>>;
+
 /** An ai_agent_orders row. */
 export interface TrackedOrder extends OrderFields {
   id: string;
@@ -68,6 +76,8 @@ export interface TrackedOrder extends OrderFields {
   last_message_at: string;
   awaiting_since: string | null;
   manual_locked_fields: string[];
+  /** What the customer asked for in a field staff had locked, by field. Never applied: a person resolves it. */
+  field_conflicts: FieldConflicts;
   confirmed_by: string | null;
   confirmed_at: string | null;
   /** The customer replied an unambiguous yes (recorded even when only staff may finalize). */
@@ -176,14 +186,22 @@ export function mergeDraft(
   existing: OrderFields | null,
   draft: OrderRequestDraft,
   locked: readonly string[] = [],
-  customerName: string | null = null
-): { fields: OrderFields; changes: FieldChange[] } {
+  customerName: string | null = null,
+  /** Says whether the customer stated this value in the CURRENT turn (a cumulative draft also repeats older words). */
+  statedNow?: (field: EditableOrderField, proposed: unknown) => boolean
+): { fields: OrderFields; changes: FieldChange[]; conflicts: FieldChange[] } {
   const base = existing ?? emptyFields();
   const isLocked = (f: EditableOrderField) => locked.includes(f);
   const fields: OrderFields = { ...base, items: [...base.items] };
   const changes: FieldChange[] = [];
+  const conflicts: FieldChange[] = [];
   const set = <K extends EditableOrderField>(field: K, next: OrderFields[K], same: boolean) => {
-    if (isLocked(field) || same) return;
+    if (same) return;
+    if (isLocked(field)) {
+      // The staff value stays. A customer who now says something else is recorded, never applied.
+      if (statedNow?.(field, next)) conflicts.push({ field, before: base[field], after: next });
+      return;
+    }
     changes.push({ field, before: base[field], after: next });
     fields[field] = next;
   };
@@ -199,7 +217,7 @@ export function mergeDraft(
   if (method) set("fulfilment_method", method, method === base.fulfilment_method);
   if (draft.delivery_preference && !isLocked("fulfilment_method")) fields.delivery_preference = draft.delivery_preference;
   if (!base.customer_name && customerName) fields.customer_name = customerName;
-  return { fields, changes };
+  return { fields, changes, conflicts };
 }
 
 // ── Customer words ───────────────────────────────────────────────────────────
@@ -467,15 +485,10 @@ function safe(value: string | null | undefined, max: number): string {
 
 export function formatLine(l: OrderLine): string {
   const detail = [l.variant, l.size].filter(Boolean).map((v) => safe(v, 40)).join(", ");
-  return `${l.quantity ? safe(l.quantity, 20) : "qty ?"} × ${safe(l.product, 80)}${detail ? ` (${detail})` : ""}`;
+  const product = `${safe(l.product, 80)}${detail ? ` (${detail})` : ""}`;
+  return l.quantity ? `${safe(l.quantity, 20)} × ${product}` : `${product} — quantity needed`;
 }
 
-const displayPhone = (digits: string | null) => (digits ? `+${digits}` : "phone not verified");
-
-function dayLabel(dateKey: string, tz: string): string {
-  const [y, m, d] = dateKey.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", weekday: "short", day: "numeric", month: "short" }).format(new Date(Date.UTC(y, m - 1, d, 12)));
-}
 
 export function isStale(o: Pick<TrackedOrder, "status" | "last_message_at" | "updated_at">, now: Date): boolean {
   if (o.status === "confirmed") return false;
@@ -484,7 +497,7 @@ export function isStale(o: Pick<TrackedOrder, "status" | "last_message_at" | "up
 }
 
 export function needsAttention(o: TrackedOrder): boolean {
-  return o.status !== "confirmed" || Boolean(o.attention) || !isComplete(o.missing_fields);
+  return o.status !== "confirmed" || Boolean(o.attention) || !isComplete(o.missing_fields) || conflictFields(o).length > 0;
 }
 
 /** What the report can honestly claim to cover. */
@@ -530,32 +543,236 @@ export function confirmationLabel(o: Pick<TrackedOrder, "confirmed_by" | "custom
   return "confirmed";
 }
 
+
+// ── Compact references, phones and names ─────────────────────────────────────
+
+/** "O-QU6U9" → "#QU6U9". The reference never changes after the order is created, so it is what staff type back. */
+export const displayRef = (refCode: string): string => `#${refCode.replace(/^O-/i, "")}`;
+
+const REF_TOKEN = /^#?(?:O-)?([A-HJ-NP-Z2-9]{5})$/i;
+
+/** "#QU6U9", "qu6u9" and "O-QU6U9" are the same order. Returns the stored reference ("O-QU6U9") or null. */
+export function parseOrderRef(token: string): string | null {
+  const m = token.trim().match(REF_TOKEN);
+  return m ? `O-${m[1].toUpperCase()}` : null;
+}
+
+/** St Lucia numbers read as staff say them (286-7466); other NANP and international numbers keep their country code. */
+export function formatPhone(digits: string | null | undefined): string | null {
+  const d = (digits ?? "").replace(/\D/g, "");
+  if (d.length < 7) return null;
+  if (/^1758\d{7}$/.test(d)) return `${d.slice(4, 7)}-${d.slice(7)}`;
+  if (/^1\d{10}$/.test(d)) return `+1 ${d.slice(1, 4)}-${d.slice(4, 7)}-${d.slice(7)}`;
+  return `+${d}`;
+}
+
+const INVISIBLE = /[​-‏‪-‮⁦-⁩﻿]/g;
+const PLACEHOLDER_NAMES = new Set(["unknown", "unknown contact", "unknown customer", "whatsapp user", "whatsapp", "customer", "n/a", "na", "none", "null", "undefined"]);
+
+/** A name safe to show: not a number or a JID, not a placeholder, not symbols or emoji only, not absurdly long. */
+export function isReliableName(value: string | null | undefined): boolean {
+  const t = (value ?? "").replace(INVISIBLE, "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (t.length < 2 || t.length > 60) return false;
+  if (!/\p{L}/u.test(t)) return false;
+  if (/@(s\.whatsapp\.net|lid|c\.us|g\.us)\b/i.test(t) || /^\+?[\d\s()-]{6,}$/.test(t)) return false;
+  if (PLACEHOLDER_NAMES.has(t.toLowerCase())) return false;
+  if (/^(.)\1+$/u.test(t)) return false;
+  return true;
+}
+
+const cleanName = (value: string | null | undefined): string | null =>
+  isReliableName(value) ? (value ?? "").replace(INVISIBLE, "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().replace(/^[!/]+/, "") : null;
+
+export type NameSource = "staff" | "saved" | "profile";
+
+export interface ResolvedName {
+  /** The best reliable name, or null (the phone is the fallback). */
+  name: string | null;
+  source: NameSource | null;
+  /** Every reliable name known for this customer, for searching. */
+  all: string[];
+}
+
+export interface NameSources {
+  /** The order's own name when staff edited it (a locked field). */
+  orderNameLocked?: string | null;
+  /** First + last name entered on the customer's profile by staff. */
+  crmName?: string | null;
+  /** The name saved for this contact on the linked phone (Baileys Contact.name). */
+  savedName?: string | null;
+  /** The customer's own WhatsApp profile name (pushName). */
+  profileName?: string | null;
+  /** The name the order recorded when it was created (origin unknown). */
+  orderName?: string | null;
+}
+
+/** Staff-entered name first, then the saved contact name, then the WhatsApp profile name. Unreliable values never win. */
+export function pickCustomerName(s: NameSources): ResolvedName {
+  const tiers: [NameSource, string | null | undefined][] = [
+    ["staff", s.orderNameLocked],
+    ["staff", s.crmName],
+    ["saved", s.savedName],
+    ["profile", s.profileName],
+    ["profile", s.orderName],
+  ];
+  const usable = tiers.map(([source, v]) => [source, cleanName(v)] as const).filter((t): t is readonly [NameSource, string] => Boolean(t[1]));
+  const all = [...new Set(usable.map((t) => t[1]))];
+  return usable.length > 0 ? { name: usable[0][1], source: usable[0][0], all } : { name: null, source: null, all };
+}
+
+// ── The daily report ─────────────────────────────────────────────────────────
+
+/** One WhatsApp message stays well inside the outbox limit; longer reports become numbered parts. */
+const MAX_PART_CHARS = 3500;
+const MAX_REPORT_PARTS = 6;
+
+const MONTH_NAMES = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+const titleDate = (dateKey: string) => {
+  const [, m, d] = dateKey.split("-").map(Number);
+  return `${d} ${MONTH_NAMES[m - 1]}`;
+};
+
+/** One short line per reason a person must look. */
+const SHORT_ATTENTION: Record<string, string> = {
+  changed_after_confirmation: "Changed after confirmation — re-confirm",
+  cancellation_requested: "Customer may want to cancel",
+  check_if_duplicate: "May be a duplicate order",
+  customer_replied_yes: "Customer said yes — staff to confirm",
+  staff_confirmed_in_chat: "Staff confirmed in chat — verify",
+  staff_cancelled_in_chat: "Staff cancelled in chat — verify",
+  staff_changed_in_chat: "Staff changed it in chat — check",
+  other_customer_note: "Needs a staff look",
+};
+const SHORT_MISSING: [string, string][] = [
+  ["items", "Needs products"],
+  ["quantity", "Needs quantity"],
+  ["fulfilment_method", "Needs delivery or collection"],
+  ["delivery_address", "Needs delivery address"],
+];
+
+export const CONFLICT_LABEL: Record<EditableOrderField, string> = {
+  customer_name: "name",
+  items: "products",
+  fulfilment_method: "delivery/collection",
+  delivery_address: "address",
+  requested_for: "day/time",
+  notes: "note",
+};
+
+/** The locked fields the customer has since contradicted. */
+export function conflictFields(o: Pick<TrackedOrder, "field_conflicts">): EditableOrderField[] {
+  return (Object.keys(o.field_conflicts ?? {}) as EditableOrderField[]).filter((f) => o.field_conflicts[f]);
+}
+
+/** One value as a person reads it ("2 × Monello; …", "delivery", "Fri 30 Oct"). */
+export function conflictValueText(field: EditableOrderField, v: unknown, max = 60): string {
+  if (v === null || v === undefined || v === "") return "—";
+  const text = field === "items" && Array.isArray(v) ? v.map((l) => orderItemText(l as OrderLine)).join("; ") : String(v);
+  return safe(text, max);
+}
+
+/** "Customer now says day/time: Fri 30 Oct (staff set Thu 29 Oct)". */
+export function conflictText(field: EditableOrderField, c: FieldConflict, max = 60): string {
+  return `${CONFLICT_LABEL[field]}: ${conflictValueText(field, c.proposed, max)} (staff set ${conflictValueText(field, c.current, max)})`;
+}
+
+/** The single most actionable thing about an order, or null when there is nothing to do. */
+export function orderWarning(o: Pick<TrackedOrder, "status" | "attention" | "missing_fields"> & Partial<Pick<TrackedOrder, "field_conflicts">>): string | null {
+  const fields = o.field_conflicts ? conflictFields({ field_conflicts: o.field_conflicts }) : [];
+  if (fields.length > 0) {
+    const more = fields.length > 1 ? ` +${fields.length - 1} more` : "";
+    return `Customer now says ${conflictText(fields[0], o.field_conflicts![fields[0]]!, 40)}${more} — check`;
+  }
+  if (o.attention) return SHORT_ATTENTION[o.attention] ?? SHORT_ATTENTION.other_customer_note;
+  const missing = SHORT_MISSING.find(([field]) => o.missing_fields.includes(field));
+  if (missing) return missing[1];
+  return o.status === "confirmed" ? null : "Needs confirmation";
+}
+
+/** "1 × Monello Chicken 25kg": product, variant and size read as one product name. */
+export function orderItemText(l: OrderLine): string {
+  return l.quantity ? `${safe(l.quantity, 20)} × ${orderProductText(l)}` : `${orderProductText(l)} — quantity needed`;
+}
+
+/** "Monello Chicken 25kg": product, variant and size, without repeating what the product name already says. */
+export function orderProductText(l: OrderLine): string {
+  const product = safe(l.product, 80);
+  const have = normalizeText(product);
+  const extras = [l.variant, l.size].map((v) => safe(v, 40)).filter((v) => v && !have.includes(normalizeText(v)));
+  return [product, ...extras].join(" ");
+}
+
+function fulfilmentLine(o: TrackedOrder): string | null {
+  const when = o.requested_for ? safe(o.requested_for, 80) : "";
+  if (o.fulfilment_method === "delivery") {
+    const parts = [o.delivery_address ? safe(o.delivery_address, 120) : "", when].filter(Boolean);
+    return parts.length > 0 ? `Delivery: ${parts.join(" · ")}` : "Delivery";
+  }
+  if (o.fulfilment_method === "collection") return when ? `Collection: ${when}` : "Collection";
+  return when ? `Wanted: ${when}` : null;
+}
+
+export interface OrderNames {
+  [orderId: string]: ResolvedName | undefined;
+}
+
+/** The name an order is listed under: the resolved one, else a reliable name the order itself holds, else null. */
+export function orderDisplayName(o: Pick<TrackedOrder, "id" | "customer_name">, names?: OrderNames): string | null {
+  return names?.[o.id]?.name ?? cleanName(o.customer_name);
+}
+
+/** One order as it reads in the staff group. */
+export function orderBlock(o: TrackedOrder, index: number | null, names?: OrderNames): string {
+  const phone = formatPhone(o.contact_number);
+  const name = orderDisplayName(o, names);
+  const lead = index === null ? "" : `${index}. `;
+  const lines = [`*${lead}${name ?? phone ?? "Unknown customer"} · ${displayRef(o.ref_code)}*`];
+  if (name && phone) lines.push(`Phone: ${phone}`);
+  if (o.items.length > 0) lines.push(...o.items.map(orderItemText));
+  const how = fulfilmentLine(o);
+  if (how) lines.push(how);
+  if (o.notes) lines.push(`Note: ${safe(o.notes, 120)}`);
+  const warning = orderWarning(o);
+  if (warning) lines.push(`⚠️ ${warning}`);
+  return lines.join("\n");
+}
+
+/** One line in the report for anything that makes the list incomplete, or null. */
+export function coverageWarning(c: Coverage | undefined): string | null {
+  if (!c) return null;
+  if (!c.trackingOn) return "⚠️ Order tracking is OFF — this list may be incomplete.";
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  const gaps: string[] = [];
+  if (c.failedChats > 0) gaps.push(`${plural(c.failedChats, "chat", "chats")} could not be analysed`);
+  if ((c.budgetChats ?? 0) > 0) gaps.push(`${plural(c.budgetChats ?? 0, "chat", "chats")} hit the analysis limit`);
+  if ((c.notForwardedMessages ?? 0) > 0) gaps.push(`${plural(c.notForwardedMessages ?? 0, "message", "messages")} never reached the agent`);
+  return gaps.length > 0 ? `⚠️ May be incomplete: ${gaps.join(", ")}. Check the inbox.` : null;
+}
+
 export interface SummaryInput {
-  businessLabel: string;
   timezone: string;
   now: Date;
   /** Every outstanding (possible / awaiting / confirmed) order of THIS business, from the database. */
   orders: TrackedOrder[];
-  trigger: "scheduled" | "manual";
+  /** Best names by order id (loadOrderNames); orders without one fall back to the phone. */
+  names?: OrderNames;
   coverage?: Coverage;
+  /** Accepted for older callers; the report no longer prints either. */
+  businessLabel?: string;
+  trigger?: "scheduled" | "manual";
 }
 
 export interface SummaryResult {
+  /** The whole report (parts joined). */
   text: string;
+  /** What is actually sent: one WhatsApp message per entry, numbered "(1/2)" when there is more than one. */
+  parts: string[];
   confirmed: number;
   attention: number;
   carriedForward: number;
   omittedStale: number;
   truncated: number;
 }
-
-const STATUS_TEXT: Record<OrderStatus, string> = {
-  possible: "Possible order — details incomplete",
-  awaiting_confirmation: "Awaiting customer confirmation",
-  confirmed: "Confirmed",
-  fulfilled: "Fulfilled",
-  cancelled: "Cancelled",
-};
 
 export function buildOrderSummary(input: SummaryInput): SummaryResult {
   const { timezone: tz, now } = input;
@@ -566,70 +783,63 @@ export function buildOrderSummary(input: SummaryInput): SummaryResult {
   const byAge = (a: TrackedOrder, b: TrackedOrder) => Date.parse(a.first_message_at) - Date.parse(b.first_message_at);
   const confirmed = live.filter((o) => !needsAttention(o)).sort(byAge);
   const attention = live.filter(needsAttention).sort(byAge);
-  const carried = (o: TrackedOrder) => localParts(new Date(o.first_message_at), tz).dateKey < today;
-  const carriedForward = live.filter(carried).length;
+  const carriedForward = live.filter((o) => localParts(new Date(o.first_message_at), tz).dateKey < today).length;
 
-  const render = (o: TrackedOrder, compact: boolean): string => {
-    const who = `${safe(o.customer_name, 60) || "Unnamed customer"} (${displayPhone(o.contact_number)})`;
-    const head = `*${o.ref_code}* · ${who}`;
-    const items = o.items.length > 0 ? o.items.map(formatLine).join("; ") : "no products yet";
-    const carry = carried(o) ? ` ↪ carried forward from ${dayLabel(localParts(new Date(o.first_message_at), tz).dateKey, tz)}` : "";
-    if (compact) return `${head}\n   ${items}${carry}`;
-    const lines = [head, `   ${items}`];
-    const how = o.fulfilment_method === "delivery" ? "Delivery" : o.fulfilment_method === "collection" ? "Collection" : "Delivery/collection not stated";
-    const where = o.fulfilment_method === "delivery" && o.delivery_address ? ` — ${safe(o.delivery_address, 120)}` : "";
-    const when = o.requested_for ? ` — ${safe(o.requested_for, 80)}` : "";
-    lines.push(`   ${how}${where}${when}`);
-    if (o.notes) lines.push(`   Note: ${safe(o.notes, 160)}`);
-    const missing = o.missing_fields.filter((m) => m in MISSING_TEXT);
-    if (missing.length > 0) lines.push(`   Missing: ${missing.map((m) => MISSING_TEXT[m]).join(", ")}`);
-    if (needsAttention(o)) lines.push(`   Status: ${STATUS_TEXT[o.status]}`);
-    else lines.push(`   Status: ${confirmationLabel(o)}`);
-    if (o.attention) lines.push(`   ⚠ ${ATTENTION_TEXT[o.attention] ?? ATTENTION_TEXT.other_customer_note}`);
-    if (carry) lines.push(`  ${carry}`);
-    return lines.join("\n");
+  const title = `📋 *DAILY ORDERS — ${titleDate(today)}*`;
+  const count = (n: number) => `${n} ${n === 1 ? "order" : "orders"}`;
+  const summaryLine = live.length === 0 ? "No outstanding orders." : `${count(live.length)} · ${confirmed.length} confirmed · ${attention.length} to review`;
+
+  const footer: string[] = [];
+  if (omittedStale > 0) footer.push(`${omittedStale} older unconfirmed ${omittedStale === 1 ? "enquiry" : "enquiries"} (${STALE_AFTER_DAYS}+ days) not shown.`);
+  const gap = coverageWarning(input.coverage);
+  if (gap) footer.push(gap);
+
+  type Section = "confirmed" | "attention";
+  const entries = [...confirmed.map((o) => ({ o, section: "confirmed" as Section })), ...attention.map((o) => ({ o, section: "attention" as Section }))];
+  // Confirmed orders get their own heading; with none confirmed, the summary line already says everything needs review.
+  const headings = confirmed.length > 0;
+  const headingFor = (section: Section, cont: boolean) => {
+    const n = section === "confirmed" ? confirmed.length : attention.length;
+    return `${section === "confirmed" ? "✅ *CONFIRMED*" : "⚠️ *NEEDS ATTENTION*"} ${cont ? "(cont.)" : `(${n})`}`;
   };
 
-  const when = new Intl.DateTimeFormat("en-GB", { timeZone: tz, weekday: "short", day: "numeric", month: "short", year: "numeric" }).format(now);
-  const clock = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(now);
-  const header = [`📋 *Orders — ${safe(input.businessLabel, 60)}*`, `${when} · ${clock}${input.trigger === "manual" ? " · requested update" : ""}`];
-
-  const build = (compact: boolean): { text: string; truncated: number } => {
-    const out = [...header, ""];
-    const coverage = coverageLines(input.coverage, tz);
-    let budget = MAX_REPORT_CHARS - header.join("\n").length - 220 - coverage.join("\n").length;
-    let truncated = 0;
-    const section = (title: string, orders: TrackedOrder[]) => {
-      out.push(`${title} (${orders.length})`);
-      if (orders.length === 0) out.push("   None");
-      for (const o of orders) {
-        const block = render(o, compact);
-        if (block.length + 1 > budget) {
-          truncated += 1;
-          continue;
-        }
-        budget -= block.length + 1;
-        out.push(block);
+  const base = title.length + 10;
+  const bodies: string[][] = [[]];
+  let size = base + summaryLine.length + 2;
+  let current: Section | null = null;
+  let truncated = 0;
+  for (const [i, e] of entries.entries()) {
+    const block = orderBlock(e.o, i + 1, input.names);
+    const heading = headings && e.section !== current ? headingFor(e.section, false) : null;
+    if (size + block.length + (heading?.length ?? 0) + 3 > MAX_PART_CHARS && bodies[bodies.length - 1].length > 0) {
+      if (bodies.length >= MAX_REPORT_PARTS) {
+        truncated = entries.length - i;
+        break;
       }
-      out.push("");
-    };
-    section("✅ *CONFIRMED*", confirmed);
-    section("⚠️ *NEEDS ATTENTION*", attention);
-    if (truncated > 0) out.push(`…and ${truncated} more not shown — see the Orders page in the inbox.`);
-    if (omittedStale > 0) out.push(`${omittedStale} older unconfirmed ${omittedStale === 1 ? "enquiry" : "enquiries"} (no reply for ${STALE_AFTER_DAYS}+ days) not listed.`);
-    if (live.length === 0 && omittedStale === 0) out.push("No outstanding orders found.");
-    if (coverage.length > 0) out.push("", ...coverage);
-    return { text: out.join("\n").trim(), truncated };
-  };
+      bodies.push([]);
+      size = base;
+      // A section that continues onto the next message says so.
+      current = null;
+    }
+    const lead = headings && e.section !== current ? (heading ?? headingFor(e.section, true)) : null;
+    const body = bodies[bodies.length - 1];
+    if (lead) {
+      body.push(lead);
+      size += lead.length + 1;
+    }
+    body.push(block);
+    size += block.length + 2;
+    current = e.section;
+  }
+  const tail = [...(truncated > 0 ? [`…and ${truncated} more ${truncated === 1 ? "order" : "orders"} — see the Orders page in the inbox.`] : []), ...footer];
+  if (tail.length > 0) bodies[bodies.length - 1].push(tail.join("\n"));
 
-  let built = build(false);
-  if (built.text.length > MAX_REPORT_CHARS || built.truncated > 0) built = build(true);
-  return {
-    text: built.text.slice(0, 4000),
-    confirmed: confirmed.length,
-    attention: attention.length,
-    carriedForward,
-    omittedStale,
-    truncated: built.truncated,
-  };
+  const total = bodies.length;
+  const parts = bodies.map((body, i) => {
+    const head = `${title}${total > 1 ? ` (${i + 1}/${total})` : ""}`;
+    // Heading and blocks are separated by a single line break, blocks from each other by a blank line.
+    const joined = body.map((chunk, j) => (j > 0 && /^(✅|⚠️) \*(CONFIRMED|NEEDS ATTENTION)\*/.test(body[j - 1]) ? `\n${chunk}` : `\n\n${chunk}`)).join("");
+    return `${head}${i === 0 ? `\n${summaryLine}` : ""}${joined}`.trim();
+  });
+  return { text: parts.join("\n\n"), parts, confirmed: confirmed.length, attention: attention.length, carriedForward, omittedStale, truncated };
 }

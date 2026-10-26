@@ -133,6 +133,10 @@ class Query implements PromiseLike<Result> {
     return this;
   }
   not(col: string, op: string, value: unknown) {
+    if (op === "like" || op === "ilike") {
+      this.where.push(`${ident(col)} not ${op} ${lit(value)}`);
+      return this;
+    }
     if (op !== "is") throw new Error(`pgSupabase: .not(${op}) is not supported`);
     this.where.push(`${ident(col)} is not ${value === null ? "null" : lit(value)}`);
     return this;

@@ -218,7 +218,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.deepEqual(o.items, [{ product: "Monello Chicken", quantity: "2", variant: null, size: "15kg" }]);
     assert.equal(o.fulfilment_method, "delivery");
     assert.equal(o.delivery_address, "12 Main St Gros Islet");
-    assert.equal(o.requested_for, "Friday morning");
+    assert.match(o.requested_for, /^\w{3} \d{1,2} \w{3} \(Friday morning\)$/, "resolved to a calendar day, keeping the customer's words");
     assert.deepEqual(o.missing_fields, []);
     assert.equal(o.source_message_ids.length, 1);
     assert.match(o.source_message_ids[0], /^CUST-/);
@@ -471,8 +471,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal((await orderEvents(o.id)).at(-1)!.kind, "customer_replied_yes");
 
     const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(report, /NEEDS ATTENTION\* \(1\)/);
-    assert.match(report, /Customer replied yes — staff to verify/);
+    assert.match(report, /1 order · 0 confirmed · 1 to review/);
+    assert.match(report, /⚠️ Customer said yes — staff to confirm/);
 
     // Saying yes again does not pile up events.
     await customerSays(JANE, "yes");
@@ -486,7 +486,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(row.attention, null);
     const after = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
     assert.match(after, /CONFIRMED\* \(1\)/);
-    assert.match(after, /verified by staff \(customer also replied yes\)/);
+    assert.match(after, /1 order · 1 confirmed · 0 to review/);
+    assert.doesNotMatch(after, /⚠️/, "a confirmed order carries no warning");
   });
 
   test("with customer confirmation enabled the report says the customer's reply confirmed it", async () => {
@@ -496,7 +497,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     modelOrders(draft(), { order_target: o.ref_code });
     await customerSays(JANE, "confirmed");
     const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(report, /confirmed by the customer's reply/);
+    assert.match(report, /1 order · 1 confirmed · 0 to review/);
+    assert.equal((await allOrders())[0].confirmed_by, "customer");
   });
 
   test("a yes is never attributed when anything else is open in the chat, whatever the model says", async () => {
@@ -585,7 +587,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
 
     // A stale screen cannot overwrite a newer version.
     const stale = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "u", action: "cancel", expectedVersion: o.version });
-    assert.deepEqual(stale, { ok: false, status: 409, error: "This order changed since you opened it — reload and try again" });
+    assert.deepEqual(stale, { ok: false, status: 409, error: "This order changed since you opened it — reload and try again", code: "conflict" });
   });
 
   test("staff confirm, fulfil and cancel; an incomplete order cannot be confirmed; closed orders are final", async () => {
@@ -630,7 +632,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
 
     const seaOrder = sea[0];
     const cross = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: seaOrder.id, adminId: "u", action: "cancel" });
-    assert.deepEqual(cross, { ok: false, status: 404, error: "Order not found" });
+    assert.deepEqual(cross, { ok: false, status: 404, error: "Order not found", code: "not_found" });
 
     const dogSummary = await orders.buildSummaryNow(await settingsOf("dog_food"), "manual", D(EIGHT_AM));
     assert.match(dogSummary.text, /Monello Chicken/);
@@ -679,9 +681,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(item.dedupe_key, "ordersummary:dog_food:2026-10-27:1");
     assert.match(item.body, /CONFIRMED\* \(1\)/);
     assert.match(item.body, /NEEDS ATTENTION\* \(1\)/);
-    assert.match(item.body, /Jane \(\+17585550101\)/);
-    assert.match(item.body, /carried forward from Sun 25 Oct/);
-    assert.match(item.body, /Marcus[\s\S]*Missing: delivery address, day\/time wanted/);
+    assert.match(item.body, /Jane · #[A-Z2-9]{5}\*\nPhone: 555-0101/);
+    assert.match(item.body, /Marcus · #[A-Z2-9]{5}\*[\s\S]*⚠️ Needs delivery address/);
     const [run] = await runs();
     assert.deepEqual([run.status, run.local_date.slice(0, 10), run.confirmed_count, run.attention_count, run.carried_count], ["queued", "2026-10-27", 1, 1, 1]);
     assert.equal(run.outbox_id, item.id);
@@ -791,16 +792,13 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
   test("with tracking switched off the report says it is incomplete", async () => {
     await configure({ orders_tracking_enabled: false });
     const text = await reportText();
-    assert.match(text, /Incomplete:\* order tracking is switched OFF/);
-    assert.match(text, /Do not treat it as complete/);
+    assert.match(text, /⚠️ Order tracking is OFF — this list may be incomplete\./);
   });
 
   test("with tracking on it says what it covers, and when tracking started", async () => {
     await configure({ orders_tracking_since: "2026-10-20T15:00:00Z" });
     const text = await reportText();
-    assert.match(text, /Covers every customer chat the agent received, including ones the AI does not reply in/);
-    assert.match(text, /Tracking has been on since Tue 20 Oct; earlier conversations were not analysed/);
-    assert.doesNotMatch(text, /Incomplete/);
+    assert.doesNotMatch(text, /⚠️|incomplete|Tracking has been on since|Covers every/i, "a healthy report has no coverage chatter");
   });
 
   test("conversations whose processing failed, or that were deliberately not read, are counted", async () => {
@@ -812,16 +810,13 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await ev(SAM.chat, "done", ["human_takeover"]);
     await ev(SAM.chat, "done", ["orders_tracking_failed"]);
     const text = await reportText();
-    assert.match(text, /2 conversations could not be analysed in the last 36 h/);
-    assert.match(text, /1 conversation was handled in the last 36 h before every conversation was being read for orders/);
-    assert.match(text, /⚠️/);
-    assert.doesNotMatch(text, /Covers every customer chat/, "a report with problems must not read as a clean one");
+    assert.match(text, /⚠️ May be incomplete: 2 chats could not be analysed\. Check the inbox\./);
   });
 
   test("a failed or stuck batch counts as not analysed", async () => {
     await pg.run(`insert into public.ai_agent_batches (business_slug, chat_id, status, first_message_at, last_message_at, due_at, max_due_at, message_count)
                   values ('dog_food', ${lit(JANE.chat)}, 'failed', now(), now(), now(), now(), 1);`);
-    assert.match(await reportText(), /1 conversation could not be analysed/);
+    assert.match(await reportText(), /May be incomplete: 1 chat could not be analysed/);
   });
 
   test("a tracking failure inside a live turn is recorded and shows up in the next report", async () => {
@@ -835,7 +830,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     }
     assert.equal((await allOrders()).length, 0);
     assert.equal(await count(`select 1 from public.ai_agent_audit_log where action = 'orders.track_failed'`), 1);
-    assert.match(await reportText(), /1 conversation could not be analysed/);
+    assert.match(await reportText(), /May be incomplete: 1 chat could not be analysed/);
   });
 
   test("order tracking no longer depends on the AI contact scope, and the report says so", async () => {
@@ -843,7 +838,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
       await configure({ contact_scope: scope });
       const text = await reportText();
       assert.doesNotMatch(text, /selected for the AI|no customers are selected/, `scope ${scope}: no stale limitation`);
-      assert.match(text, /Covers every customer chat the agent received/);
+      assert.doesNotMatch(text, /⚠️/, `scope ${scope}: a healthy report`);
     }
   });
 
@@ -856,10 +851,9 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-25T15:00:00Z', last_message_at = '2026-10-26T15:00:00Z' where chat_id = ${lit(MARCUS.chat)};`);
     const text = await reportText();
     for (const part of [
-      "Jane Doe (+17585550101)", "2 × Monello Chicken (15kg)", "Delivery — 12 Main St Gros Islet — Friday morning",
-      "Note: Gate code 1234, ring twice", "Status: Awaiting customer confirmation",
-      "Unnamed customer (+17585550102)", "4 × Dog Treats", "Missing: delivery address, day/time wanted",
-      "Status: Possible order — details incomplete", "carried forward from Sun 25 Oct",
+      "Jane Doe · #", "Phone: 555-0101", "2 × Monello Chicken 15kg", "Delivery: 12 Main St Gros Islet · ", "(Friday morning)",
+      "Note: Gate code 1234, ring twice", "⚠️ Needs confirmation",
+      "555-0102 · #", "4 × Dog Treats", "⚠️ Needs delivery address",
     ]) assert.ok(text.includes(part), part);
   });
 
@@ -870,14 +864,14 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     const all = await allOrders();
     assert.equal(all.length, 1);
     assert.equal(all[0].fulfilment_method, "collection");
-    assert.equal(all[0].requested_for, "Saturday 10am");
+    assert.match(all[0].requested_for, /^\w{3} \d{1,2} \w{3} \(Saturday 10am\)$/);
     assert.deepEqual(all[0].missing_fields, []);
-    assert.match(await reportText(), /Collection — Saturday 10am/);
+    assert.match(await reportText(), /Collection: \w{3} \d{1,2} \w{3} \(Saturday 10am\)/);
 
     await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "u", action: "cancel", reason: "customer called" });
     const text = await reportText();
     assert.doesNotMatch(text, /Monello/);
-    assert.match(text, /No outstanding orders found/);
+    assert.match(text, /No outstanding orders\./);
     assert.equal((await allOrders())[0].status, "cancelled");
   });
 
@@ -892,7 +886,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(res.outbox[0].send, true);
     assert.equal(res.outbox[0].kind, "staff_notice");
     assert.equal(res.outbox[0].to, GROUP);
-    assert.match(res.outbox[0].body, /requested update/);
+    assert.match(res.outbox[0].body, /^📋 \*DAILY ORDERS — \d{1,2} [A-Z]{3}\*/);
     assert.match(res.outbox[0].body, /Jane/);
     assert.equal(modelCalls.length, before, "no model call for a staff summary request");
     const [run] = await runs();

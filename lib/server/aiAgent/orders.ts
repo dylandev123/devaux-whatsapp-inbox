@@ -13,6 +13,7 @@ import { randomBytes } from "crypto";
 import {
   AgentSettings,
   canPostOrderSummary,
+  type OrderItem,
   generateRefCode,
   hasSeparateOrdersGroup,
   ordersGroupJid,
@@ -22,6 +23,16 @@ import {
 import { groundOrderDraft } from "@/lib/aiAgent/escalationUpdates";
 import { SenderAuthorization } from "@/lib/aiAgent/identity";
 import {
+  moreInfoReply,
+  type OrderCommand,
+  ORDER_HELP,
+  ORDER_REPLY,
+  resolveSelector,
+  searchOrders,
+  searchReply,
+} from "@/lib/aiAgent/orderCommands";
+import { anchorRequestedFor, guardRemovedItems, messageTimeFor, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
+import {
   buildOrderSummary,
   type Coverage,
   computeMissing,
@@ -30,16 +41,20 @@ import {
   EDITABLE_ORDER_FIELDS,
   EditableOrderField,
   FieldChange,
+  type FieldConflicts,
   groundDeliveryPreference,
   isComplete,
   isOpenStatus,
   isWholeOrderCancellation,
   localParts,
   mergeDraft,
+  MISSING_TEXT,
   OPEN_ORDER_STATUSES,
+  type OrderNames,
   OrderFields,
   OrderLine,
   OrderStatus,
+  pickCustomerName,
   planOrderUpdate,
   resolveOrderTarget,
   scheduleState,
@@ -54,7 +69,7 @@ import { enqueue, OutboxInsert, OutboxRow } from "@/lib/server/aiAgent/outbox";
 import { businessLabel, isOutbound } from "@/lib/whatsapp";
 
 export const ORDER_COLUMNS =
-  "id, ref_code, business_slug, chat_id, contact_number, customer_name, status, items, fulfilment_method, delivery_preference, delivery_address, requested_for, notes, missing_fields, attention, source_message_ids, first_message_at, last_message_at, awaiting_since, manual_locked_fields, confirmed_by, confirmed_at, customer_confirmed_at, cancelled_at, cancel_reason, fulfilled_at, version, created_at, updated_at";
+  "id, ref_code, business_slug, chat_id, contact_number, customer_name, status, items, fulfilment_method, delivery_preference, delivery_address, requested_for, notes, missing_fields, attention, source_message_ids, first_message_at, last_message_at, awaiting_since, manual_locked_fields, field_conflicts, confirmed_by, confirmed_at, customer_confirmed_at, cancelled_at, cancel_reason, fulfilled_at, version, created_at, updated_at";
 
 const MAX_SOURCE_IDS = 50;
 const MAX_ATTEMPTS = 3;
@@ -177,6 +192,69 @@ export async function listOrderEvents(businessSlug: string, orderId: string) {
   return data ?? [];
 }
 
+// ── Customer names ───────────────────────────────────────────────────────────
+
+/**
+ * The best name for each order, read fresh from what the bridge and the Inbox already store (no copy to go stale):
+ * a name staff entered (on the order, or on the customer's profile) first, then the name saved for the contact on the
+ * business phone (customers / whatsapp_messages.business_contact_name), then the customer's own WhatsApp profile name
+ * (pushName). Unreliable values (numbers, JIDs, placeholders, symbols only) never win; the phone is the fallback.
+ * One query per source for the whole list, all scoped to the business.
+ */
+export async function loadOrderNames(businessSlug: string, orders: TrackedOrder[]): Promise<OrderNames> {
+  const names: OrderNames = {};
+  if (orders.length === 0) return names;
+  const db = agentDb();
+  const phones = unique(orders.map((o) => o.contact_number).filter((p): p is string => Boolean(p)));
+  const chats = unique(orders.map((o) => o.chat_id));
+  const recent = (column: "business_contact_name" | "contact_name") =>
+    db
+      .from("whatsapp_messages")
+      .select(`chat_id, ${column}, timestamp`)
+      .eq("business_slug", businessSlug)
+      .in("chat_id", chats)
+      .not(column, "is", null)
+      .order("timestamp", { ascending: false })
+      .limit(1000);
+  const [customers, savedRows, profileRows] = await Promise.all([
+    phones.length > 0
+      ? db.from("customers").select("phone_number, first_name, last_name, whatsapp_name, business_contact_name").in("phone_number", phones)
+      : Promise.resolve({ data: [] as never[], error: null }),
+    recent("business_contact_name"),
+    recent("contact_name"),
+  ]);
+  // A missing table or a failed lookup degrades to "no name known", never to a failed report.
+  const byPhone = new Map<string, { crm: string; saved: string | null; profile: string | null }>();
+  for (const c of customers.error ? [] : (customers.data ?? [])) {
+    byPhone.set(c.phone_number as string, {
+      crm: [c.first_name, c.last_name].filter(Boolean).join(" "),
+      saved: (c.business_contact_name as string | null) ?? null,
+      profile: (c.whatsapp_name as string | null) ?? null,
+    });
+  }
+  const savedByChat = new Map<string, string>();
+  const profileByChat = new Map<string, string>();
+  for (const m of savedRows.error ? [] : (savedRows.data ?? [])) {
+    const row = m as unknown as { chat_id: string; business_contact_name: string };
+    if (!savedByChat.has(row.chat_id)) savedByChat.set(row.chat_id, row.business_contact_name);
+  }
+  for (const m of profileRows.error ? [] : (profileRows.data ?? [])) {
+    const row = m as unknown as { chat_id: string; contact_name: string };
+    if (!profileByChat.has(row.chat_id)) profileByChat.set(row.chat_id, row.contact_name);
+  }
+  for (const o of orders) {
+    const c = o.contact_number ? byPhone.get(o.contact_number) : undefined;
+    names[o.id] = pickCustomerName({
+      orderNameLocked: o.manual_locked_fields.includes("customer_name") ? o.customer_name : null,
+      crmName: c?.crm,
+      savedName: c?.saved ?? savedByChat.get(o.chat_id),
+      profileName: c?.profile ?? profileByChat.get(o.chat_id),
+      orderName: o.customer_name,
+    });
+  }
+  return names;
+}
+
 // ── Writing ──────────────────────────────────────────────────────────────────
 
 const fieldsOf = (o: TrackedOrder): OrderFields => ({
@@ -267,7 +345,7 @@ function rowFrom(
   existing: TrackedOrder | null,
   fields: OrderFields,
   plan: ReturnType<typeof planOrderUpdate>,
-  ctx: { chatId: string; phone: string | null; messageIds: string[]; firstAt: string; lastAt: string; locked?: string[] }
+  ctx: { chatId: string; phone: string | null; messageIds: string[]; firstAt: string; lastAt: string; locked?: string[]; conflicts?: FieldConflicts }
 ): OrderRow {
   const confirmed = plan.status === "confirmed";
   return {
@@ -289,6 +367,7 @@ function rowFrom(
     last_message_at: ctx.lastAt,
     awaiting_since: plan.awaitingSince,
     manual_locked_fields: ctx.locked ?? existing?.manual_locked_fields ?? [],
+    field_conflicts: ctx.conflicts ?? existing?.field_conflicts ?? {},
     confirmed_by: confirmed ? (plan.confirmedByCustomer ? "customer" : (existing?.confirmed_by ?? null)) : null,
     confirmed_at: confirmed ? (plan.confirmedByCustomer ? ctx.lastAt : (existing?.confirmed_at ?? null)) : null,
     customer_confirmed_at: plan.customerConfirmedAt,
@@ -354,6 +433,8 @@ export interface TrackArgs {
   proposal: Parameters<typeof turnDrafts>[0] | null;
   /** The customer's messages in this turn, verbatim. */
   segments: string[];
+  /** When each of `segments` was written (same order). Relative dates ("tomorrow") count from these, not from "now". */
+  segmentTimes?: string[];
   /** The customer's recent words, for grounding. */
   customerWords: string[];
   messageIds: string[];
@@ -388,6 +469,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   const name = cleanName(args.customerName, chatId);
   const drafts = args.proposal ? turnDrafts(args.proposal) : [];
   const ctx = { chatId, phone: args.phone, messageIds: args.messageIds, firstAt: args.firstAt, lastAt: args.lastAt };
+  const tz = tzOf(args.settings);
 
   const write = async (key: string, existing: TrackedOrder | null, build: (current: TrackedOrder | null) => { row: OrderRow; event: string; actorKind: "ai" | "customer"; changes: Record<string, unknown> } | null) => {
     let current = existing;
@@ -482,20 +564,37 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     grounded.delivery_preference = groundDeliveryPreference(draft.delivery_preference, args.customerWords) ?? grounded.delivery_preference;
     // A whole-order cancellation in the same breath as a (re-stated) order must not create a new one.
     if (!existing && segments.some(isWholeOrderCancellation)) continue;
+    // Plainly stated quantities and delivery/collection are recorded even when the model left them out.
+    const refined = refineOrderDraft(grounded, segments, args.customerWords);
 
     await write(`${args.dedupeBase}:${index}`, existing, (cur) => {
-      const merged = mergeDraft(cur ? fieldsOf(cur) : null, grounded, cur?.manual_locked_fields ?? [], name);
+      // "Tomorrow" counts from when the customer WROTE it, in the business's timezone: a later retry or backfill cannot move it.
+      const when = refined.requested_for ? anchorRequestedFor(refined.requested_for, cur?.requested_for, messageTimeFor(refined.requested_for, segments, args.segmentTimes, args.lastAt), tz) : null;
+      // A product the model left out is dropped only if the customer withdrew it ("just the Monello bags").
+      const removal = cur ? guardRemovedItems<OrderItem>(cur.items, refined.items, segments) : null;
+      if (removal && removal.restored.length > 0 && !result.reasons.includes("order_item_removal_unconfirmed")) result.reasons.push("order_item_removal_unconfirmed");
+      const forMerge: OrderRequestDraft = { ...refined, ...(when ? { requested_for: when } : {}), ...(removal ? { items: removal.items } : {}) };
+      const merged = mergeDraft(cur ? fieldsOf(cur) : null, forMerge, cur?.manual_locked_fields ?? [], name, (field, proposed) => statedThisTurn(field, proposed, segments, cur?.items ?? []));
       const fields = merged.fields;
       const changed = cur ? merged.changes.length > 0 : true;
+      // A customer contradicting a staff-locked field: the staff value stays, the proposal is recorded for a person.
+      const conflicts: FieldConflicts = { ...(cur?.field_conflicts ?? {}) };
+      for (const c of merged.conflicts) conflicts[c.field] = { proposed: c.after, current: c.before, at: args.lastAt };
+      const conflictsChanged = merged.conflicts.some((c) => JSON.stringify(cur?.field_conflicts?.[c.field]?.proposed ?? null) !== JSON.stringify(c.after));
       const plan = planOrderUpdate({ existing: cur, fields, contentChanged: changed, customerTexts: segments, outboundSinceAwaiting: false, now });
       const attention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : plan.attention;
-      if (cur && plan.event === "no_change" && !changed) return null;
+      if (cur && plan.event === "no_change" && !changed && !conflictsChanged) return null;
       const finalPlan = { ...plan, attention };
       return {
-        row: rowFrom(cur, fields, finalPlan, ctx),
-        event: finalPlan.event,
+        row: rowFrom(cur, fields, finalPlan, { ...ctx, conflicts }),
+        event: cur && !changed && conflictsChanged && finalPlan.event === "no_change" ? "locked_field_conflict" : finalPlan.event,
         actorKind: finalPlan.event === "customer_cancelled" ? "customer" : "ai",
-        changes: { ...diff(merged.changes), ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}) },
+        changes: {
+          ...diff(merged.changes),
+          ...(conflictsChanged ? { field_conflicts: { before: cur?.field_conflicts ?? {}, after: conflicts } } : {}),
+          ...(removal && removal.removed.length > 0 && merged.changes.some((c) => c.field === "items") ? { removed_items: { before: removal.removed.map((i) => i.product), after: null } } : {}),
+          ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}),
+        },
       };
     });
     open = await loadOpenOrders(businessSlug, chatId);
@@ -563,21 +662,51 @@ export async function flagOrderFromStaff(args: StaffFlagArgs): Promise<{ applied
 
 // ── Manual corrections (dashboard) ───────────────────────────────────────────
 
-export type ManualAction = "edit" | "confirm" | "cancel" | "fulfil";
+/** "keep" = staff keep their value for the fields the customer contradicted (`conflictFields`, default all). */
+export type ManualAction = "edit" | "confirm" | "cancel" | "fulfil" | "keep";
 
 export interface ManualInput {
   businessSlug: string;
   orderId: string;
+  /** Who made the change: an admin's user id (dashboard) or a staff member's verified WhatsApp id (order command). */
   adminId: string;
+  /** "staff" = an authorized sender in the staff group; same rules as the dashboard, recorded as such. Default "admin". */
+  actor?: "admin" | "staff";
+  /** Makes the change idempotent: the same key applied twice changes nothing the second time. */
+  idempotencyKey?: string | null;
+  /** WhatsApp commands: refuse when a customer/AI/dashboard change landed after the command was written. */
+  notChangedSince?: string | null;
   action: ManualAction;
   expectedVersion?: number | null;
   patch?: Partial<Record<EditableOrderField, unknown>>;
+  conflictFields?: string[];
   reason?: string | null;
 }
 
+export type ManualFailure = "not_found" | "closed" | "conflict" | "stale" | "incomplete" | "invalid";
+
 export type ManualResult =
-  | { ok: true; order: TrackedOrder }
-  | { ok: false; status: number; error: string };
+  | { ok: true; order: TrackedOrder; duplicate?: boolean }
+  | { ok: false; status: number; error: string; code: ManualFailure };
+
+/** A change by one of these staff commands never makes a later command "stale": two commands typed seconds apart both apply. */
+const STAFF_COMMAND_EVENT = "staff_whatsapp_%";
+/** Clock difference tolerated between WhatsApp's message time and the database. */
+const STALE_TOLERANCE_MS = 5_000;
+
+/** True when something other than a staff command changed the order after `since` (the command was written before it). */
+async function changedSince(orderId: string, since: string): Promise<boolean> {
+  const cutoff = new Date(Date.parse(since) + STALE_TOLERANCE_MS).toISOString();
+  const { data, error } = await agentDb()
+    .from("ai_agent_order_events")
+    .select("id")
+    .eq("order_id", orderId)
+    .gt("created_at", cutoff)
+    .not("kind", "like", STAFF_COMMAND_EVENT)
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return (data ?? []).length > 0;
+}
 
 const trimmed = (v: unknown, max: number): string | null | undefined => {
   if (v === null) return null;
@@ -626,17 +755,35 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
   const { businessSlug, orderId, action } = input;
   const db = agentDb();
   const { data, error } = await db.from("ai_agent_orders").select(ORDER_COLUMNS).eq("id", orderId).eq("business_slug", businessSlug).maybeSingle();
-  if (error) return { ok: false, status: 500, error: error.message };
+  if (error) return { ok: false, status: 500, error: error.message, code: "invalid" };
   const order = data as TrackedOrder | null;
-  if (!order) return { ok: false, status: 404, error: "Order not found" };
-  if (input.expectedVersion != null && input.expectedVersion !== order.version) {
-    return { ok: false, status: 409, error: "This order changed since you opened it — reload and try again" };
+  if (!order) return { ok: false, status: 404, error: "Order not found", code: "not_found" };
+  const actor = input.actor ?? "admin";
+  const fail = (status: number, message: string, code: ManualFailure): ManualResult => ({ ok: false, status, error: message, code });
+  // Already applied (a redelivered command): report success without touching anything.
+  if (input.idempotencyKey) {
+    const { data: done } = await db.from("ai_agent_order_events").select("id").eq("idempotency_key", input.idempotencyKey).limit(1);
+    if ((done ?? []).length > 0) return { ok: true, order, duplicate: true };
   }
-  if (!isOpenStatus(order.status)) return { ok: false, status: 409, error: `The order is already ${order.status}` };
+  if (input.expectedVersion != null && input.expectedVersion !== order.version) {
+    return fail(409, "This order changed since you opened it — reload and try again", "conflict");
+  }
+  if (!isOpenStatus(order.status)) return fail(409, `The order is already ${order.status}`, "closed");
+  if (input.notChangedSince && (await changedSince(order.id, input.notChangedSince))) {
+    return fail(409, "This order changed after the command was written", "stale");
+  }
 
   const now = new Date().toISOString();
   let fields = fieldsOf(order);
   let locked = order.manual_locked_fields;
+  // A person editing a field settles whatever the customer proposed for it; "keep" settles it without an edit.
+  const conflicts: FieldConflicts = { ...(order.field_conflicts ?? {}) };
+  const settle = (list: readonly string[]) => {
+    const cleared = list.filter((f) => f in conflicts);
+    for (const f of cleared) delete conflicts[f as EditableOrderField];
+    if (cleared.length > 0) changes.field_conflicts = { before: order.field_conflicts, after: { ...conflicts } };
+    return cleared.length;
+  };
   let status: OrderStatus = order.status;
   let attention = order.attention;
   let awaitingSince = order.awaiting_since;
@@ -650,14 +797,15 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
 
   if (action === "edit") {
     const checked = validatePatch(input.patch ?? {});
-    if (!checked.ok) return { ok: false, status: 400, error: checked.error };
+    if (!checked.ok) return fail(400, checked.error, "invalid");
     const changedFields = Object.keys(checked.fields) as EditableOrderField[];
-    if (changedFields.length === 0) return { ok: false, status: 400, error: "Nothing to change" };
+    if (changedFields.length === 0) return fail(400, "Nothing to change", "invalid");
     fields = { ...fields, ...checked.fields };
     // Choosing the method by hand also fixes the free-text preference so the two cannot disagree.
     if (checked.fields.fulfilment_method !== undefined) fields.delivery_preference = checked.fields.fulfilment_method;
     for (const f of changedFields) changes[f] = { before: order[f], after: fields[f] };
     locked = unique([...locked, ...changedFields]);
+    settle(changedFields);
     if (order.status === "possible" && isComplete(computeMissing(fields))) {
       status = "awaiting_confirmation";
       awaitingSince = now;
@@ -671,10 +819,10 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
     }
   } else if (action === "confirm") {
     const missing = computeMissing(fields);
-    if (!isComplete(missing)) return { ok: false, status: 409, error: "Add the missing details before confirming (products, quantity, delivery or collection, address)" };
+    if (!isComplete(missing)) return fail(409, "Add the missing details before confirming (products, quantity, delivery or collection, address)", "incomplete");
     status = "confirmed";
     attention = null;
-    confirmedBy = `admin:${input.adminId}`;
+    confirmedBy = `${actor}:${input.adminId}`;
     confirmedAt = now;
     changes.status = { before: order.status, after: status };
   } else if (action === "cancel") {
@@ -682,6 +830,8 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
     cancelledAt = now;
     cancelReason = (input.reason ?? "").trim().slice(0, 300) || "cancelled by staff";
     changes.status = { before: order.status, after: status, reason: cancelReason };
+  } else if (action === "keep") {
+    if (settle(input.conflictFields ?? Object.keys(conflicts)) === 0) return fail(400, "Nothing to keep", "invalid");
   } else {
     status = "fulfilled";
     fulfilledAt = now;
@@ -696,6 +846,7 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
       firstAt: order.first_message_at,
       lastAt: order.last_message_at,
       locked,
+      conflicts,
     }),
     confirmed_by: status === "confirmed" || status === "fulfilled" ? confirmedBy : null,
     confirmed_at: status === "confirmed" || status === "fulfilled" ? confirmedAt : null,
@@ -705,18 +856,19 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
   };
   const res = await applyOrder({
     businessSlug,
-    key: null,
+    key: input.idempotencyKey ?? null,
     existing: order,
     row,
-    event: `manual_${action}`,
-    actorKind: "admin",
+    event: actor === "staff" ? `staff_whatsapp_${action}` : `manual_${action}`,
+    actorKind: actor,
     actorId: input.adminId,
     changes,
     messageIds: [],
   });
-  if (res.result === "conflict") return { ok: false, status: 409, error: "This order changed since you opened it — reload and try again" };
-  if (res.result !== "applied") return { ok: false, status: 404, error: "Order not found" };
-  await audit(businessSlug, "admin", input.adminId, `order.${action}`, { type: "order", id: orderId }, { ref: order.ref_code, changes });
+  if (res.result === "conflict") return fail(409, "This order changed since you opened it — reload and try again", "conflict");
+  if (res.result === "duplicate") return { ok: true, order, duplicate: true };
+  if (res.result !== "applied") return fail(404, "Order not found", "not_found");
+  await audit(businessSlug, actor, input.adminId, `order.${action}`, { type: "order", id: orderId }, { ref: order.ref_code, changes, ...(actor === "staff" ? { via: "whatsapp" } : {}) });
   const { data: fresh } = await db.from("ai_agent_orders").select(ORDER_COLUMNS).eq("id", orderId).eq("business_slug", businessSlug).maybeSingle();
   return { ok: true, order: (fresh as TrackedOrder | null) ?? order };
 }
@@ -821,7 +973,8 @@ export async function loadCoverage(settings: AgentSettings, now: Date): Promise<
 /** The report as of right now, from the database (orders and coverage are both read fresh). */
 export async function buildSummaryNow(settings: AgentSettings, trigger: "scheduled" | "manual", now: Date) {
   const [orders, coverage] = await Promise.all([loadOutstandingOrders(settings.business_slug), loadCoverage(settings, now)]);
-  return buildOrderSummary({ businessLabel: businessLabel(settings.business_slug), timezone: tzOf(settings), now, orders, trigger, coverage });
+  const names = await loadOrderNames(settings.business_slug, orders);
+  return buildOrderSummary({ businessLabel: businessLabel(settings.business_slug), timezone: tzOf(settings), now, orders, names, trigger, coverage });
 }
 
 function summaryItem(settings: AgentSettings, body: string, dedupeKey: string, eventId: string | null): OutboxInsert {
@@ -829,36 +982,46 @@ function summaryItem(settings: AgentSettings, body: string, dedupeKey: string, e
   return { businessSlug: settings.business_slug, chatId: group, kind: "staff_notice", toJid: group, body, dedupeKey, eventId };
 }
 
-/** Builds the report from the database and queues it. Returns the outbox row, or null when the final gate refused. */
+/** Part 1 keeps the run's own dedupe key (so a resumed run finds it); later parts are keyed `<key>:p<n>`. */
+const partKey = (dedupeKey: string, index: number) => (index === 0 ? dedupeKey : `${dedupeKey}:p${index + 1}`);
+
+/** Builds the report from the database and queues it (one outbox row per numbered part). Returns the rows created, or null when the final gate refused. */
 async function queueSummary(
   settings: AgentSettings,
   run: { id: string; trigger: "scheduled" | "manual"; dedupeKey: string; eventId?: string | null },
   now: Date,
   dispatchNow: boolean
-): Promise<OutboxRow | null> {
+): Promise<OutboxRow[] | null> {
   const summary = await buildSummaryNow(settings, run.trigger, now);
-  const item = summaryItem(settings, summary.text, run.dedupeKey, run.eventId ?? null);
-  if (!outboxAllowed(settings, item)) {
+  const items = summary.parts.map((part, i) => summaryItem(settings, part, partKey(run.dedupeKey, i), run.eventId ?? null));
+  if (!outboxAllowed(settings, items[0])) {
     await agentDb().from("ai_agent_order_summary_runs").update({ status: "skipped", skip_reason: "send_not_permitted" }).eq("id", run.id);
     return null;
   }
-  const rows = await enqueue([item], dispatchNow);
+  // One at a time, so the parts reach the group in order (rows created together share a timestamp).
+  const created: OutboxRow[] = [];
+  let first: OutboxRow | null = null;
+  for (const [i, item] of items.entries()) {
+    const made = await enqueue([item], dispatchNow);
+    created.push(...made);
+    if (i === 0) first = made[0] ?? null;
+  }
   // An existing row for this dedupe key (a resumed run) is the same send: never a second one.
   const outboxRow =
-    rows[0] ??
+    first ??
     ((await agentDb().from("ai_agent_outbox").select("id, business_slug, kind, to_jid, body, status, reply_to_message_id, error").eq("dedupe_key", run.dedupeKey).maybeSingle()).data as OutboxRow | null);
   await agentDb()
     .from("ai_agent_order_summary_runs")
     .update({
       status: "queued",
       outbox_id: outboxRow?.id ?? null,
-      group_jid: item.toJid,
+      group_jid: items[0].toJid,
       confirmed_count: summary.confirmed,
       attention_count: summary.attention,
       carried_count: summary.carriedForward,
     })
     .eq("id", run.id);
-  return rows[0] ?? null;
+  return created;
 }
 
 async function loadRun(key: string): Promise<SummaryRun | null> {
@@ -1019,9 +1182,9 @@ export async function sendSummaryNow(settings: AgentSettings, requestedBy: strin
     .select("id")
     .single();
   if (error) throw new Error(error.message);
-  const row = await queueSummary(settings, { id: data.id, trigger: "manual", dedupeKey: `ordersummary:manual:${data.id}` }, now, false);
+  const rows = await queueSummary(settings, { id: data.id, trigger: "manual", dedupeKey: `ordersummary:manual:${data.id}` }, now, false);
   await audit(settings.business_slug, kind, requestedBy, "orders.summary_manual", { type: "order_summary_run", id: data.id });
-  return row ? { ok: true as const } : { ok: false as const, error: "The summary could not be posted in the current mode" };
+  return rows && rows.length > 0 ? { ok: true as const } : { ok: false as const, error: "The summary could not be posted in the current mode" };
 }
 
 async function recentManualRun(businessSlug: string, now: Date): Promise<boolean> {
@@ -1051,10 +1214,54 @@ export interface UpdateCommandResult {
   outcome: string;
 }
 
+export interface CommandContext {
+  settings: AgentSettings;
+  fromGroup: string;
+  senderAuth: SenderAuthorization;
+  senderJid: string | null;
+  eventId: string;
+  now?: Date;
+}
+
+/** A reply to the group the command came from. Always a group JID: order commands have no customer-bound output at all. */
+function groupReply(settings: AgentSettings, fromGroup: string, eventId: string, body: string, kind: "staff_notice" | "staff_feedback", outcome: string, dedupeKey = `${eventId}:orders_update_refusal`): UpdateCommandResult {
+  return {
+    outbox: [{ businessSlug: settings.business_slug, chatId: fromGroup, kind, toJid: fromGroup, body: body.slice(0, 3800), dedupeKey, eventId }],
+    queued: [],
+    outcome,
+  };
+}
+
 /**
- * "!update" from a group message. `fromGroup` is the chat it came from. Authorization is the same verified
- * allow-list as "!send". The report is rebuilt from the database right now, with no model call.
+ * The checks every order command passes first, in the same order and with the same rules as "!update": the feature is
+ * on, the message is in the configured orders group, the sender is on the verified allow-list, and the agent may post
+ * there in its current mode. Returns the refusal to post (or a silent no-op), or null when the command may proceed.
  */
+async function guardOrderCommand(ctx: CommandContext, mode: "update" | "command"): Promise<UpdateCommandResult | null> {
+  const { settings, fromGroup, senderAuth } = ctx;
+  const slug = settings.business_slug;
+  const target = ordersGroupJid(settings);
+  const rejected = mode === "update" ? "orders.update_rejected" : "orders.command_rejected";
+  const outcome = (what: string) => `orders:${mode}_${what}`;
+  // "!update" keeps its established refusal kind (feedback in the staff group); other commands answer with a notice, which
+  // every mode that can post to the group accepts.
+  const refuse = (text: string, what: string) => groupReply(settings, fromGroup, ctx.eventId, text, mode === "update" && fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", outcome(what));
+
+  if (!settings.orders_summary_enabled) return refuse(UPDATE_REFUSAL.disabled, "disabled");
+  if (!target || fromGroup !== target) {
+    await audit(slug, "staff", ctx.senderJid, rejected, { type: "chat", id: fromGroup }, { reason: "wrong_group" });
+    return hasSeparateOrdersGroup(settings) && fromGroup === settings.staff_group_jid
+      ? refuse(mode === "update" ? UPDATE_REFUSAL.other_group : "ℹ️ Order commands are used in the Orders group.", "wrong_group")
+      : { outbox: [], queued: [], outcome: outcome("wrong_group") };
+  }
+  if (!senderAuth.authorized) {
+    await audit(slug, "staff", ctx.senderJid, rejected, { type: "chat", id: fromGroup }, { reason: "unauthorized", sender: senderAuth.senderId });
+    return refuse(mode === "update" ? UPDATE_REFUSAL.unauthorized : "⛔ Only authorized staff can use order commands.", "unauthorized");
+  }
+  if (!canPostOrderSummary(settings)) return refuse(mode === "update" ? UPDATE_REFUSAL.blocked : "⚠️ Order commands can't be answered in the current mode, so nothing was changed.", "blocked");
+  return null;
+}
+
 export async function handleUpdateCommand(args: {
   settings: AgentSettings;
   fromGroup: string;
@@ -1067,25 +1274,9 @@ export async function handleUpdateCommand(args: {
   const slug = settings.business_slug;
   const now = args.now ?? new Date();
   const target = ordersGroupJid(settings);
-  const refuse = (text: string, outcome: string): UpdateCommandResult => {
-    // A refusal goes back to the group the command came from, as that group's own kind.
-    const kind = fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice";
-    return { outbox: [{ businessSlug: slug, chatId: fromGroup, kind, toJid: fromGroup, body: text, dedupeKey: `${args.eventId}:orders_update_refusal`, eventId: args.eventId }], queued: [], outcome };
-  };
-
-  if (!settings.orders_summary_enabled) return refuse(UPDATE_REFUSAL.disabled, "orders:update_disabled");
-  if (!target || fromGroup !== target) {
-    await audit(slug, "staff", args.senderJid, "orders.update_rejected", { type: "chat", id: fromGroup }, { reason: "wrong_group" });
-    return hasSeparateOrdersGroup(settings) && fromGroup === settings.staff_group_jid
-      ? refuse(UPDATE_REFUSAL.other_group, "orders:update_wrong_group")
-      : { outbox: [], queued: [], outcome: "orders:update_wrong_group" };
-  }
-  if (!senderAuth.authorized) {
-    await audit(slug, "staff", args.senderJid, "orders.update_rejected", { type: "chat", id: fromGroup }, { reason: "unauthorized", sender: senderAuth.senderId });
-    return refuse(UPDATE_REFUSAL.unauthorized, "orders:update_unauthorized");
-  }
-  if (!canPostOrderSummary(settings)) return refuse(UPDATE_REFUSAL.blocked, "orders:update_blocked");
-  if (await recentManualRun(slug, now)) return refuse(UPDATE_REFUSAL.cooldown, "orders:update_cooldown");
+  const refused = await guardOrderCommand(args, "update");
+  if (refused) return refused;
+  if (await recentManualRun(slug, now)) return groupReply(settings, fromGroup, args.eventId, UPDATE_REFUSAL.cooldown, fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", "orders:update_cooldown");
 
   const { dateKey } = localParts(now, tzOf(settings));
   const { data, error } = await agentDb()
@@ -1095,7 +1286,150 @@ export async function handleUpdateCommand(args: {
     .single();
   if (error) throw new Error(error.message);
   // Dispatched in this very response: the person who typed !update is waiting for it.
-  const row = await queueSummary(settings, { id: data.id, trigger: "manual", dedupeKey: `ordersummary:manual:${args.eventId}`, eventId: args.eventId }, now, true);
+  const rows = await queueSummary(settings, { id: data.id, trigger: "manual", dedupeKey: `ordersummary:manual:${args.eventId}`, eventId: args.eventId }, now, true);
   await audit(slug, "staff", senderAuth.senderId, "orders.update_requested", { type: "order_summary_run", id: data.id });
-  return { outbox: [], queued: row ? [row] : [], outcome: row ? "orders:update_sent" : "orders:update_blocked" };
+  return { outbox: [], queued: rows ?? [], outcome: rows && rows.length > 0 ? "orders:update_sent" : "orders:update_blocked" };
 }
+
+// ── Order commands (!update #REF …, !order, !moreinfo #REF) ──────────────────
+
+/** A command written longer ago than this (an offline catch-up) is not applied: send it again. */
+const MAX_COMMAND_AGE_MS = 2 * 3_600_000;
+
+async function loadOrderByRef(businessSlug: string, refCode: string): Promise<TrackedOrder | null> {
+  const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).eq("ref_code", refCode).maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as TrackedOrder | null) ?? null;
+}
+
+const selectorText = (s: Extract<OrderCommand, { kind: "update" }>["selector"]) => (s.type === "ref" ? `#${s.ref.replace(/^O-/, "")}` : s.type === "phone" ? s.digits : s.text);
+
+export interface OrderCommandArgs extends CommandContext {
+  command: OrderCommand;
+  whatsappMessageId: string;
+  /** When the staff member wrote the command (WhatsApp's own timestamp). */
+  timestamp: string | null;
+}
+
+/**
+ * The staff commands for orders. Everything is deterministic (no model call), resolved server-side inside the business,
+ * and shares the Orders dashboard's mutation (updateOrderManually → apply_ai_agent_order: version-checked, locked
+ * fields recorded, full history and audit). The only output is a short reply to the group the command came from; no
+ * code path here can address a customer.
+ *
+ *   * a selector must identify exactly ONE active order, otherwise nothing changes and the candidates are listed;
+ *   * the same WhatsApp message applied twice changes nothing the second time (idempotency key);
+ *   * a command is refused when the order changed (customer, AI or dashboard) after it was written, or when it is
+ *     more than two hours old, or when someone changed the order while it was being applied.
+ */
+export async function handleOrderCommand(args: OrderCommandArgs): Promise<UpdateCommandResult> {
+  const { settings, fromGroup, command, senderAuth } = args;
+  const slug = settings.business_slug;
+  const now = args.now ?? new Date();
+  if (command.kind === "report") return handleUpdateCommand(args);
+  const refused = await guardOrderCommand(args, "command");
+  if (refused) return refused;
+
+  const reply = (body: string, outcome: string) => groupReply(settings, fromGroup, args.eventId, body, "staff_notice", `orders:${outcome}`);
+  const reject = async (reason: string, body: string) => {
+    await audit(slug, "staff", senderAuth.senderId, "orders.command_rejected", { type: "chat", id: fromGroup }, { reason, command: command.kind });
+    return reply(body, `cmd_${reason}`);
+  };
+  if (command.kind === "help") return reply(ORDER_HELP, "cmd_help");
+
+  const tz = tzOf(settings);
+  const active = await loadOutstandingOrders(slug);
+
+  if (command.kind === "search") {
+    const everyone = await loadOrderNames(slug, active);
+    const matches = searchOrders(command.query, active, everyone);
+    await audit(slug, "staff", senderAuth.senderId, "orders.lookup", { type: "chat", id: fromGroup }, { command: "search", matches: matches.length });
+    return reply(searchReply(command.query, matches, everyone), "cmd_search");
+  }
+
+  const selector = command.selector;
+  let pool = active;
+  if (selector.type === "ref" && !active.some((o) => o.ref_code.toUpperCase() === selector.ref)) {
+    const closed = await loadOrderByRef(slug, selector.ref);
+    if (closed) pool = [...active, closed];
+  }
+  const names = await loadOrderNames(slug, pool);
+  const found = resolveSelector(selector, pool, names);
+  if (found.kind === "none") return reject("not_found", selector.type === "ref" ? ORDER_REPLY.noRef(selector.ref) : ORDER_REPLY.none(selectorText(selector)));
+  if (found.kind === "many") return reject("ambiguous", ORDER_REPLY.many(selectorText(selector), found.orders, names));
+  const order = found.order;
+
+  if (command.kind === "info") {
+    const events = (await listOrderEvents(slug, order.id)).slice(0, 5) as never[];
+    await audit(slug, "staff", senderAuth.senderId, "orders.lookup", { type: "order", id: order.id }, { command: "info" });
+    return reply(moreInfoReply({ order, name: names[order.id], events, timezone: tz }), "cmd_info");
+  }
+
+  // ── a change ──
+  const action = command.action;
+  if (!isOpenStatus(order.status)) return reject("closed", ORDER_REPLY.closed(order));
+  const writtenAt = args.timestamp && !Number.isNaN(Date.parse(args.timestamp)) ? args.timestamp : null;
+  if (writtenAt && now.getTime() - Date.parse(writtenAt) > MAX_COMMAND_AGE_MS) {
+    return reject("too_old", `⚠️ That command was written more than 2 hours ago, so it was not applied to ${displayRefText(order)}. Send it again if it is still right.`);
+  }
+  const base = {
+    businessSlug: slug,
+    orderId: order.id,
+    adminId: senderAuth.senderId ?? "unknown",
+    actor: "staff" as const,
+    idempotencyKey: `wa:${slug}:${args.whatsappMessageId}`,
+    notChangedSince: writtenAt,
+    expectedVersion: order.version,
+  };
+  let run: Promise<ManualResult>;
+  let success: (fresh: TrackedOrder) => string;
+  switch (action.type) {
+    case "confirm": {
+      if (order.status === "confirmed") return reject("no_change", ORDER_REPLY.alreadyConfirmed(order, names));
+      const missing = computeMissing(fieldsOf(order)).filter((m) => m !== "requested_for");
+      if (missing.length > 0) return reject("incomplete", ORDER_REPLY.incomplete(order, missing.map((m) => MISSING_TEXT[m] ?? m).join(", ")));
+      run = updateOrderManually({ ...base, action: "confirm" });
+      success = (o) => ORDER_REPLY.confirmed(o, order.status, names);
+      break;
+    }
+    case "cancel":
+      run = updateOrderManually({ ...base, action: "cancel", reason: "cancelled by staff via WhatsApp" });
+      success = (o) => ORDER_REPLY.cancelled(o, order.status, names);
+      break;
+    case "quantity": {
+      if (order.items.length !== 1) return reject("several_products", ORDER_REPLY.severalProducts(order));
+      const before = order.items[0].quantity;
+      if (before !== null && before.trim() === String(action.quantity)) return reject("no_change", ORDER_REPLY.sameQuantity(order, action.quantity));
+      run = updateOrderManually({ ...base, action: "edit", patch: { items: [{ ...order.items[0], quantity: String(action.quantity) }] } });
+      success = (o) => ORDER_REPLY.quantity(o, before, action.quantity, names);
+      break;
+    }
+    case "delivery": {
+      // "tomorrow" counts from when the staff member wrote it.
+      const at = writtenAt ? new Date(writtenAt) : now;
+      const when = anchorRequestedFor(action.when, order.requested_for, at, tz) ?? action.when;
+      if (when === order.requested_for) return reject("no_change", ORDER_REPLY.sameDelivery(order));
+      run = updateOrderManually({ ...base, action: "edit", patch: { requested_for: when } });
+      success = (o) => ORDER_REPLY.delivery(o, when, names);
+      break;
+    }
+  }
+  const result = await run;
+  // One success notice per WhatsApp message, however many times it is delivered (the key is the message, not the event);
+  // a retry after a crash that lost the first notice still gets one, because nothing was queued yet.
+  if (result.ok) return groupReply(settings, fromGroup, args.eventId, success(result.order), "staff_notice", `orders:cmd_${action.type}_${result.duplicate ? "repeated" : "applied"}`, `ordercmd:${slug}:${args.whatsappMessageId}:ack`);
+  switch (result.code) {
+    case "stale":
+      return reject("stale", ORDER_REPLY.stale(order));
+    case "conflict":
+      return reject("conflict", ORDER_REPLY.conflict(order));
+    case "closed":
+      return reject("closed", ORDER_REPLY.closed(order));
+    case "incomplete":
+      return reject("incomplete", ORDER_REPLY.incomplete(order, "required details"));
+    default:
+      return reject("failed", ORDER_REPLY.failed());
+  }
+}
+
+const displayRefText = (o: TrackedOrder) => `#${o.ref_code.replace(/^O-/, "")}`;

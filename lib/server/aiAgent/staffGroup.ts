@@ -41,8 +41,8 @@ import {
   summarizeOutcomes,
   WITHHOLD_TEXT,
 } from "@/lib/aiAgent/staffAnswers";
-import { isUpdateCommand } from "@/lib/aiAgent/orders";
-import { handleUpdateCommand } from "@/lib/server/aiAgent/orders";
+import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
+import { handleOrderCommand } from "@/lib/server/aiAgent/orders";
 import { agentDb, audit, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
 import { customerGate, planCustomerSend, sha } from "@/lib/server/aiAgent/customerSend";
 import {
@@ -188,15 +188,21 @@ const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number 
 export async function processStaffGroupMessage(input: StaffGroupMessage): Promise<StaffGroupResult> {
   const { settings } = input;
   const groupJid = settings.staff_group_jid!;
-  // "!update": a fresh order summary from the database. Handled first so a quote or reference in the message can
-  // never route it to an escalation. Authorization and the group check live in handleUpdateCommand.
-  if (isUpdateCommand(input.text)) {
-    const result = await handleUpdateCommand({
+  // Order commands ("!update", "!update #REF …", "!order …", "!moreinfo #REF"): deterministic, from the database. Handled
+  // first so a quote or reference in the message can never route one to an escalation, and kept apart from the
+  // approval commands (a "!moreinfo" without an order reference still goes to the escalation logic below).
+  // Authorization and the group check live in handleOrderCommand.
+  const orderCommand = parseOrderCommand(input.text);
+  if (orderCommand) {
+    const result = await handleOrderCommand({
       settings,
       fromGroup: groupJid,
+      command: orderCommand,
       senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone),
       senderJid: input.senderJid,
       eventId: input.eventId,
+      whatsappMessageId: input.whatsappMessageId,
+      timestamp: input.timestamp,
     });
     return { outbox: result.outbox, queued: result.queued, outcome: result.outcome, escalationId: null };
   }

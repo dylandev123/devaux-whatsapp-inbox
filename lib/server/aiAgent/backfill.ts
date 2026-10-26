@@ -214,6 +214,7 @@ async function backfillChat(settings: AgentSettings, run: BackfillRun, chatId: s
       segments: customer.map((r) => r.text),
       customerWords: seenCustomerWords.slice(-60),
       messageIds: customer.map((r) => r.id),
+      segmentTimes: customer.map((r) => r.at),
       firstAt: customer[0].at,
       lastAt: customer[customer.length - 1].at,
       dedupeBase: key,

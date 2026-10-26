@@ -413,7 +413,8 @@ export interface BackfillRunView {
   finished_at: string | null;
 }
 
-export type OrderView = TrackedOrder;
+/** An order plus the best name the Inbox knows (staff-entered, saved contact, then WhatsApp profile name). */
+export type OrderView = TrackedOrder & { display_name?: string | null; name_source?: "staff" | "saved" | "profile" | null };
 export interface OrderRunView {
   id: string;
   trigger: "scheduled" | "manual";
@@ -459,8 +460,8 @@ export const aiAgentApi = {
   updateOrder: (
     b: string,
     orderId: string,
-    action: "edit" | "confirm" | "cancel" | "fulfil",
-    extra: { version: number; patch?: Partial<Record<EditableOrderField, unknown>>; reason?: string }
+    action: "edit" | "confirm" | "cancel" | "fulfil" | "keep",
+    extra: { version: number; patch?: Partial<Record<EditableOrderField, unknown>>; conflictFields?: string[]; reason?: string }
   ) => api<{ order: OrderView }>("/api/ai-agent/orders", send("PATCH", { businessSlug: b, orderId, action, ...extra })),
   sendOrderSummary: (b: string) => api<{ ok: true }>("/api/ai-agent/orders", send("POST", { businessSlug: b })),
   listApprovals: (b: string) => api<{ mode: string; items: ApprovalItemView[] }>(`/api/ai-agent/approvals${q(b)}`),

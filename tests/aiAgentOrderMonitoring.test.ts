@@ -523,7 +523,7 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     assert.deepEqual(res.outbox, []);
     assert.ok((await lastReasons(JANE.chat)).includes("orders_monitor_failed"));
     assert.equal(await count(`select 1 from public.ai_agent_audit_log where action = 'orders.monitor_failed'`), 1);
-    assert.match(await reportText(), /1 conversation could not be analysed in the last 36 h/);
+    assert.match(await reportText(), /May be incomplete: 1 chat could not be analysed/);
   });
 
   test("a database failure while tracking is recorded as a failed analysis; the message still completes", async () => {
@@ -550,7 +550,7 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     await customerSays(JANE, "2 Monello Chicken 15kg delivered to 12 Main St Gros Islet Friday morning");
     assert.equal(monitorCalls.length, 0);
     assert.ok((await lastReasons(JANE.chat)).includes("orders_monitor_rate_limited"));
-    assert.match(await reportText(), /1 conversation was not analysed in the last 36 h because the hourly analysis limit was reached/);
+    assert.match(await reportText(), /May be incomplete: 1 chat hit the analysis limit/);
     // Another chat of the same business is unaffected by this chat's budget.
     await customerSays(MARCUS, "2 Monello Chicken 15kg delivered to 12 Main St Gros Islet Friday morning");
     assert.equal(monitorCalls.length, 1);
@@ -588,8 +588,8 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     const text = await reportText();
     assert.match(text, /Monello Chicken/);
     assert.match(text, /Dog Treats/);
-    assert.match(text, /NEEDS ATTENTION/);
-    assert.match(text, /Covers every customer chat the agent received, including ones the AI does not reply in/);
+    assert.match(text, /2 orders · 0 confirmed · 2 to review/);
+    assert.doesNotMatch(text, /⚠️ May be incomplete|OFF/, "nothing is missing, so nothing is flagged");
     assert.doesNotMatch(text, /selected for the AI/);
   });
 
@@ -605,9 +605,8 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     await pg.run(`insert into public.ai_agent_events (business_slug, chat_id, whatsapp_message_id, kind, status, reason_codes)
                   values ('dog_food', ${lit(MARCUS.chat)}, 'FORWARDED', 'customer_inbound', 'done', array['orders_monitor_skipped_no_order_signal']);`);
     const text = await reportText();
-    assert.match(text, /1 customer message in the last 36 h reached the inbox but not the AI agent/);
-    assert.match(text, /⚠️/);
-    assert.doesNotMatch(text, /Covers every customer chat/, "a report with a known gap must not read as clean");
+    assert.match(text, /May be incomplete: 1 message never reached the agent/);
+    assert.match(text, /⚠️/, "a report with a known gap says so");
   });
 
   test("rapid messages from a customer the AI may not answer are analysed together, in order, by ONE call (batching)", async () => {
