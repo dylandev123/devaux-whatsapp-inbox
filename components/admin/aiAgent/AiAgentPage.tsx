@@ -10,6 +10,7 @@ import { EscalationsPanel } from "@/components/admin/aiAgent/EscalationsPanel";
 import { EvaluationPanel } from "@/components/admin/aiAgent/EvaluationPanel";
 import { KnowledgePanel } from "@/components/admin/aiAgent/KnowledgePanel";
 import { MemoryPanel } from "@/components/admin/aiAgent/MemoryPanel";
+import { OrdersPanel } from "@/components/admin/aiAgent/OrdersPanel";
 import { ReviewPanel } from "@/components/admin/aiAgent/ReviewPanel";
 import { SettingsCard } from "@/components/admin/aiAgent/SettingsCard";
 import { TestConsole } from "@/components/admin/aiAgent/TestConsole";
@@ -19,6 +20,7 @@ const TABS = [
   { id: "setup", label: "Setup" },
   { id: "knowledge", label: "Knowledge" },
   { id: "escalations", label: "Escalations" },
+  { id: "orders", label: "Orders" },
   { id: "memory", label: "Memory" },
   { id: "takeover", label: "Takeover" },
   { id: "review", label: "Review" },
@@ -137,6 +139,7 @@ export function AiAgentPage() {
           )}
           {tab === "knowledge" && <KnowledgePanel businessSlug={businessSlug} />}
           {tab === "escalations" && <EscalationsPanel businessSlug={businessSlug} observe={s?.mode === "observe"} />}
+          {tab === "orders" && <OrdersPanel businessSlug={businessSlug} settings={s} />}
           {tab === "memory" && <MemoryPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "takeover" && <ConversationsPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "review" && <ReviewPanel businessSlug={businessSlug} />}

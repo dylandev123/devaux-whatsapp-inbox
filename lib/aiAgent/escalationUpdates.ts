@@ -254,7 +254,7 @@ export const ORDER_CHANGE_KINDS: readonly ChangeKind[] = [
   "delivery_changed",
 ];
 
-const productKey = (p: string) =>
+export const productKey = (p: string) =>
   normalizeText(p)
     .split(" ")
     .map((w) => (w.length > 3 ? w.replace(/s$/, "") : w))
@@ -351,17 +351,24 @@ export function groundOrderDraft(
     if (quantity && !(known && sameText(known.quantity, quantity)) && !quantityGrounded(quantity, corpus, corpusDigits)) {
       quantity = known?.quantity ?? null;
     }
-    items.push({ product: item.product, quantity });
+    // Variant and size (daily order tracking) are kept only when the customer wrote them.
+    const detail = (value: string | null | undefined, was: string | null | undefined) =>
+      value && (sameText(value, was) || coverage(value, corpus) >= 0.5) ? value : (was ?? null);
+    const variant = detail(item.variant, known?.variant);
+    const size = detail(item.size, known?.size);
+    items.push({ product: item.product, quantity, ...(variant ? { variant } : {}), ...(size ? { size } : {}) });
   }
   const text = (value: string | null, was: string | null) => {
     if (!value || sameText(value, was)) return value ?? was;
     return coverage(value, corpus) >= 0.5 ? value : was;
   };
+  const requestedFor = text(draft.requested_for ?? null, prior?.requested_for ?? null);
   return {
     items,
     delivery_address: text(draft.delivery_address, prior?.delivery_address ?? null),
     delivery_preference: text(draft.delivery_preference, prior?.delivery_preference ?? null),
     notes: text(draft.notes, prior?.notes ?? null),
+    ...(requestedFor ? { requested_for: requestedFor } : {}),
   };
 }
 

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { readJson, verifyBridgeSecret } from "@/lib/server/aiAgent/auth";
 import { parseBusinessSlug } from "@/lib/server/aiAgent/db";
 import { claimOutbox } from "@/lib/server/aiAgent/outbox";
-import { sweepBatchesAfterResponse } from "@/lib/server/aiAgent/scheduler";
+import { sweepBatchesAfterResponse, sweepOrderSummariesAfterResponse } from "@/lib/server/aiAgent/scheduler";
 
 // Bridge → app: claim outbox items queued outside a message request (admin UI
 // answers to escalations). Each item is handed out once; ack every one.
@@ -26,6 +26,8 @@ export async function POST(request: Request) {
     // this response is sent, so the poll never waits on a model call) and their
     // outbox items are handed out by the next poll.
     sweepBatchesAfterResponse();
+    // ... and the 8 AM order summary (idempotent per business per day; see runScheduledSummary).
+    sweepOrderSummariesAfterResponse();
     return NextResponse.json({ items });
   } catch (err) {
     console.error("[bridge/ai-agent/outbox/claim]", err);

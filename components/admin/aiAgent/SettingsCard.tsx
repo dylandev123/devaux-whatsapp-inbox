@@ -33,6 +33,14 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
   const [senders, setSenders] = useState((s.staff_authorized_senders ?? []).join("\n"));
   const [passiveScope, setPassiveScope] = useState(s.passive_learning_scope ?? "off");
   const [confirmViaWhatsapp, setConfirmViaWhatsapp] = useState(s.knowledge_confirm_via_whatsapp === true);
+  const [ordersTracking, setOrdersTracking] = useState(s.orders_tracking_enabled === true);
+  const [ordersSummary, setOrdersSummary] = useState(s.orders_summary_enabled === true);
+  const [ordersGroup, setOrdersGroup] = useState<StaffGroupValue | null>(
+    s.orders_group_jid ? { jid: s.orders_group_jid, name: s.orders_group_name ?? null, manual: false } : null
+  );
+  const [ordersCustomerConfirms, setOrdersCustomerConfirms] = useState(s.orders_customer_confirms === true);
+  const [ordersHour, setOrdersHour] = useState(s.orders_summary_hour ?? 8);
+  const [ordersTimezone, setOrdersTimezone] = useState(s.orders_timezone ?? "America/St_Lucia");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -75,6 +83,14 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
       staffAuthorizedSenders: senders.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
       passiveLearningScope: passiveScope,
       knowledgeConfirmViaWhatsapp: confirmViaWhatsapp,
+      ordersTrackingEnabled: ordersTracking,
+      ordersSummaryEnabled: ordersSummary,
+      ordersCustomerConfirms,
+      ordersGroupJid: ordersGroup?.jid ?? null,
+      ordersGroupName: ordersGroup?.name ?? null,
+      ordersGroupManual: ordersGroup?.manual ?? false,
+      ordersSummaryHour: ordersHour,
+      ordersTimezone: ordersTimezone.trim(),
     });
   }
 
@@ -260,6 +276,50 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
             <input type="checkbox" checked={confirmViaWhatsapp} onChange={(e) => setConfirmViaWhatsapp(e.target.checked)} />
             Authorized senders can confirm suggestions from WhatsApp (<code>!confirm K-XXXX</code>)
           </label>
+        </div>
+
+        <div className="rounded-md border border-zinc-200 p-3">
+          <p className="text-sm font-medium text-zinc-900">Daily orders</p>
+          <p className="mb-2 mt-1 text-xs text-zinc-500">
+            Keeps a record of the orders customers place (Orders tab) and posts one summary to a WhatsApp group every morning. Staff type{" "}
+            <code>!update</code> in that group for a fresh one. Neither ever messages a customer, and neither changes Approval Pilot.
+          </p>
+          <label className="flex items-center gap-2 text-sm text-zinc-700">
+            <input type="checkbox" checked={ordersTracking} onChange={(e) => setOrdersTracking(e.target.checked)} />
+            Track orders from customer conversations (uses the existing AI analysis — no extra AI calls)
+          </label>
+          <label className="mt-2 flex items-center gap-2 text-sm text-zinc-700">
+            <input type="checkbox" checked={ordersCustomerConfirms} onChange={(e) => setOrdersCustomerConfirms(e.target.checked)} />
+            Let a customer&apos;s clear &quot;yes&quot; finalize an order (leave OFF at first: a yes is then only recorded and staff verify it)
+          </label>
+          <label className="mt-2 flex items-center gap-2 text-sm text-zinc-700">
+            <input type="checkbox" checked={ordersSummary} onChange={(e) => setOrdersSummary(e.target.checked)} />
+            Post the daily summary and answer <code>!update</code>
+          </label>
+          <div className={`mt-3 flex flex-col gap-3 ${ordersSummary ? "" : "opacity-60"}`}>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Orders WhatsApp group</label>
+              <StaffGroupPicker businessSlug={businessSlug} value={ordersGroup} onChange={setOrdersGroup} />
+              <p className="mt-1 text-xs text-zinc-400">
+                Leave empty to use the staff group above. A different group also needs the bridge to forward its messages (see docs/ai-agent-daily-orders.md).
+                <code> !update</code> works only here, and only for the authorized staff above.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-zinc-500">Send at (hour, 0–23)</label>
+                <input type="number" min={0} max={23} value={ordersHour} onChange={(e) => setOrdersHour(Number(e.target.value))} className={inputClass} />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-zinc-500">Timezone</label>
+                <input value={ordersTimezone} onChange={(e) => setOrdersTimezone(e.target.value)} className={inputClass} />
+              </div>
+            </div>
+            {ordersSummary && enabled && !ordersGroup && !s.staff_group_jid && <Notice tone="warn">No group is set — pick an orders group or a staff group.</Notice>}
+            {ordersSummary && enabled && mode === "observe" && !staffNotices && (
+              <Notice tone="warn">In Observe mode the summary is only posted when &quot;post escalation notices to the staff group&quot; is on.</Notice>
+            )}
+          </div>
         </div>
 
         <label className="flex items-center gap-2 text-sm text-zinc-700">

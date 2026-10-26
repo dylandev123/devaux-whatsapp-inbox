@@ -72,7 +72,7 @@ export async function ensureSettings(businessSlug: string): Promise<AgentSetting
 }
 
 export const SETTINGS_COLUMNS =
-  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, default_customer_mode, passive_learning_scope, knowledge_confirm_via_whatsapp, updated_at";
+  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, default_customer_mode, passive_learning_scope, knowledge_confirm_via_whatsapp, orders_tracking_enabled, orders_summary_enabled, orders_group_jid, orders_group_name, orders_timezone, orders_summary_hour, orders_customer_confirms, orders_tracking_since, updated_at";
 
 export async function loadSettings(businessSlug: string): Promise<AgentSettings | null> {
   const { data, error } = await agentDb()

@@ -14,7 +14,7 @@ export async function GET(request: Request) {
 
   const { data, error } = await agentDb()
     .from("ai_agent_settings")
-    .select("business_slug, enabled, mode, staff_group_jid, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds");
+    .select("business_slug, enabled, mode, staff_group_jid, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, orders_summary_enabled, orders_group_jid");
   if (error) return NextResponse.json({ error: "Failed to load AI agent config" }, { status: 500 });
 
   return NextResponse.json({
@@ -31,6 +31,10 @@ export async function GET(request: Request) {
       batchingEnabled: row.batching_enabled === true,
       batchQuietSeconds: row.batch_quiet_seconds,
       batchMaxWaitSeconds: row.batch_max_wait_seconds,
+      // Daily order summary. ordersGroupJid is where the summary goes and where "!update" is honoured (null = the
+      // staff group). A group other than staffGroupJid must also be forwarded to /message.
+      ordersSummaryEnabled: row.orders_summary_enabled === true,
+      ordersGroupJid: row.orders_summary_enabled === true && row.orders_group_jid ? row.orders_group_jid : null,
     })),
   });
 }

@@ -41,6 +41,8 @@ import {
   summarizeOutcomes,
   WITHHOLD_TEXT,
 } from "@/lib/aiAgent/staffAnswers";
+import { isUpdateCommand } from "@/lib/aiAgent/orders";
+import { handleUpdateCommand } from "@/lib/server/aiAgent/orders";
 import { agentDb, audit, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
 import { customerGate, planCustomerSend, sha } from "@/lib/server/aiAgent/customerSend";
 import {
@@ -185,6 +187,18 @@ const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number 
 export async function processStaffGroupMessage(input: StaffGroupMessage): Promise<StaffGroupResult> {
   const { settings } = input;
   const groupJid = settings.staff_group_jid!;
+  // "!update": a fresh order summary from the database. Handled first so a quote or reference in the message can
+  // never route it to an escalation. Authorization and the group check live in handleUpdateCommand.
+  if (isUpdateCommand(input.text)) {
+    const result = await handleUpdateCommand({
+      settings,
+      fromGroup: groupJid,
+      senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone),
+      senderJid: input.senderJid,
+      eventId: input.eventId,
+    });
+    return { outbox: result.outbox, queued: result.queued, outcome: result.outcome, escalationId: null };
+  }
   const { candidates, quotedDraft, quotedNotice, quotedNoticeAt } = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
   // Approval Pilot: only an explicit !command ever sends — a casual "send it" is not one.
   const match = matchStaffReply({ text: input.text, quotedMessageId: input.quotedMessageId }, candidates, {

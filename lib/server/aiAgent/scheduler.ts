@@ -8,6 +8,7 @@
 
 import { after } from "next/server";
 import { processDueBatches } from "@/lib/server/aiAgent/decide";
+import { runDueOrderSummaries } from "@/lib/server/aiAgent/orders";
 
 const MIN_GAP_MS = 5_000;
 let lastRunAt = 0;
@@ -22,6 +23,26 @@ export function sweepBatchesAfterResponse(): void {
       await processDueBatches();
     } catch (err) {
       console.error("[aiAgent] due-batch sweep failed", err instanceof Error ? err.message : err);
+    }
+  });
+}
+
+const ORDER_SUMMARY_MIN_GAP_MS = 60_000;
+let lastOrderSweepAt = 0;
+
+/**
+ * The 8 AM order summary piggy-backs on the same traffic. Idempotent per business per local day in the database
+ * (runScheduledSummary), so a skipped, repeated or concurrent sweep can never post twice or miss a day.
+ */
+export function sweepOrderSummariesAfterResponse(): void {
+  const now = Date.now();
+  if (now - lastOrderSweepAt < ORDER_SUMMARY_MIN_GAP_MS) return;
+  lastOrderSweepAt = now;
+  after(async () => {
+    try {
+      await runDueOrderSummaries();
+    } catch (err) {
+      console.error("[aiAgent] order summary sweep failed", err instanceof Error ? err.message : err);
     }
   });
 }

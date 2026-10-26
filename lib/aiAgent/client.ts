@@ -4,6 +4,7 @@
 // lib/server/aiAgent/decide.ts + lib/aiAgent/engine.ts).
 
 import type { CustomerMode } from "@/lib/aiAgent/customerMode";
+import type { EditableOrderField, OrderStatus, TrackedOrder } from "@/lib/aiAgent/orders";
 import type { OutboxState, OutboxStatus } from "@/lib/aiAgent/outboxStatus";
 import type {
   AgentDecision,
@@ -48,6 +49,18 @@ export interface SettingsPatch {
   passiveLearningScope?: NonNullable<AgentSettings["passive_learning_scope"]>;
   /** Authorized senders may confirm knowledge candidates with !confirm. */
   knowledgeConfirmViaWhatsapp?: boolean;
+  /** Daily orders: extract orders from conversations into the Orders tab. */
+  ordersTrackingEnabled?: boolean;
+  /** Daily orders: the 8 AM summary and the !update command. */
+  ordersSummaryEnabled?: boolean;
+  /** null = post in the staff group. */
+  ordersGroupJid?: string | null;
+  ordersGroupName?: string | null;
+  ordersGroupManual?: boolean;
+  ordersTimezone?: string;
+  ordersSummaryHour?: number;
+  /** Rollout safety: false = a customer's yes is only recorded; staff verify and confirm. */
+  ordersCustomerConfirms?: boolean;
 }
 
 export interface ContactSearchResult {
@@ -368,6 +381,31 @@ export interface SimulationView {
   customerMode?: CustomerMode;
 }
 
+export type OrderView = TrackedOrder;
+export interface OrderRunView {
+  id: string;
+  trigger: "scheduled" | "manual";
+  local_date: string;
+  status: "claimed" | "queued" | "missed" | "skipped";
+  skip_reason: string | null;
+  attempts: number;
+  confirmed_count: number | null;
+  attention_count: number | null;
+  carried_count: number | null;
+  created_at: string;
+  delivery: OutboxState | null;
+  sent_at: string | null;
+}
+export interface OrderEventView {
+  id: string;
+  kind: string;
+  actor_kind: string;
+  actor_id: string | null;
+  changes: Record<string, { before?: unknown; after?: unknown }>;
+  whatsapp_message_ids: string[];
+  created_at: string;
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     cache: "no-store",
@@ -383,6 +421,16 @@ const q = (businessSlug: string, extra = "") => `?businessSlug=${encodeURICompon
 const send = (method: string, body: unknown): RequestInit => ({ method, body: JSON.stringify(body) });
 
 export const aiAgentApi = {
+  listOrders: (b: string, status: "open" | "all" | OrderStatus, query: string) =>
+    api<{ orders: OrderView[]; runs: OrderRunView[]; coverage: import("@/lib/aiAgent/orders").Coverage }>(`/api/ai-agent/orders${q(b, `&status=${status}&q=${encodeURIComponent(query)}`)}`),
+  orderEvents: (b: string, orderId: string) => api<{ events: OrderEventView[] }>(`/api/ai-agent/orders${q(b, `&orderId=${encodeURIComponent(orderId)}`)}`),
+  updateOrder: (
+    b: string,
+    orderId: string,
+    action: "edit" | "confirm" | "cancel" | "fulfil",
+    extra: { version: number; patch?: Partial<Record<EditableOrderField, unknown>>; reason?: string }
+  ) => api<{ order: OrderView }>("/api/ai-agent/orders", send("PATCH", { businessSlug: b, orderId, action, ...extra })),
+  sendOrderSummary: (b: string) => api<{ ok: true }>("/api/ai-agent/orders", send("POST", { businessSlug: b })),
   getBusinesses: () =>
     api<{ businesses: import("@/lib/aiAgent/businessList").AgentBusiness[]; sessionsKnown: boolean }>("/api/ai-agent/businesses"),
   getSettings: (b: string) => api<SettingsResponse>(`/api/ai-agent/settings${q(b)}`),

@@ -88,6 +88,37 @@ export interface AgentSettings {
   passive_learning_scope?: PassiveLearningScope | null;
   /** Authorized senders may confirm knowledge candidates with !confirm. Absent/false = admins only. */
   knowledge_confirm_via_whatsapp?: boolean | null;
+  /** Daily order tracking (lib/aiAgent/orders.ts): extract orders from conversations into ai_agent_orders. Absent = off. */
+  orders_tracking_enabled?: boolean | null;
+  /** The 8 AM summary and the "!update" command. Absent = off. */
+  orders_summary_enabled?: boolean | null;
+  /** Where the summary is posted; null = the staff group. */
+  orders_group_jid?: string | null;
+  orders_group_name?: string | null;
+  /** IANA timezone of the schedule. Absent = America/St_Lucia. */
+  orders_timezone?: string | null;
+  orders_summary_hour?: number | null;
+  /** Rollout safety: may a customer's own "yes" finalize an order? Absent/false = it is only recorded for staff to verify. */
+  orders_customer_confirms?: boolean | null;
+  /** When order tracking was last switched on. */
+  orders_tracking_since?: string | null;
+}
+
+/** Where the order summary goes and "!update" is accepted: the orders group, else the staff group. */
+export function ordersGroupJid(settings: AgentSettings | null): string | null {
+  return settings?.orders_group_jid || settings?.staff_group_jid || null;
+}
+
+/** The orders group is a different group from the staff group (so it needs its own bridge forwarding and send rule). */
+export function hasSeparateOrdersGroup(settings: AgentSettings | null): boolean {
+  return Boolean(settings?.orders_group_jid && settings.orders_group_jid !== settings.staff_group_jid);
+}
+
+/** Whether the order summary (scheduled or "!update") may be posted right now. Never customer-bound. */
+export function canPostOrderSummary(settings: AgentSettings | null): boolean {
+  if (!settings?.enabled || !settings.orders_summary_enabled || !ordersGroupJid(settings)) return false;
+  if (settings.mode === "assisted" || settings.mode === "approval_pilot") return true;
+  return settings.mode === "observe" && settings.staff_notices_enabled === true;
 }
 
 export const PASSIVE_LEARNING_SCOPES = ["off", "staff_group", "staff_group_and_chats"] as const;
@@ -105,6 +136,9 @@ export interface ConversationControl {
 export interface OrderItem {
   product: string;
   quantity: string | null;
+  /** Daily order tracking only (lib/aiAgent/orders.ts). Present only when the customer stated it. */
+  variant?: string | null;
+  size?: string | null;
 }
 
 export interface OrderRequestDraft {
@@ -112,6 +146,15 @@ export interface OrderRequestDraft {
   delivery_address: string | null;
   delivery_preference: string | null;
   notes: string | null;
+  /** Daily order tracking only: the day/time the customer asked for, in their words. Present only when stated. */
+  requested_for?: string | null;
+}
+
+/** A further, distinct order the same customer turn started (daily order tracking). */
+export interface AdditionalOrderDraft {
+  /** Reference of the open order it adds to, or "new". */
+  target: string;
+  order: OrderRequestDraft;
 }
 
 export interface ModelProposal {
@@ -124,6 +167,10 @@ export interface ModelProposal {
   priority: EscalationPriority | null;
   summary: string | null;
   order_request: OrderRequestDraft | null;
+  /** Daily order tracking: which open order `order_request` adds to (its reference), "new", or null when not stated. Unvalidated. */
+  order_target?: string | null;
+  /** Daily order tracking: further distinct orders in the same turn. Unvalidated. */
+  other_orders?: AdditionalOrderDraft[];
   /** Raw, UNVALIDATED memory candidates; validateMemoryFacts() (lib/aiAgent/memory.ts) decides what is kept. */
   memory_facts?: unknown[];
 }
@@ -207,6 +254,12 @@ const OBSERVE_STAFF_KINDS: readonly string[] = ["staff_notice", "staff_draft"];
 /** Final gate on every item the live path is about to enqueue. */
 export function outboxAllowed(settings: AgentSettings | null, item: { kind: string; toJid: string }): boolean {
   if (!settings?.enabled) return false;
+  // A separate orders group takes only the order summary (and refusals to "!update"), in the same modes the staff
+  // group takes notices. The staff group's own rules below are unchanged.
+  if (hasSeparateOrdersGroup(settings) && item.toJid === settings.orders_group_jid) {
+    const kinds = settings.mode === "observe" ? ["staff_notice"] : ["staff_notice", "staff_feedback"];
+    return kinds.includes(item.kind) && canPostOrderSummary(settings);
+  }
   if (settings.mode === "assisted") return true;
   if (settings.mode === "approval_pilot") {
     // Staff-group kinds to the staff group, or a staff_relay (an authorized staff send). Never the AI's own customer kinds.
@@ -629,9 +682,23 @@ function parseItems(value: unknown): OrderItem[] {
     .map((item) => ({
       product: cleanText(item?.product, 200) ?? "",
       quantity: cleanText(typeof item?.quantity === "number" ? String(item.quantity) : item?.quantity, 50),
+      variant: cleanText(item?.variant, 100),
+      size: cleanText(item?.size, 50),
     }))
     .filter((item) => item.product)
+    .map(({ variant, size, ...item }) => ({ ...item, ...(variant ? { variant } : {}), ...(size ? { size } : {}) }))
     .slice(0, 20);
+}
+
+function parseOrderDraft(order: Record<string, unknown>): OrderRequestDraft {
+  const requestedFor = cleanText(order.requested_for, 200);
+  return {
+    items: parseItems(order.items),
+    delivery_address: cleanText(order.delivery_address),
+    delivery_preference: cleanText(order.delivery_preference),
+    notes: cleanText(order.notes),
+    ...(requestedFor ? { requested_for: requestedFor } : {}),
+  };
 }
 
 /** Strict parse of the model's JSON. Throws on anything malformed — the caller escalates. */
@@ -658,14 +725,20 @@ export function parseModelProposal(raw: string): ModelProposal {
     priority: (ESCALATION_PRIORITIES as readonly string[]).includes(parsed.priority) ? parsed.priority : null,
     summary: cleanText(parsed.summary, 500),
     memory_facts: Array.isArray(parsed.memory_facts) ? parsed.memory_facts.slice(0, 8) : [],
-    order_request: order
+    order_request: order ? parseOrderDraft(order) : null,
+    ...(cleanText(parsed.order_target, 40) ? { order_target: cleanText(parsed.order_target, 40) } : {}),
+    ...(Array.isArray(parsed.other_orders) && parsed.other_orders.length > 0
       ? {
-          items: parseItems(order.items),
-          delivery_address: cleanText(order.delivery_address),
-          delivery_preference: cleanText(order.delivery_preference),
-          notes: cleanText(order.notes),
+          other_orders: parsed.other_orders
+            .filter((o: unknown): o is Record<string, unknown> => Boolean(o) && typeof o === "object")
+            .slice(0, 3)
+            .map((o: Record<string, unknown>) => ({
+              target: cleanText(o.target, 40) ?? "new",
+              order: parseOrderDraft((o.order_request ?? o.order ?? o) as Record<string, unknown>),
+            }))
+            .filter((o: AdditionalOrderDraft) => o.order.items.length > 0),
         }
-      : null,
+      : {}),
   };
 }
 

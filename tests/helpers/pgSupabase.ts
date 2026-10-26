@@ -142,7 +142,7 @@ class Query implements PromiseLike<Result> {
       const [col, op, ...rest] = part.split(".");
       const value = rest.join(".");
       if (op === "is") return `${ident(col)} is ${value}`;
-      const sql = { eq: "=", gt: ">", gte: ">=", lt: "<", lte: "<=" }[op];
+      const sql = { eq: "=", gt: ">", gte: ">=", lt: "<", lte: "<=", like: "like", ilike: "ilike" }[op];
       if (!sql) throw new Error(`pgSupabase: .or(${op}) is not supported`);
       return `${ident(col)} ${sql} ${lit(value)}`;
     });

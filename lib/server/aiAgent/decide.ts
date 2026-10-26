@@ -16,6 +16,7 @@ import {
   CUSTOMER_MESSAGE_SEPARATOR,
   canSendStaffNotice,
   detectSafeguards,
+  hasSeparateOrdersGroup,
   evaluateGate,
   GateResult,
   HOLDING_REPLY_GENERAL,
@@ -65,7 +66,7 @@ import {
   CustomerTurn,
   singleMessageTurn,
 } from "@/lib/aiAgent/batching";
-import { ChatIdentity } from "@/lib/aiAgent/identity";
+import { authorizeStaffSender, ChatIdentity } from "@/lib/aiAgent/identity";
 import { historyLinesForStaff, MemoryBrief, validateMemoryFacts } from "@/lib/aiAgent/memory";
 import {
   loadCustomerContext,
@@ -112,6 +113,8 @@ import {
   staffNoticeFor,
 } from "@/lib/server/aiAgent/escalations";
 import { proposeReply } from "@/lib/server/aiAgent/model";
+import { isUpdateCommand, type TrackedOrder } from "@/lib/aiAgent/orders";
+import { handleUpdateCommand, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
 import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
 import {
   BridgeOutboxItem,
@@ -170,14 +173,23 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   if (!settings?.enabled) return ignored("agent_disabled");
 
   const isStaffGroup = Boolean(settings.staff_group_jid) && input.chatId === settings.staff_group_jid;
+  // A separate Orders group (when configured) accepts the "!update" command and nothing else.
+  const isOrdersGroup = !isStaffGroup && hasSeparateOrdersGroup(settings) && input.chatId === settings.orders_group_jid;
   // Our own sends echoed back by the bridge are dropped before anything else:
   // an echoed staff notice must never be read as a staff answer, and an echoed
   // AI reply must never look like a human taking over.
-  if ((isStaffGroup || input.fromMe) && (await isAgentEcho(input.businessSlug, input.chatId, input.whatsappMessageId, input.text))) {
-    await recordIgnored(input, isStaffGroup ? "staff_group" : "staff_outbound", "agent_echo", settings);
+  if ((isStaffGroup || isOrdersGroup || input.fromMe) && (await isAgentEcho(input.businessSlug, input.chatId, input.whatsappMessageId, input.text))) {
+    await recordIgnored(input, isStaffGroup || isOrdersGroup ? "staff_group" : "staff_outbound", "agent_echo", settings);
     return ignored("agent_echo");
   }
-  const kind = isStaffGroup ? "staff_group" : input.fromMe ? "staff_outbound" : "customer_inbound";
+  // "!update" is honoured in the configured group only. From any other group it is refused, silently (the agent
+  // never posts into a group it was not given) and on the record.
+  if (!isStaffGroup && !isOrdersGroup && input.chatId.endsWith("@g.us") && isUpdateCommand(input.text)) {
+    await audit(input.businessSlug, "staff", input.senderJid, "orders.update_rejected", { type: "chat", id: input.chatId }, { reason: "wrong_group" });
+    await recordIgnored(input, "other_group", "orders_update_wrong_group", settings);
+    return ignored("orders_update_wrong_group");
+  }
+  const kind = isStaffGroup || isOrdersGroup ? "staff_group" : input.fromMe ? "staff_outbound" : "customer_inbound";
 
   const claim = await claimEvent(input, kind, settings);
   let eventId: string;
@@ -192,7 +204,9 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
 
   try {
     let outcome: Outcome;
-    if (isStaffGroup) {
+    if (isOrdersGroup) {
+      outcome = await processOrdersGroupMessage(input, settings, eventId);
+    } else if (isStaffGroup) {
       const staff = await processStaffGroupMessage({
         settings,
         text: input.text,
@@ -254,7 +268,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
     if (outcome.batched) {
       return { eventId, status: "done", decision: null, reasons: outcome.reasons, outbox: [] };
     }
-    if (!isStaffGroup) {
+    if (!isStaffGroup && !isOrdersGroup) {
       await agentDb()
         .from("ai_agent_conversations")
         .upsert(
@@ -288,6 +302,19 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
     // Fail closed: nothing is sent; the event row records what went wrong.
     return { eventId, status: "error", decision: null, reasons: ["internal_error"], outbox: [] };
   }
+}
+
+/** A message in the separate Orders group: only "!update" does anything; it never reaches the escalation logic. */
+async function processOrdersGroupMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
+  if (!isUpdateCommand(input.text)) return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
+  const result = await handleUpdateCommand({
+    settings,
+    fromGroup: input.chatId,
+    senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone ?? null),
+    senderJid: input.senderJid,
+    eventId,
+  });
+  return { decision: "NO_REPLY", reasons: [result.outcome], outbox: result.outbox, queued: result.queued };
 }
 
 // An enabled business's message that was dropped before a decision: leave an
@@ -463,6 +490,9 @@ interface Pipeline {
   trivialTurn: boolean;
   /** Tokens of the model call the pipeline made (null when it made none). */
   usage: ShadowUsage | null;
+  /** Daily order tracking: present only when the business has it on and this is a live turn. */
+  orderTrackingFailed?: boolean;
+  orderTracking: { open: TrackedOrder[]; rawProposal: Pick<ModelProposal, "order_request" | "order_target" | "other_orders"> | null; customerWords: string[] } | null;
 }
 
 /**
@@ -528,12 +558,14 @@ async function runPipeline(args: {
     customerMode,
     trivialTurn,
     usage: null,
+    orderTracking: null,
   };
   if (!gate.pass && !args.forceGatePass) return empty;
   if (args.requirePermittedContact && !gate.pass && gate.reasons.some((c) => PERMISSION_CODES.includes(c))) return empty;
   if (!args.text.trim()) return empty;
 
-  const [knowledge, context, openOrder, openEscalation, recentReplies] = await Promise.all([
+  const tracking = Boolean(settings?.orders_tracking_enabled) && Boolean(chatId) && !args.asOf;
+  const [knowledge, context, openOrder, openEscalation, recentReplies, trackedOpen] = await Promise.all([
     loadActiveKnowledge(businessSlug),
     chatId && identity
       ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text, { before: args.asOf })
@@ -541,6 +573,8 @@ async function runPipeline(args: {
     chatId && !args.asOf ? loadOpenOrderRequest(businessSlug, chatId) : Promise.resolve(null),
     chatId && !args.asOf ? findOpenEscalation(businessSlug, chatId) : Promise.resolve(null),
     chatId && !args.asOf ? autoRepliesLastHour(businessSlug, chatId) : Promise.resolve(0),
+    // A failure to read the orders must not stop the customer turn; it is recorded so the report can say so.
+    tracking ? loadOpenOrders(businessSlug, chatId!).catch(() => "failed" as const) : Promise.resolve(null),
   ]);
 
   const safeguards = detectSafeguards(args.text);
@@ -579,13 +613,17 @@ async function runPipeline(args: {
         // even while an earlier request is still open (rule 10 of the prompt), instead of going quiet.
         openEscalation: Boolean(openEscalation) && settings?.mode !== "approval_pilot",
         reviewMode: settings?.mode === "approval_pilot",
+        // Same call, two extra JSON fields: which open order the turn belongs to, and any further distinct order.
+        openOrders: Array.isArray(trackedOpen) ? ordersForModel(trackedOpen) : undefined,
       });
 
   // The model may only restate what the customer actually wrote: ungrounded products, quantities,
   // addresses and times are dropped before anything is merged, stored or shown to staff.
   let proposal = modelResult.proposal;
+  const customerWords = [args.text, ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? [])];
+  // The raw drafts are kept for order tracking, which grounds them against the order they target (not the legacy request).
+  const rawProposal = proposal ? { order_request: proposal.order_request, order_target: proposal.order_target, other_orders: proposal.other_orders } : null;
   if (proposal?.order_request) {
-    const customerWords = [args.text, ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? [])];
     proposal = { ...proposal, order_request: groundOrderDraft(proposal.order_request, priorOrder, customerWords) };
   }
 
@@ -619,6 +657,8 @@ async function runPipeline(args: {
     customerMode,
     trivialTurn,
     usage: modelResult.usage ?? null,
+    orderTracking: Array.isArray(trackedOpen) ? { open: trackedOpen, rawProposal, customerWords } : null,
+    orderTrackingFailed: trackedOpen === "failed",
   };
 }
 
@@ -667,12 +707,46 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
     return { decision: "NO_REPLY", reasons: ["trivial_acknowledgement"], outbox: [] };
   }
 
+  // Daily order tracking: fold this turn's order draft into the database. Reuses the model call above; never
+  // sends anything, and a failure here never changes the decision.
+  const trackingReasons: string[] = [];
+  if (p.gate.pass && p.orderTrackingFailed) {
+    console.error("[aiAgent] could not read open orders");
+    trackingReasons.push("orders_tracking_failed");
+    await audit(businessSlug, "system", null, "orders.track_failed", { type: "chat", id: chatId }, { error: "could not read open orders" });
+  }
+  if (p.gate.pass && p.orderTracking) {
+    try {
+      const tracked = await trackOrders({
+        settings,
+        businessSlug,
+        chatId,
+        phone: p.identity?.phone ?? null,
+        customerName: p.customerName,
+        intent: p.proposal?.intent ?? null,
+        proposal: p.orderTracking.rawProposal,
+        segments: turn.segments,
+        customerWords: p.orderTracking.customerWords,
+        messageIds: turn.whatsappMessageIds,
+        firstAt: turn.firstAt,
+        lastAt: turn.lastAt,
+        dedupeBase: ctx.dedupeBase,
+      });
+      trackingReasons.push(...tracked.reasons);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error("[aiAgent] trackOrders failed", message);
+      trackingReasons.push("orders_tracking_failed");
+      await audit(businessSlug, "system", null, "orders.track_failed", { type: "chat", id: chatId }, { error: message.slice(0, 300) });
+    }
+  }
+
   // Evaluation: keep what the AI proposed on its own, from the model call already made. Write-only evidence
   // for admins; it can neither change this outcome nor reach the outbox.
   await recordHistoricalShadow(p, turn, ctx, sendable);
 
   const r = p.resolution;
-  const reasons = [...(p.gate.pass ? r!.reasons : p.gate.reasons), ...p.identityNotes];
+  const reasons = [...(p.gate.pass ? r!.reasons : p.gate.reasons), ...p.identityNotes, ...trackingReasons];
   const engineDecision: AgentDecision = p.gate.pass ? r!.decision : "ESCALATE";
   // The customer's mode decides what the engine's decision becomes: Staff First turns a reply the AI
   // would have sent into an escalation carrying it as a draft; Manual Only does nothing.

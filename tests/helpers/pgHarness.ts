@@ -24,6 +24,7 @@ const MIGRATIONS = [
   "20261029000000_ai_agent_evaluation.sql",
   "20261030000000_ai_agent_approval_pilot.sql",
   "20261031000000_ai_agent_pilot_refinements.sql",
+  "20261101000000_ai_agent_daily_orders.sql",
 ];
 
 const BOOTSTRAP = `

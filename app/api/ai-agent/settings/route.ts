@@ -3,6 +3,7 @@ import { AGENT_MODES, CONTACT_SCOPES, PASSIVE_LEARNING_SCOPES, requiredConfidenc
 import { isCustomerMode } from "@/lib/aiAgent/customerMode";
 import { parseAuthorizedSenders } from "@/lib/aiAgent/identity";
 import { validateBatchWindow } from "@/lib/aiAgent/batching";
+import { isValidTimezone } from "@/lib/aiAgent/orders";
 import { normalizeGroupJid } from "@/lib/aiAgent/chatDirectory";
 import { loadBusinessChats } from "@/lib/server/aiAgent/chats";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
@@ -54,6 +55,14 @@ interface Payload {
   defaultCustomerMode?: unknown;
   passiveLearningScope?: unknown;
   knowledgeConfirmViaWhatsapp?: unknown;
+  ordersTrackingEnabled?: unknown;
+  ordersSummaryEnabled?: unknown;
+  ordersGroupJid?: unknown;
+  ordersGroupName?: unknown;
+  ordersGroupManual?: unknown;
+  ordersTimezone?: unknown;
+  ordersSummaryHour?: unknown;
+  ordersCustomerConfirms?: unknown;
 }
 
 function intIn(value: unknown, min: number, max: number): number | null {
@@ -150,6 +159,55 @@ export async function PUT(request: Request) {
   if (body.knowledgeConfirmViaWhatsapp !== undefined) {
     if (typeof body.knowledgeConfirmViaWhatsapp !== "boolean") return jsonError("knowledgeConfirmViaWhatsapp must be a boolean", 400);
     patch.knowledge_confirm_via_whatsapp = body.knowledgeConfirmViaWhatsapp;
+  }
+  if (body.ordersTrackingEnabled !== undefined) {
+    if (typeof body.ordersTrackingEnabled !== "boolean") return jsonError("ordersTrackingEnabled must be a boolean", 400);
+    patch.orders_tracking_enabled = body.ordersTrackingEnabled;
+    // Remember when tracking (re)started: the report says earlier conversations were not analysed.
+    const current = await loadSettings(businessSlug);
+    if (body.ordersTrackingEnabled && current?.orders_tracking_enabled !== true) patch.orders_tracking_since = new Date().toISOString();
+  }
+  if (body.ordersCustomerConfirms !== undefined) {
+    if (typeof body.ordersCustomerConfirms !== "boolean") return jsonError("ordersCustomerConfirms must be a boolean", 400);
+    patch.orders_customer_confirms = body.ordersCustomerConfirms;
+  }
+  if (body.ordersSummaryEnabled !== undefined) {
+    if (typeof body.ordersSummaryEnabled !== "boolean") return jsonError("ordersSummaryEnabled must be a boolean", 400);
+    patch.orders_summary_enabled = body.ordersSummaryEnabled;
+  }
+  if (body.ordersSummaryHour !== undefined) {
+    const v = intIn(body.ordersSummaryHour, 0, 23);
+    if (v === null) return jsonError("ordersSummaryHour must be a whole hour 0–23", 400);
+    patch.orders_summary_hour = v;
+  }
+  if (body.ordersTimezone !== undefined) {
+    if (typeof body.ordersTimezone !== "string" || !isValidTimezone(body.ordersTimezone)) return jsonError("ordersTimezone must be a valid IANA timezone, e.g. America/St_Lucia", 400);
+    patch.orders_timezone = body.ordersTimezone;
+  }
+  if (body.ordersGroupJid !== undefined) {
+    if (body.ordersGroupJid === null || body.ordersGroupJid === "") {
+      // No separate group: the summary goes to the staff group.
+      patch.orders_group_jid = null;
+      patch.orders_group_name = null;
+    } else if (typeof body.ordersGroupJid === "string" && normalizeGroupJid(body.ordersGroupJid)) {
+      const jid = normalizeGroupJid(body.ordersGroupJid)!;
+      const current = await loadSettings(businessSlug);
+      // Same rule as the staff group: only a group this business has seen, unless typed in explicitly.
+      if (current?.orders_group_jid !== jid && body.ordersGroupManual !== true) {
+        try {
+          const known = await loadBusinessChats(businessSlug);
+          if (!known.groups.some((g) => g.chatId.toLowerCase() === jid)) {
+            return jsonError("That group has no messages for this business — pick a discovered group or enter its JID manually", 400);
+          }
+        } catch (err) {
+          return jsonError(err instanceof Error ? err.message : "Failed to verify the group", 500);
+        }
+      }
+      patch.orders_group_jid = jid;
+      patch.orders_group_name = typeof body.ordersGroupName === "string" ? body.ordersGroupName.trim().slice(0, 200) || null : null;
+    } else {
+      return jsonError("ordersGroupJid must be a WhatsApp group id (…@g.us)", 400);
+    }
   }
   if (body.staffAuthorizedSenders !== undefined) {
     // Verified WhatsApp identities only: phone numbers or exact …@lid ids — never names.

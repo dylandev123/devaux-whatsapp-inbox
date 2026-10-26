@@ -52,6 +52,17 @@ Respond with ONLY one JSON object, no prose or code fences:
   }
 }`;
 
+// Appended to the instructions only when the business has order tracking on. Same single model call: it adds fields
+// to the JSON the call already returns, never a second call.
+const ORDER_TRACKING_RULES = `
+
+11. Order tracking: the business also keeps a record of every order. "OPEN ORDERS" lists this customer's orders that are still open, each with a reference (O-XXXXX).
+- "order_request" is always the CUMULATIVE state of ONE order. Set "order_target" to the reference of the open order the NEW messages add to, change or correct, or to "new" when they start a clearly different order (different recipient, date or delivery address). A correction or an extra product for an existing order is NEVER "new". When you cannot tell which order is meant, set "order_target" to null.
+- A further distinct order in the same turn goes in "other_orders" as { "target": "<reference or new>", "order_request": {...} }. Normally empty.
+- When the customer states them, put the variant (for example a flavour) in "variant" and the bag size or weight in "size" of the item, and the day/time they asked for, in their words, in "order_request.requested_for". Otherwise null. Only what the customer wrote; never infer.
+- Never describe an order as confirmed, never add a price, stock level or delivery commitment. Whether a customer's "yes" confirms an order is decided by the server from their exact words; you still return the unchanged cumulative "order_request" for such a message.
+- The extra JSON fields are: "order_target": "<reference>" | "new" | null, "other_orders": [].`;
+
 function data(text: string): string {
   // Strip anything that could close the data fence early.
   return `<<<DATA\n${text.replace(/<<<DATA|DATA>>>/g, "")}\nDATA>>>`;
@@ -75,6 +86,8 @@ export interface ProposeReplyInput {
   openEscalation?: boolean;
   /** Approval Pilot: staff approve every reply, so the model drafts the next message even while a request is open. */
   reviewMode?: boolean;
+  /** Order tracking on: the customer's open orders (reference + content), for "order_target". Undefined = tracking off. */
+  openOrders?: unknown[];
 }
 
 type ReplyProposer = (input: ProposeReplyInput) => Promise<ModelCallResult>;
@@ -102,6 +115,7 @@ export async function proposeReply(input: ProposeReplyInput): Promise<ModelCallR
       ? "REVIEW MODE — staff approve every reply before it is sent. Write the next customer message."
       : `Staff escalation: ${input.openEscalation ? "OPEN — staff own this conversation" : "none"}`,
     `Pending order request: ${input.pendingOrder ? data(JSON.stringify(input.pendingOrder)) : "none"}`,
+    ...(input.openOrders ? [`OPEN ORDERS (reference, status and content):\n${input.openOrders.length > 0 ? data(JSON.stringify(input.openOrders)) : "none"}`] : []),
     ctx && ctx.transcript.length > 0
       ? `Recent conversation (oldest first):\n${data(ctx.transcript.map((t) => `${t.who}: ${t.text}`).join("\n"))}`
       : "Recent conversation: none",
@@ -112,9 +126,9 @@ export async function proposeReply(input: ProposeReplyInput): Promise<ModelCallR
     const client = new OpenAI({ apiKey: settings.api_key });
     const response = await client.responses.create({
       model: settings.model,
-      instructions: SYSTEM_PROMPT,
+      instructions: input.openOrders ? SYSTEM_PROMPT + ORDER_TRACKING_RULES : SYSTEM_PROMPT,
       input: sections.join("\n\n"),
-      max_output_tokens: 900,
+      max_output_tokens: input.openOrders ? 1200 : 900,
     });
     if (response.error) throw new Error(response.error.message);
     if (!response.output_text?.trim()) throw new Error("Model returned no text");
