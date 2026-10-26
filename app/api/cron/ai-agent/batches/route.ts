@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { verifySchedulerSecret } from "@/lib/server/aiAgent/auth";
 import { processDueBatches } from "@/lib/server/aiAgent/decide";
+import { runDueLearningDigests } from "@/lib/server/aiAgent/learningDigest";
 
 // Scheduler entry point: processes every batch whose quiet period or maximum
 // wait has elapsed, plus batches whose worker died (expired lease). Idempotent
@@ -16,7 +17,13 @@ async function run(request: Request) {
   const denied = verifySchedulerSecret(request);
   if (denied) return denied;
   try {
-    return NextResponse.json({ ok: true, ...(await processDueBatches({ budgetMs: 45_000 })) });
+    const batches = await processDueBatches({ budgetMs: 45_000 });
+    // The weekly AI-memory digest rides the same tick (idempotent; never affects the batches above).
+    const learning = await runDueLearningDigests().catch((err) => {
+      console.error("[cron/ai-agent/batches] learning digests", err);
+      return null;
+    });
+    return NextResponse.json({ ok: true, ...batches, learningDigests: learning });
   } catch (err) {
     console.error("[cron/ai-agent/batches]", err);
     return NextResponse.json({ error: "Failed to process batches" }, { status: 500 });

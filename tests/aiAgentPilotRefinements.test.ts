@@ -424,7 +424,7 @@ describe("Approval Pilot refinements (real server code, real SQL)", { skip: !pgA
     const [c] = await candidates();
     assert.equal(c.sender_verified, false);
     assert.equal(c.status, "pending");
-    assert.match(await lastFeedback(), /UNVERIFIED/);
+    assert.equal((await feedbacks()).length, 0, "no per-suggestion notice: the dashboard and the next digest carry it");
     // A verified authorized person's message is still a verified candidate.
     await pg.run(`delete from public.ai_agent_learning_candidates;`);
     await staffFrom(fact);

@@ -72,7 +72,7 @@ export async function ensureSettings(businessSlug: string): Promise<AgentSetting
 }
 
 export const SETTINGS_COLUMNS =
-  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, default_customer_mode, passive_learning_scope, knowledge_confirm_via_whatsapp, orders_tracking_enabled, orders_summary_enabled, orders_group_jid, orders_group_name, orders_timezone, orders_summary_hour, orders_customer_confirms, orders_tracking_since, updated_at";
+  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, default_customer_mode, passive_learning_scope, knowledge_confirm_via_whatsapp, orders_tracking_enabled, orders_summary_enabled, orders_group_jid, orders_group_name, orders_timezone, orders_summary_hour, orders_customer_confirms, orders_tracking_since, auto_learning_enabled, updated_at";
 
 export async function loadSettings(businessSlug: string): Promise<AgentSettings | null> {
   const { data, error } = await agentDb()
@@ -91,17 +91,30 @@ export interface KnowledgeRow {
   title: string;
   content: string;
   status: "draft" | "approved" | "archived";
-  source: "admin" | "staff_correction" | "import";
+  source: "admin" | "staff_correction" | "import" | "whatsapp" | "auto";
   source_ref: string | null;
   expires_at: string | null;
   version: number;
   approved_by: string | null;
   approved_at: string | null;
   updated_at: string;
+  /** Automatic learning: the K-XXXX code staff use with !forget, the product identity and the standard price. */
+  short_code: string | null;
+  subject_key: string | null;
+  price_amount: number | null;
+  fingerprint: string | null;
+  learned_message_at: string | null;
+  supersedes_id: string | null;
+  superseded_by: string | null;
+  archived_reason: string | null;
+  archived_at: string | null;
 }
 
 export const KNOWLEDGE_COLUMNS =
-  "id, business_slug, kind, title, content, status, source, source_ref, expires_at, version, approved_by, approved_at, updated_at";
+  "id, business_slug, kind, title, content, status, source, source_ref, expires_at, version, approved_by, approved_at, updated_at, short_code, subject_key, price_amount, fingerprint, learned_message_at, supersedes_id, superseded_by, archived_reason, archived_at";
+
+/** What the dashboard also reads: the identifiers of an automatic fact's source (never sent to the model). */
+export const KNOWLEDGE_ADMIN_COLUMNS = `${KNOWLEDGE_COLUMNS}, learned_message_id, learned_chat_id`;
 
 /** Only approved, unexpired entries — the sole facts the agent may state. */
 export async function loadActiveKnowledge(businessSlug: string): Promise<KnowledgeRow[]> {

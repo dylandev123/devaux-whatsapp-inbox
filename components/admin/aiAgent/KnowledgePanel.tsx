@@ -136,6 +136,14 @@ export function KnowledgePanel({ businessSlug }: { businessSlug: string }) {
                   <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-600">{e.kind}</span>
                   <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${STATUS_STYLES[e.status]}`}>{e.status}</span>
                   {isExpired(e) && <span className="rounded bg-red-50 px-1.5 py-0.5 text-[11px] text-red-600">expired</span>}
+                  {e.source === "auto" && <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[11px] text-sky-700">auto-learned{e.short_code ? ` · ${e.short_code}` : ""}</span>}
+                  {e.status === "archived" && e.archived_reason && (
+                    <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-500">
+                      {e.archived_reason === "superseded" ? "replaced by a newer fact" : e.archived_reason === "forgotten" ? "removed" : e.archived_reason}
+                      {e.archived_at ? ` · ${formatWhen(e.archived_at)}` : ""}
+                    </span>
+                  )}
+                  {e.supersedes_id && e.status === "approved" && <span className="rounded bg-violet-50 px-1.5 py-0.5 text-[11px] text-violet-700">replaces an older fact</span>}
                   <span className="font-medium text-zinc-900">{e.title}</span>
                   <span className="text-xs text-zinc-400">
                     v{e.version} · {e.source === "staff_correction" ? "from staff correction" : e.source} · updated {formatWhen(e.updated_at)}
@@ -143,6 +151,27 @@ export function KnowledgePanel({ businessSlug }: { businessSlug: string }) {
                   </span>
                 </div>
                 <p className="mt-1 whitespace-pre-wrap text-zinc-700">{e.content}</p>
+                {e.source === "auto" && (
+                  <details className="mt-1 text-xs text-zinc-500">
+                    <summary className="cursor-pointer hover:text-zinc-800">Where this came from</summary>
+                    {e.source_info ? (
+                      <div className="mt-1 space-y-0.5 rounded bg-zinc-50 p-2">
+                        <p>
+                          Conversation: {e.source_info.chat_id ? e.source_info.chat_id.split("@")[0] : "not recorded"}
+                          {e.source_info.at ? ` · sent ${formatWhen(e.source_info.at)}` : ""}
+                        </p>
+                        {e.source_info.original ? (
+                          <p className="whitespace-pre-wrap text-zinc-700">Original message: “{e.source_info.original}”</p>
+                        ) : (
+                          <p>Original message: {e.source_info.original_available ? "empty" : "no longer in the inbox"}</p>
+                        )}
+                        <p className="text-zinc-400">Read from the inbox just now — the chat text is not stored with this fact.</p>
+                      </div>
+                    ) : (
+                      <p className="mt-1">No source was recorded for this fact.</p>
+                    )}
+                  </details>
+                )}
                 <div className="mt-1.5 flex gap-3 text-xs">
                   <button
                     type="button"

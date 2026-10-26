@@ -33,6 +33,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
   const [senders, setSenders] = useState((s.staff_authorized_senders ?? []).join("\n"));
   const [passiveScope, setPassiveScope] = useState(s.passive_learning_scope ?? "off");
   const [confirmViaWhatsapp, setConfirmViaWhatsapp] = useState(s.knowledge_confirm_via_whatsapp === true);
+  const [autoLearning, setAutoLearning] = useState(s.auto_learning_enabled === true);
   const [ordersTracking, setOrdersTracking] = useState(s.orders_tracking_enabled === true);
   const [ordersSummary, setOrdersSummary] = useState(s.orders_summary_enabled === true);
   const [ordersGroup, setOrdersGroup] = useState<StaffGroupValue | null>(
@@ -83,6 +84,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
       staffAuthorizedSenders: senders.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
       passiveLearningScope: passiveScope,
       knowledgeConfirmViaWhatsapp: confirmViaWhatsapp,
+      autoLearningEnabled: autoLearning,
       ordersTrackingEnabled: ordersTracking,
       ordersSummaryEnabled: ordersSummary,
       ordersCustomerConfirms,
@@ -275,6 +277,14 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
           <label className="mt-3 flex items-center gap-2 text-sm text-zinc-700">
             <input type="checkbox" checked={confirmViaWhatsapp} onChange={(e) => setConfirmViaWhatsapp(e.target.checked)} />
             Authorized senders can confirm suggestions from WhatsApp (<code>!confirm K-XXXX</code>)
+          </label>
+          <label className="mt-3 flex items-start gap-2 text-sm text-zinc-700">
+            <input type="checkbox" className="mt-1" checked={autoLearning} onChange={(e) => setAutoLearning(e.target.checked)} />
+            <span>
+              Learn clearly stated facts automatically from the business&apos;s own human messages in customer chats (standard prices, sizes, hours, delivery). They are used by the AI right away;
+              conflicting prices, unclear products, customer-specific terms and risky policies wait on the Review tab instead. The staff group gets one short digest per 10 learned facts —{" "}
+              <code>!memory</code> lists them, <code>!forget K-XXXXX</code> removes one. Uses one AI call per relevant message (hourly limit). Never lets the AI message a customer.
+            </span>
           </label>
         </div>
 

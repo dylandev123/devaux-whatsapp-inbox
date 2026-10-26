@@ -1060,12 +1060,12 @@ describe("Approval Pilot and WhatsApp learning (real server code, real SQL)", { 
     assert.equal((await feedbacks()).length, 0, "a routine knowledge suggestion stays in the dashboard unless WhatsApp confirmation is on");
   });
 
-  test("passive learning posts a suggestion to the group only when the business opted in to confirming knowledge from WhatsApp", async () => {
+  test("passive learning never posts individual suggestions to the group, even when WhatsApp confirmation is on: they wait in the dashboard and are counted in the next digest", async () => {
     await configure({ passive_learning_scope: "staff_group", knowledge_confirm_via_whatsapp: true });
     analyzerScript = hoursItem;
     await staffSays(hoursFact);
-    assert.match(await lastFeedback(), /possible fact/);
-    assert.match(await lastFeedback(), /!confirm K-/);
+    assert.equal((await candidates()).length, 1);
+    assert.equal((await feedbacks()).length, 0);
   });
 
   test("passive learning never reads customer chats unless the admin chose the wider scope, and then only the business's OWN messages", async () => {

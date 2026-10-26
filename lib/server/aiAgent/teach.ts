@@ -2,7 +2,7 @@
 // way it becomes knowledge:
 //
 //   !teach <fact>          an authorized staff member proposes a fact       → candidate (pending)
-//   passive extraction     a fact stated by authorized staff in the staff   → candidate (pending)
+//   passive extraction     a fact stated by authorized staff in the staff   → candidate (pending, silent)
 //                          group, or by the business itself in a customer
 //                          chat, when the admin enabled that scope
 //   admin dashboard        (unchanged) staff-answer candidates              → candidate (pending)
@@ -41,9 +41,9 @@ export interface TeachResult {
   outcome: string;
 }
 
-export type CandidateSource = "whatsapp_teach" | "passive_staff_group" | "passive_staff_chat";
+export type CandidateSource = "whatsapp_teach" | "passive_staff_group" | "passive_staff_chat" | "auto_staff_chat";
 
-interface CandidateRowLite {
+export interface CandidateRowLite {
   id: string;
   short_code: string | null;
   staff_answer: string;
@@ -100,7 +100,7 @@ async function expireLapsed(businessSlug: string): Promise<void> {
 }
 
 /** Stores one candidate, assessed against today's approved knowledge. Returns null when it is already known or already proposed. */
-async function storeCandidate(args: {
+export async function storeCandidate(args: {
   settings: AgentSettings;
   source: CandidateSource;
   fact: string;
@@ -116,6 +116,9 @@ async function storeCandidate(args: {
   sourceMessageAt: string | null;
   /** The staff's own words; only stored for an explicit !teach (never for passive extraction). */
   sourceText: string | null;
+  /** Automatic learning: why a person must decide (REVIEW_REASON_TEXT key), and the fact's identity (product + figures). */
+  reviewReason?: string | null;
+  fingerprint?: string;
   now?: Date;
 }): Promise<{ row: CandidateRowLite; conflicts: KnowledgeConflict[] } | { known: string } | { proposed: CandidateRowLite }> {
   const now = args.now ?? new Date();
@@ -125,7 +128,7 @@ async function storeCandidate(args: {
   if (assessment.duplicateOf) return { known: assessment.duplicateOf.title };
   // A temporary fact expires on its own; it is not compared against permanent rules.
   const conflicts = args.expiresAt ? [] : assessment.conflicts;
-  const fingerprint = candidateFingerprint(args.fact);
+  const fingerprint = args.fingerprint ?? candidateFingerprint(args.fact);
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const { data, error } = await agentDb()
@@ -150,6 +153,7 @@ async function storeCandidate(args: {
         confidence: args.confidence,
         proposal_expires_at: new Date(now.getTime() + PROPOSAL_TTL_DAYS * 86_400_000).toISOString(),
         fact_expires_at: args.expiresAt,
+        review_reason: args.reviewReason ?? null,
         short_code: generateKnowledgeCode(randomBytes(4)),
       })
       .select(CANDIDATE_LITE)
@@ -464,16 +468,9 @@ export async function maybeExtractPassive(args: {
       sender_verified: !unverified,
       auto_approved: false,
     });
-    // Routine knowledge suggestions stay in the dashboard (AI Agent → Review) unless the business opted in to confirming
-    // them from WhatsApp: only then is a post actionable, so only then does it go to the staff group.
-    if (settings.knowledge_confirm_via_whatsapp !== true) return { outbox: [], outcome: "passive:proposed" };
-    const confirmHint = "Reply !confirm K-… to add it or !discard K-… to drop it";
-    const body = [
-      `📚 I noticed ${stored.length === 1 ? "a possible fact" : `${stored.length} possible facts`} (not used yet${unverified ? " — UNVERIFIED: sent from the business account, so nobody can say who wrote it" : ""}):`,
-      ...stored.slice(0, 3).map((s) => `• ${s.code}: “${clip(s.text, 140)}”`),
-      confirmHint + ".",
-    ].join("\n");
-    return say(settings, args.eventId, body, "passive:proposed");
+    // Routine suggestions never post to the staff group one by one: they wait in the dashboard (AI Agent → Review) and
+    // the next learning digest carries their count. Only an explicit !teach is answered in the group.
+    return { outbox: [], outcome: "passive:proposed" };
   } catch (err) {
     console.error("[aiAgent] maybeExtractPassive", err instanceof Error ? err.message : err);
     return none;

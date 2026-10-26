@@ -1,5 +1,6 @@
 "use client";
 
+import { REVIEW_REASON_TEXT, type ReviewReason } from "@/lib/aiAgent/autoLearn";
 import { useCallback, useEffect, useState } from "react";
 import { aiAgentApi, LearningCandidate, OrderRequestView } from "@/lib/aiAgent/client";
 import { formatOrderRequest, KNOWLEDGE_KINDS, KnowledgeKind } from "@/lib/aiAgent/engine";
@@ -55,9 +56,12 @@ function CandidateItem({ businessSlug, c, onDone }: { businessSlug: string; c: L
         </span>
         {c.source && c.source !== "staff_answer" && (
           <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] text-zinc-700">
-            {c.source === "whatsapp_teach" ? "!teach" : c.source === "passive_staff_group" ? "noticed in the staff group" : "noticed in a customer chat"}
+            {c.source === "whatsapp_teach" ? "!teach" : c.source === "passive_staff_group" ? "noticed in the staff group" : c.source === "auto_staff_chat" ? "learned from a business message — needs a decision" : "noticed in a customer chat"}
             {c.short_code ? ` · ${c.short_code}` : ""}
           </span>
+        )}
+        {c.review_reason && c.review_reason in REVIEW_REASON_TEXT && (
+          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800">{REVIEW_REASON_TEXT[c.review_reason as ReviewReason]}</span>
         )}
         {c.sender_verified === false && (
           <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800">unverified sender — business account message</span>

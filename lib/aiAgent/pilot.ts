@@ -15,7 +15,7 @@ import { statesTemporaryCondition } from "./staffAnswers.ts";
 /** Commands that act on one escalation's draft. */
 export const DRAFT_COMMANDS = ["approve", "edit", "reject", "moreinfo"] as const;
 /** Commands about the business's knowledge (and read-only status); they need no escalation. */
-export const BUSINESS_COMMANDS = ["teach", "confirm", "discard", "status"] as const;
+export const BUSINESS_COMMANDS = ["teach", "confirm", "discard", "status", "memory", "forget"] as const;
 export type PilotCommand = (typeof DRAFT_COMMANDS)[number] | (typeof BUSINESS_COMMANDS)[number];
 
 /** "!more info" and "!more-info" are read as "!moreinfo". */
@@ -547,15 +547,23 @@ const FACT_CUE =
 
 const QUESTION_ONLY = /\?\s*$/;
 
-/** Cheap pre-filter before any model call: long enough, not a command, not a question, and it states something factual. */
-export function passiveWorthLooking(text: string): boolean {
+/**
+ * The shape of a message worth reading for facts: long enough, not a command, not a question, not one of the agent's
+ * own posts. With requireFactCue it must also contain a usual business cue (a price, a time, "we deliver"…).
+ */
+export function looksLikeStatement(text: string, requireFactCue: boolean): boolean {
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length < 20 || t.length > 800) return false;
   if (t.startsWith("!")) return false;
   if (QUESTION_ONLY.test(t)) return false;
   if (/\bE-[A-Z0-9]{4,8}\b/i.test(t)) return false; // an escalation answer: handled by the staff-answer pipeline
   if (/(AI escalation #|Draft v\d|Draft reply for #|Update on #)/.test(t)) return false;
-  return FACT_CUE.test(t);
+  return requireFactCue ? FACT_CUE.test(t) : true;
+}
+
+/** Cheap pre-filter before any model call: long enough, not a command, not a question, and it states something factual. */
+export function passiveWorthLooking(text: string): boolean {
+  return looksLikeStatement(text, true);
 }
 
 /** Model calls a business may spend on passive extraction per hour. */

@@ -88,6 +88,8 @@ export interface AgentSettings {
   passive_learning_scope?: PassiveLearningScope | null;
   /** Authorized senders may confirm knowledge candidates with !confirm. Absent/false = admins only. */
   knowledge_confirm_via_whatsapp?: boolean | null;
+  /** Learn reusable facts automatically from the business's own human messages (lib/aiAgent/autoLearn.ts). Absent/false = off. */
+  auto_learning_enabled?: boolean | null;
   /** Daily order tracking (lib/aiAgent/orders.ts): extract orders from conversations into ai_agent_orders. Absent = off. */
   orders_tracking_enabled?: boolean | null;
   /** The 8 AM summary and the "!update" command. Absent = off. */

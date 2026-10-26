@@ -55,6 +55,7 @@ interface Payload {
   defaultCustomerMode?: unknown;
   passiveLearningScope?: unknown;
   knowledgeConfirmViaWhatsapp?: unknown;
+  autoLearningEnabled?: unknown;
   ordersTrackingEnabled?: unknown;
   ordersSummaryEnabled?: unknown;
   ordersGroupJid?: unknown;
@@ -159,6 +160,10 @@ export async function PUT(request: Request) {
   if (body.knowledgeConfirmViaWhatsapp !== undefined) {
     if (typeof body.knowledgeConfirmViaWhatsapp !== "boolean") return jsonError("knowledgeConfirmViaWhatsapp must be a boolean", 400);
     patch.knowledge_confirm_via_whatsapp = body.knowledgeConfirmViaWhatsapp;
+  }
+  if (body.autoLearningEnabled !== undefined) {
+    if (typeof body.autoLearningEnabled !== "boolean") return jsonError("autoLearningEnabled must be a boolean", 400);
+    patch.auto_learning_enabled = body.autoLearningEnabled;
   }
   if (body.ordersTrackingEnabled !== undefined) {
     if (typeof body.ordersTrackingEnabled !== "boolean") return jsonError("ordersTrackingEnabled must be a boolean", 400);

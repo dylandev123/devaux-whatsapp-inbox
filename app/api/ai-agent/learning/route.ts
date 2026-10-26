@@ -13,7 +13,7 @@ import { approvedKnowledgeLite, approveCandidate, assessCandidate } from "@/lib/
 export const dynamic = "force-dynamic";
 
 const CANDIDATE_COLUMNS =
-  "id, escalation_id, question, staff_answer, status, knowledge_id, reviewed_at, created_at, category, suggested_kind, suggested_title, source_message, source_message_at, ref_code, conflicts, source, short_code, fact_expires_at, proposal_expires_at, sender_verified";
+  "id, escalation_id, question, staff_answer, status, knowledge_id, reviewed_at, created_at, category, suggested_kind, suggested_title, source_message, source_message_at, ref_code, conflicts, source, short_code, fact_expires_at, proposal_expires_at, sender_verified, review_reason";
 
 interface CandidateRow {
   id: string;

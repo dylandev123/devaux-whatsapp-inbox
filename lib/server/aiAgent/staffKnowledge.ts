@@ -293,7 +293,7 @@ export interface StaffAnalysisOutcome {
   error: string | null;
 }
 
-async function recentTranscript(businessSlug: string, chatId: string): Promise<{ who: "Customer" | "Staff"; text: string }[]> {
+export async function recentTranscript(businessSlug: string, chatId: string): Promise<{ who: "Customer" | "Staff"; text: string }[]> {
   const { data } = await agentDb()
     .from("whatsapp_messages")
     .select("direction, message_body, timestamp")

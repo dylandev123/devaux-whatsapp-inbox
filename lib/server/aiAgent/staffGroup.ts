@@ -65,6 +65,7 @@ import {
   type PilotCtx,
   recordStaffTextSent,
 } from "@/lib/server/aiAgent/pilot";
+import { handleForget, handleMemory } from "@/lib/server/aiAgent/learningCommands";
 import { handleConfirm, handleDiscard, handleTeach, maybeExtractPassive } from "@/lib/server/aiAgent/teach";
 import {
   analyzeAndStore,
@@ -213,10 +214,10 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
   });
   const senderAuth = authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone);
 
-  // !confirm / !discard name a knowledge code, never an escalation: they work whatever else the message quotes
-  // (e.g. the proposal message of a fact taught for an escalation that has since closed).
+  // !confirm / !discard / !forget name a knowledge code, and !memory names nothing: never an escalation, so they work
+  // whatever else the message quotes (e.g. the proposal message of a fact taught for an escalation that has since closed).
   const knowledgeCmd = looksLikeAgentMessage(input.text) ? null : parsePilotCommand(input.text.replace(/#?\bE-[A-Z0-9]{4,8}\b/gi, " "));
-  if (knowledgeCmd && (knowledgeCmd.command === "confirm" || knowledgeCmd.command === "discard") && match.kind !== "unmatched") {
+  if (knowledgeCmd && ["confirm", "discard", "forget", "memory"].includes(knowledgeCmd.command) && match.kind !== "unmatched") {
     return handleUntargeted(input, knowledgeCmd, senderAuth, canSendApproved(settings));
   }
   // !teach quoting a closed request still teaches (just not tied to that request).
@@ -344,6 +345,10 @@ async function handleUntargeted(
       return wrap(await handleConfirm(base));
     case "discard":
       return wrap(await handleDiscard(base));
+    case "forget":
+      return wrap(await handleForget(base));
+    case "memory":
+      return wrap(await handleMemory(base));
     case "status": {
       const text = await businessStatusText(settings.business_slug);
       return {
@@ -405,6 +410,10 @@ async function handlePilotCommand(ctx: Ctx, command: PilotCommand | "loose_appro
       return done(await handleConfirm(base));
     case "discard":
       return done(await handleDiscard(base));
+    case "forget":
+      return done(await handleForget(base));
+    case "memory":
+      return done(await handleMemory(base));
     case "loose_approval":
       return {
         outbox: canSendApproved(settings) ? [feedbackItem(ctx, PILOT_REFUSAL_TEXT.loose_approval(e.ref_code))] : [],

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { readJson, verifyBridgeSecret } from "@/lib/server/aiAgent/auth";
 import { parseBusinessSlug } from "@/lib/server/aiAgent/db";
 import { claimOutbox } from "@/lib/server/aiAgent/outbox";
-import { sweepBatchesAfterResponse, sweepOrderSummariesAfterResponse } from "@/lib/server/aiAgent/scheduler";
+import { sweepBatchesAfterResponse, sweepLearningDigestsAfterResponse, sweepOrderSummariesAfterResponse } from "@/lib/server/aiAgent/scheduler";
 
 // Bridge → app: claim outbox items queued outside a message request (admin UI
 // answers to escalations). Each item is handed out once; ack every one.
@@ -28,6 +28,8 @@ export async function POST(request: Request) {
     sweepBatchesAfterResponse();
     // ... and the 8 AM order summary (idempotent per business per day; see runScheduledSummary).
     sweepOrderSummariesAfterResponse();
+    // ... and the weekly AI-memory digest (once per week per business, decided in the database).
+    sweepLearningDigestsAfterResponse();
     return NextResponse.json({ items });
   } catch (err) {
     console.error("[bridge/ai-agent/outbox/claim]", err);

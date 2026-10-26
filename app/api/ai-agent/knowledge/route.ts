@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { KNOWLEDGE_KINDS } from "@/lib/aiAgent/engine";
+import { candidateFingerprint } from "@/lib/aiAgent/staffAnswers";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, KNOWLEDGE_COLUMNS, KnowledgeRow, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, KNOWLEDGE_ADMIN_COLUMNS, KNOWLEDGE_COLUMNS, KnowledgeRow, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
+import { loadSources, type SourceInfo, type SourceRef } from "@/lib/server/aiAgent/learningSources";
 
 // Admin-only. Business knowledge: the only facts the agent may state. Any edit
 // to an approved entry sends it back to draft until it is re-approved.
@@ -15,12 +17,29 @@ export async function GET(request: Request) {
 
   const { data, error } = await agentDb()
     .from("ai_agent_knowledge")
-    .select(KNOWLEDGE_COLUMNS)
+    .select(KNOWLEDGE_ADMIN_COLUMNS)
     .eq("business_slug", businessSlug)
     .order("kind")
     .order("title");
   if (error) return jsonError(error.message, 500);
-  return NextResponse.json({ entries: data ?? [] });
+  const entries = (data ?? []) as unknown as (KnowledgeRow & SourceRef)[];
+  // Where each automatic fact came from. The original message is read from the inbox now, for this admin only — it is
+  // never stored with the knowledge. A failed lookup only leaves the source out.
+  let sources = new Map<string, SourceInfo>();
+  try {
+    sources = await loadSources(businessSlug, entries.filter((e) => e.source === "auto"), { withText: true });
+  } catch (err) {
+    console.error("[ai-agent/knowledge] source lookup", err instanceof Error ? err.message : err);
+  }
+  return NextResponse.json({
+    entries: entries.map(({ learned_message_id: _message, learned_chat_id: _chat, ...entry }) => {
+      const src = sources.get(entry.id);
+      return {
+        ...entry,
+        source_info: src ? { chat_id: src.chatId, message_id: src.messageId, at: src.at, original: src.original, original_available: src.originalAvailable } : null,
+      };
+    }),
+  });
 }
 
 interface Fields {
@@ -112,10 +131,17 @@ export async function PATCH(request: Request) {
       patch = { status: "approved", approved_by: admin.userId, approved_at: now };
       break;
     case "archive":
-      patch = { status: "archived" };
+      // Archived, never deleted. Marked "forgotten" so a repeat of the same message does not relearn it right away.
+      patch = {
+        status: "archived",
+        archived_reason: "forgotten",
+        archived_at: now,
+        archived_by: admin.userId,
+        fingerprint: prev.fingerprint ?? candidateFingerprint(prev.content),
+      };
       break;
     case "restore":
-      patch = { status: "draft", approved_by: null, approved_at: null };
+      patch = { status: "draft", approved_by: null, approved_at: null, archived_reason: null, archived_at: null, archived_by: null };
       break;
     case "update": {
       const fields = validateFields(body, true);

@@ -49,6 +49,8 @@ export interface SettingsPatch {
   passiveLearningScope?: NonNullable<AgentSettings["passive_learning_scope"]>;
   /** Authorized senders may confirm knowledge candidates with !confirm. */
   knowledgeConfirmViaWhatsapp?: boolean;
+  /** Learn reusable facts automatically from the business's own human messages; reviews and digests only, no per-fact notices. */
+  autoLearningEnabled?: boolean;
   /** Daily orders: extract orders from conversations into the Orders tab. */
   ordersTrackingEnabled?: boolean;
   /** Daily orders: the 8 AM summary and the !update command. */
@@ -105,12 +107,24 @@ export interface KnowledgeEntry {
   title: string;
   content: string;
   status: "draft" | "approved" | "archived";
-  source: "admin" | "staff_correction" | "import";
+  source: "admin" | "staff_correction" | "import" | "whatsapp" | "auto";
   source_ref: string | null;
   expires_at: string | null;
   version: number;
   approved_at: string | null;
   updated_at: string;
+  /** Learned facts: the K-XXXX code for !forget, the standard price, and the history link when a newer fact replaced it. */
+  short_code?: string | null;
+  /** Automatic learning: why a person must decide (key of REVIEW_REASON_TEXT). */
+  review_reason?: string | null;
+  price_amount?: number | null;
+  learned_message_at?: string | null;
+  supersedes_id?: string | null;
+  superseded_by?: string | null;
+  archived_reason?: string | null;
+  archived_at?: string | null;
+  /** Automatic facts: the conversation, time and original message they were learned from (the message is read from the inbox, never stored with the fact). */
+  source_info?: { chat_id: string | null; message_id: string; at: string | null; original: string | null; original_available: boolean } | null;
 }
 
 export interface EscalationView {
@@ -289,11 +303,13 @@ export interface LearningCandidate {
   status: "pending" | "approved" | "rejected" | "expired";
   created_at: string;
   /** Where the suggestion came from; 'staff_answer' = a staff answer to an escalation. */
-  source?: "staff_answer" | "whatsapp_teach" | "passive_staff_group" | "passive_staff_chat";
+  source?: "staff_answer" | "whatsapp_teach" | "passive_staff_group" | "passive_staff_chat" | "auto_staff_chat";
   /** false = from the business account's own messages: nobody can say who wrote it. */
   sender_verified?: boolean;
   /** The code staff use in WhatsApp (!confirm K-XXXX). */
   short_code?: string | null;
+  /** Automatic learning: why a person must decide (key of REVIEW_REASON_TEXT in lib/aiAgent/autoLearn.ts). */
+  review_reason?: string | null;
   /** Set for a temporary fact: the knowledge entry created from it expires then. */
   fact_expires_at?: string | null;
   proposal_expires_at?: string | null;

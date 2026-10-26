@@ -8,6 +8,7 @@
 
 import { after } from "next/server";
 import { processDueBatches } from "@/lib/server/aiAgent/decide";
+import { runDueLearningDigests } from "@/lib/server/aiAgent/learningDigest";
 import { runDueOrderSummaries } from "@/lib/server/aiAgent/orders";
 
 const MIN_GAP_MS = 5_000;
@@ -43,6 +44,26 @@ export function sweepOrderSummariesAfterResponse(): void {
       await runDueOrderSummaries();
     } catch (err) {
       console.error("[aiAgent] order summary sweep failed", err instanceof Error ? err.message : err);
+    }
+  });
+}
+
+const LEARNING_DIGEST_MIN_GAP_MS = 30 * 60_000;
+let lastLearningSweepAt = 0;
+
+/**
+ * The weekly "AI memory" digest piggy-backs on the same traffic. The weekly decision and its once-only guarantee live in the
+ * database (claim_ai_agent_learning_digest + the outbox dedupe key), so a skipped, repeated or concurrent sweep is harmless.
+ */
+export function sweepLearningDigestsAfterResponse(): void {
+  const now = Date.now();
+  if (now - lastLearningSweepAt < LEARNING_DIGEST_MIN_GAP_MS) return;
+  lastLearningSweepAt = now;
+  after(async () => {
+    try {
+      await runDueLearningDigests();
+    } catch (err) {
+      console.error("[aiAgent] learning digest sweep failed", err instanceof Error ? err.message : err);
     }
   });
 }

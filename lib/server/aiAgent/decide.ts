@@ -97,6 +97,7 @@ import {
 import { loadGateData } from "@/lib/server/aiAgent/gateData";
 import { saveCustomerFacts } from "@/lib/server/aiAgent/memory";
 import { createFollowUpAiDraft, type DraftMeta, draftMetaFrom, ensureAiDraft, purgePilotDrafts, turnBasisAt } from "@/lib/server/aiAgent/pilot";
+import { maybeAutoLearn } from "@/lib/server/aiAgent/autoLearn";
 import { maybeExtractPassive } from "@/lib/server/aiAgent/teach";
 import {
   canSend,
@@ -443,6 +444,18 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
       actorId: null,
     });
   }
+  // Automatic learning reads the same message, independently of order monitoring: its own gate, model budget and failure
+  // handling (maybeAutoLearn never throws). It starts first so a failing monitor cannot stop it; it is idempotent per
+  // WhatsApp message, so a bridge retry never learns or counts twice. It only ever produces knowledge (and the staff digest).
+  const learning = maybeAutoLearn({
+    settings,
+    chatId: input.chatId,
+    contactNumber: input.contactNumber,
+    text: input.text,
+    hasMedia: input.hasMedia,
+    whatsappMessageId: input.whatsappMessageId,
+    timestamp: input.timestamp,
+  });
   // Order monitoring reads what the business writes in a customer chat too (a confirmation, a cancellation, a change),
   // but it can only flag an existing order for a person to verify. Never a reply, never an order of its own.
   const monitored = settings.orders_tracking_enabled
@@ -456,11 +469,16 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
         whatsappMessageId: input.whatsappMessageId,
         timestamp: input.timestamp,
         eventId,
+      }).catch(async (err) => {
+        await learning;
+        throw err;
       })
     : { reasons: [] as string[] };
-  // The business's own message in a customer chat may state a reusable fact. Only with the admin's explicit
-  // "staff chats" scope; stored as a PENDING suggestion (never knowledge), never customer text.
-  if (settings.passive_learning_scope === "staff_group_and_chats" && !input.chatId.endsWith("@g.us")) {
+  const learned = await learning;
+  const learnedReasons = learned.outcome === "auto:off" || learned.outcome === "auto:not_human" || learned.outcome === "auto:no_signal" ? [] : [learned.outcome.replace(":", "_")];
+  // Without automatic learning, the business's own message in a customer chat may still state a reusable fact. Only with the
+  // admin's explicit "staff chats" scope; stored as a PENDING suggestion (never knowledge), never customer text.
+  if (settings.auto_learning_enabled !== true && settings.passive_learning_scope === "staff_group_and_chats" && !input.chatId.endsWith("@g.us")) {
     const passive = await maybeExtractPassive({
       settings,
       source: "staff_chat",
@@ -475,7 +493,7 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
     });
     return { decision: "HUMAN", reasons: ["staff_message", ...monitored.reasons, ...(passive.outcome === "passive:skipped" ? [] : [passive.outcome.replace(":", "_")])], outbox: passive.outbox };
   }
-  return { decision: "HUMAN", reasons: ["staff_message", ...monitored.reasons], outbox: [] };
+  return { decision: "HUMAN", reasons: ["staff_message", ...monitored.reasons, ...learnedReasons], outbox: [] };
 }
 
 async function autoRepliesLastHour(businessSlug: string, chatId: string): Promise<number> {
