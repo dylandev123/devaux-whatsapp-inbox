@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { aiAgentApi, AgentBusiness, SettingsResponse } from "@/lib/aiAgent/client";
 import { fetchKnownChats, KnownChat } from "@/lib/knownChats";
+import { ApprovalsPanel } from "@/components/admin/aiAgent/ApprovalsPanel";
 import { ActivityPanel } from "@/components/admin/aiAgent/ActivityPanel";
 import { ContactPermissions } from "@/components/admin/aiAgent/ContactPermissions";
 import { ConversationsPanel } from "@/components/admin/aiAgent/ConversationsPanel";
@@ -125,6 +126,8 @@ export function AiAgentPage() {
           </button>
         ))}
       </nav>
+
+      {data && s && businessSlug && s.enabled && <ApprovalsPanel businessSlug={businessSlug} mode={s.mode} />}
 
       {error && <Notice tone="error">{error}</Notice>}
       {!data && !error && <p className="text-sm text-zinc-500">Loading…</p>}

@@ -59,6 +59,7 @@ import {
   handleApprove,
   handleEdit,
   handleEscalationStatus,
+  handleMoreInfo,
   handleReject,
   PILOT_DRAFT_KEY_PREFIX,
   type PilotCtx,
@@ -390,6 +391,8 @@ async function handlePilotCommand(ctx: Ctx, command: PilotCommand | "loose_appro
       return done(await handleReject(pctx, body));
     case "status":
       return done(await handleEscalationStatus(pctx));
+    case "moreinfo":
+      return done(await handleMoreInfo(pctx));
     case "teach":
       return done(await handleTeach({ ...base, escalation: { id: e.id, ref_code: e.ref_code }, whatsappMessageId: ctx.whatsappMessageId, timestamp: ctx.timestamp }));
     case "confirm":

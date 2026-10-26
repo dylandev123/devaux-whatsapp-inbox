@@ -34,6 +34,7 @@ says so. Two codes, or a quote that disagrees with the code, are refused.
 | `!edit <text>` | authorized | Creates a **replacement draft version** from exact wording. Sends nothing; it must be approved. The replaced version is kept as history. |
 | `!send <text>` | authorized | Sends exactly that wording (existing behavior, same central policy). A bare `!send` is refused in the pilot; use `!approve`. |
 | `!reject [wrong\|missing] [why]` | authorized | Drops the current draft. Nothing is sent. `wrong` / `missing` records the AI as factually wrong / missing information. |
+| `!moreinfo` | authorized | A separate, detailed, **read-only** staff-group message: customer name and verified phone, the full current order (product, variant, size, quantity, delivery/collection, address, day), what is missing, recent order changes and cancellations, knowledge gaps and unverified claims, why the draft may be risky, the approval status, and whether the quoted draft is still actionable (a stale or replaced one is labelled **STALE**). Quote a notice, or add `#E-XXXXX`. Built from stored data: no model call, no change to the draft, order, request or approval, nothing to the customer. Works on a stale or closed request. Answers once per request every 45 s and at most 12 per business per 10 min (extra requests are silent and audited). |
 | `!status` | anyone in the group | With a target: draft version, readiness, stale warning. Without: the open requests. Read-only. |
 | `!teach [for 6h\|until YYYY-MM-DD] <fact>` | authorized (any mode) | Proposes a business fact (see below). Quote an escalation (or add its code) to tie the fact to the question it fixes. |
 | `!confirm K-XXXX [replace\|keep]` | authorized, **only if** "WhatsApp confirmation" is enabled | Approves a suggestion into knowledge. |
@@ -46,19 +47,62 @@ In Observe the commands never speak in the group and never send; in Assisted `!a
 
 ## The staff notice
 
-One concise message per escalation: the customer's latest request, the **AI's independent suggestion** (version 1), its
-readiness, what is missing or uncertain, the escalation code and the commands.
+Short on purpose. One message per request:
 
-* `✅ customer-ready`: every claim in the draft is backed by approved knowledge the AI cited, no sensitive topic, confidence
-  above the autonomy bar.
-* `⚠️ confirm the facts before sending` + up to four plain-language reasons (price not in knowledge, no approved knowledge,
-  promises stock/delivery/payment, sensitive request, low confidence, order still unconfirmed). Needs `!approve confirm` or `!edit`.
+```
+#E-ABCDE · Jane
 
-The suggestion is the proposal from the one model call the pipeline already made (no extra call), generated from the knowledge
-active at that turn, before any staff input. A later customer message posts the usual material-change update (unchanged
-detection) and the draft becomes **stale**: it can no longer be approved; write a new one with `!edit`.
-A plain staff answer ("yes we deliver on Wednesdays") is still information; the reply drafted from it becomes a new draft version
-that needs `!approve`.
+Customer: “2 bags of Monello chicken 15kg, delivered Friday”
+
+AI suggests:
+“Sure! What delivery address should we use?”
+
+⚠️ It states a day or time that approved knowledge doesn't contain
+
+!approve confirm · !edit <text> · !reject · !moreinfo
+```
+
+* The suggestion is the **exact** text `!approve` would send. The AI's internal reasoning, confidence, knowledge ids, order history and the full
+  missing-field list are not shown: they are in `!moreinfo` and the dashboard.
+* **Warnings** are only what a person must act on before approving (at most two): the draft states something approved knowledge does not back
+  (price, stock, day/time, offer, a promise), it is a sensitive request, or the customer wants to cancel. A warning-free notice shows `!approve`;
+  one with warnings shows `!approve confirm` (the approver attests the facts).
+* No suggestion: `AI suggests: nothing — it needs a person to answer.` and `!send <text> · !moreinfo`.
+* `!send`, `!status`, `!teach`, `!confirm`, `!discard`, `!note` and `!close` still work; they are just not repeated in every notice.
+
+### One actionable approval per request
+
+Rapid customer messages are batched into one turn (existing batching) and answered by **one** notice. When the customer later adds something that
+matters (an order change, a question, a cancellation), staff get **one short replacement**:
+
+```
+#E-ABCDE · Jane — updated
+
+Customer: “make it 3 bags”
+Changed: Quantity changed: Monello Chicken 15kg 2 → 3
+
+AI suggests (replaces the earlier one):
+“Got it, 3 bags. Delivery or collection?”
+
+Quote this message: !approve · !edit <text> · !reject · !moreinfo
+```
+
+The earlier draft is superseded (kept for Evaluation) and can no longer be approved; quoting it is refused and names the current one. A pleasantry or
+a repeat posts nothing.
+
+### Quiet messages
+
+In Approval Pilot a message that needs no answer creates **no** request, notice or draft: a thank-you / "ok" / greeting, or small talk with no question.
+It is still stored, still counted in Activity, and still updates the customer's orders. Never silenced: an order or order change, a cancellation, a
+complaint or other sensitive topic, a question, or anything while staff already own the request.
+
+### Dashboard approval queue
+
+AI Agent page → "Pending approvals" (Approval Pilot only): each open request with the customer's latest message, the exact draft, and **Approve / Edit /
+Reject / More info**. It is a second *view* of the same pilot, not a second send path: Approve calls the same `approveDraftCore()` as `!approve`
+(central send policy, draft freshness, atomic id + hash compare-and-set, duplicate and unknown-send holds), the reply is the one `staff_relay` outbox
+row (status `pending`, claimed by the bridge's poll), and the audit log records the admin. A stale draft shows "out of date" and cannot be approved;
+an unconfirmed draft needs "I have checked these facts". One request at a time: there is no bulk action.
 
 ## What `!approve` checks (nothing relaxed)
 
@@ -155,8 +199,7 @@ The pilot keeps the conversation going; it never stops after the first approved 
   knowledge gap (`⚠️ confirm the facts`, with the reason) and no order is started.
 * A draft that only asks for the next order detail is **customer-ready** (plain `!approve`); one that states a price, stock, day/time or offer
   without approved knowledge still needs `!approve confirm` or `!edit`.
-* The notice is concise: customer + latest message, the AI suggestion, "Order so far (not confirmed)", "Missing / uncertain", the code and the
-  commands. Everything else (full history, versions, verdicts) is in the dashboard.
+* The notice is compact (see above). The order so far, what is missing and the risks are in `!moreinfo` and the dashboard.
 
 ## Rollout stages (existing controls only)
 

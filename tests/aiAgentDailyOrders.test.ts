@@ -798,7 +798,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
   test("with tracking on it says what it covers, and when tracking started", async () => {
     await configure({ orders_tracking_since: "2026-10-20T15:00:00Z" });
     const text = await reportText();
-    assert.match(text, /Lists only orders found in conversations the AI analysed/);
+    assert.match(text, /Covers every customer chat the agent received, including ones the AI does not reply in/);
     assert.match(text, /Tracking has been on since Tue 20 Oct; earlier conversations were not analysed/);
     assert.doesNotMatch(text, /Incomplete/);
   });
@@ -813,9 +813,9 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await ev(SAM.chat, "done", ["orders_tracking_failed"]);
     const text = await reportText();
     assert.match(text, /2 conversations could not be analysed in the last 36 h/);
-    assert.match(text, /1 conversation was not analysed/);
+    assert.match(text, /1 conversation was handled in the last 36 h before every conversation was being read for orders/);
     assert.match(text, /⚠️/);
-    assert.doesNotMatch(text, /Lists only orders found/, "a report with problems must not read as a clean one");
+    assert.doesNotMatch(text, /Covers every customer chat/, "a report with problems must not read as a clean one");
   });
 
   test("a failed or stuck batch counts as not analysed", async () => {
@@ -838,11 +838,13 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.match(await reportText(), /1 conversation could not be analysed/);
   });
 
-  test("selected-contacts and no-contacts scopes are stated", async () => {
-    await configure({ contact_scope: "selected" });
-    assert.match(await reportText(), /Only conversations with customers selected for the AI are analysed/);
-    await configure({ contact_scope: "none" });
-    assert.match(await reportText(), /no customers are selected for the AI/);
+  test("order tracking no longer depends on the AI contact scope, and the report says so", async () => {
+    for (const scope of ["selected", "none"]) {
+      await configure({ contact_scope: scope });
+      const text = await reportText();
+      assert.doesNotMatch(text, /selected for the AI|no customers are selected/, `scope ${scope}: no stale limitation`);
+      assert.match(text, /Covers every customer chat the agent received/);
+    }
   });
 
   test("the report carries every field staff need", async () => {

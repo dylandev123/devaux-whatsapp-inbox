@@ -83,6 +83,43 @@ export async function loadCustomerContext(
   return { customerKey, customerName, memory, transcript };
 }
 
+/** The customer's saved name (or their verified number / chat id when none is saved). Display only. */
+export async function loadCustomerDisplayName(identity: ChatIdentity, contactNumber: string | null, chatId: string): Promise<string> {
+  const customerKey = identity.phone ?? resolveRecipientNumber(contactNumber, chatId);
+  const { data: c } = identity.phone
+    ? await agentDb().from("customers").select("first_name, last_name, whatsapp_name, business_contact_name").eq("phone_number", identity.phone).maybeSingle()
+    : { data: null };
+  return resolveContactName({
+    businessContactName: c?.business_contact_name,
+    firstName: c?.first_name,
+    lastName: c?.last_name,
+    whatsappName: c?.whatsapp_name,
+    phoneNumber: customerKey,
+  });
+}
+
+/** The last few stored messages of a chat (oldest first), labelled. Order monitoring's only look at history. */
+export async function loadRecentMessages(
+  businessSlug: string,
+  chatId: string,
+  excludeMessageIds: string[],
+  limit = 8
+): Promise<{ who: "Customer" | "Staff"; text: string; at: string }[]> {
+  const excluded = new Set(excludeMessageIds);
+  const { data } = await agentDb()
+    .from("whatsapp_messages")
+    .select("whatsapp_message_id, direction, message_body, timestamp")
+    .eq("business_slug", businessSlug)
+    .eq("chat_id", chatId)
+    .order("timestamp", { ascending: false })
+    .limit(limit + excluded.size + 1);
+  return (data ?? [])
+    .filter((m) => !excluded.has(m.whatsapp_message_id) && m.message_body?.trim())
+    .slice(0, limit)
+    .reverse()
+    .map((m) => ({ who: isOutbound(m.direction) ? ("Staff" as const) : ("Customer" as const), text: m.message_body!.trim().slice(0, 400), at: m.timestamp }));
+}
+
 export interface OpenOrderRequest extends OrderRequestDraft {
   id: string;
   status: "collecting" | "pending_approval";

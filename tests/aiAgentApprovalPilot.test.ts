@@ -21,6 +21,7 @@ import {
   assessDraftReadiness,
   buildPilotDraftPost,
   buildPilotNotice,
+  buildPilotUpdateNotice,
   inferVerdict,
   parseApproveArgs,
   parseConfirmArgs,
@@ -132,7 +133,7 @@ describe("Approval Pilot: commands are explicit", () => {
   test("the pilot's own posts are never read as commands or answers", () => {
     const echo = "✍️ Draft v2 for #E-AAAAA · Jane\n“Hello”\n\nNeeds approval — reply !approve";
     assert.deepEqual(matchStaffReply({ text: `!approve ${echo}`, quotedMessageId: "N1" }, escalations), { kind: "unmatched" });
-    const notice = buildPilotNotice({ refCode: "E-AAAAA", priority: "normal", customerLabel: "Jane", messages: ["Hi"], draft: null, missing: [] });
+    const notice = buildPilotNotice({ refCode: "E-AAAAA", customerLabel: "Jane", messages: ["Hi"], draft: null });
     assert.deepEqual(matchStaffReply({ text: `!approve\n${notice}`, quotedMessageId: "N1" }, escalations), { kind: "unmatched" });
   });
 
@@ -171,18 +172,61 @@ describe("Approval Pilot: draft readiness and the evaluation verdict", () => {
     assert.equal(inferVerdict("We open at 9am.", "Hi! We open at 9am, see you then."), null);
   });
 
-  test("the staff notice is concise and tells customer-ready from confirm-first", () => {
-    const ready = buildPilotNotice({ refCode: "E-AAAAA", priority: "normal", customerLabel: "Jane", messages: ["Do you have the 15kg bag?"], draft: { version: 1, body: "Yes, EC$90.", ready: true, notes: [] }, missing: [] });
-    assert.match(ready, /✅ customer-ready/);
-    assert.match(ready, /!approve/);
-    assert.ok(ready.split("\n").length <= 9, ready);
-    const unsure = buildPilotNotice({ refCode: "E-AAAAA", priority: "high", customerLabel: "Jane", messages: ["a", "b"], draft: { version: 1, body: "Maybe EC$99.", ready: false, notes: ["A price in the draft is not in approved knowledge"] }, missing: ["Delivery fee"] });
-    assert.match(unsure, /confirm the facts before sending/);
-    assert.match(unsure, /A price in the draft/);
-    assert.match(unsure, /Missing \/ uncertain/);
-    assert.match(unsure, /!approve confirm/);
-    assert.match(buildPilotNotice({ refCode: "E-AAAAA", priority: "low", customerLabel: "J", messages: ["hi"], draft: null, missing: [] }), /No AI suggestion/);
+  test("the staff notice is compact: who, what they said, the exact suggestion, only essential warnings, the commands", () => {
+    const ready = buildPilotNotice({ refCode: "E-AAAAA", customerLabel: "Jane", messages: ["Do you have the 15kg bag?"], draft: { version: 1, body: "Yes, EC$90.", ready: true, notes: [] } });
+    assert.equal(ready, ["#E-AAAAA · Jane", "", "Customer: “Do you have the 15kg bag?”", "", "AI suggests:", "“Yes, EC$90.”", "", "!approve · !edit <text> · !reject · !moreinfo"].join("\n"));
+    const unsure = buildPilotNotice({
+      refCode: "E-AAAAA",
+      customerLabel: "Jane",
+      messages: ["a", "b"],
+      draft: { version: 1, body: "Maybe EC$99.", ready: false, notes: ["A price in the draft is not in approved knowledge", "x", "y", "z"] },
+    });
+    assert.match(unsure, /⚠️ A price in the draft is not in approved knowledge/);
+    assert.ok((unsure.match(/⚠️/g) ?? []).length <= 2, "at most two warnings");
+    assert.match(unsure, /!approve confirm · !edit <text> · !reject · !moreinfo/);
+    assert.doesNotMatch(unsure, /Missing|priority|URGENT|NORMAL|v1|confidence|knowledge_ids/i, "no internal diagnostics");
+    assert.match(buildPilotNotice({ refCode: "E-AAAAA", customerLabel: "J", messages: ["hi"], draft: null }), /AI suggests: nothing/);
+    assert.match(buildPilotNotice({ refCode: "E-AAAAA", customerLabel: "J", messages: ["hi"], draft: null }), /!send <text> · !moreinfo/);
+    assert.ok(ready.split("\n").length <= 8, ready);
     assert.match(buildPilotDraftPost({ refCode: "E-AAAAA", customerLabel: "Jane", version: 3, body: "x", ready: true, notes: [] }), /Draft v3/);
+  });
+
+  test("the replacement notice is short and says the earlier suggestion can no longer be approved", () => {
+    const update = buildPilotUpdateNotice({
+      refCode: "E-AAAAA",
+      customerLabel: "Jane",
+      messages: ["2 bags", "make it 3"],
+      changes: ["Quantity changed: Chicken 2 → 3"],
+      draft: { version: 2, body: "Got it, 3 bags.", ready: true, notes: [] },
+    });
+    assert.match(update, /^#E-AAAAA · Jane — updated/);
+    assert.match(update, /Changed: Quantity changed: Chicken 2 → 3/);
+    assert.match(update, /AI suggests \(replaces the earlier one\):\n“Got it, 3 bags\.”/);
+    assert.match(update, /Quote this message: !approve · !edit <text> · !reject · !moreinfo/);
+    assert.match(buildPilotUpdateNotice({ refCode: "E-AAAAA", customerLabel: "J", messages: ["x"], changes: [], draft: null }), /earlier suggestion can no longer be approved/);
+  });
+
+  test("our own compact notices and !moreinfo posts are never read as staff commands or answers", () => {
+    const escalations = [{ id: "e1", ref_code: "E-AAAAA", notice_message_id: "N1", status: "notified" }];
+    const notice = buildPilotNotice({ refCode: "E-AAAAA", customerLabel: "Jane", messages: ["Hi"], draft: { version: 1, body: "Hello", ready: true, notes: [] } });
+    const update = buildPilotUpdateNotice({ refCode: "E-AAAAA", customerLabel: "Jane", messages: ["Hi"], changes: ["x"], draft: { version: 2, body: "Hello again", ready: true, notes: [] } });
+    for (const text of [notice, update, "ℹ️ #E-AAAAA · Jane · +17585550101\nRequest: open · priority normal"]) {
+      assert.deepEqual(matchStaffReply({ text: `!approve\n${text}`, quotedMessageId: "N1" }, escalations), { kind: "unmatched" });
+    }
+  });
+
+  test("!moreinfo is a draft command: quoting or naming the request works, \"!more info\" is read the same, and a closed request can still be read", () => {
+    const escalations = [{ id: "e1", ref_code: "E-AAAAA", notice_message_id: "N1", status: "notified" }];
+    assert.deepEqual(parsePilotCommand("!moreinfo"), { command: "moreinfo", body: "" });
+    assert.deepEqual(parsePilotCommand("!more info #E-AAAAA"), { command: "moreinfo", body: "#E-AAAAA" });
+    const byQuote = matchStaffReply({ text: "!moreinfo", quotedMessageId: "N1" }, escalations, { explicitCommandsOnly: true });
+    assert.equal(byQuote.kind === "matched" && byQuote.command, "moreinfo");
+    const byCode = matchStaffReply({ text: "!moreinfo #E-AAAAA", quotedMessageId: null }, escalations, { explicitCommandsOnly: true });
+    assert.equal(byCode.kind === "matched" && byCode.command, "moreinfo");
+    const closed = [{ id: "e9", ref_code: "E-CCCCC", notice_message_id: "N9", status: "resolved" }];
+    assert.equal(matchStaffReply({ text: "!moreinfo", quotedMessageId: "N9" }, closed, { explicitCommandsOnly: true }).kind, "matched");
+    assert.equal(matchStaffReply({ text: "!approve", quotedMessageId: "N9" }, closed, { explicitCommandsOnly: true }).kind, "closed");
+    assert.deepEqual(matchStaffReply({ text: "!moreinfo", quotedMessageId: null }, escalations, { explicitCommandsOnly: true }), { kind: "unmatched" });
   });
 });
 
@@ -449,9 +493,10 @@ describe("Approval Pilot and WhatsApp learning (real server code, real SQL)", { 
     assert.equal(result.decision, "ESCALATE");
     assert.equal(modelCalls.length, 1, "no extra model call for the suggestion");
     assert.equal((await customerBound()).length, 0, "no holding reply, no AI reply");
-    assert.match(notice.body, /AI suggestion v1 — ✅ customer-ready/);
+    assert.match(notice.body, /AI suggests:\n“The 15kg chicken dog food bag costs EC\$90\.”/);
     assert.match(notice.body, /EC\$90/);
-    assert.match(notice.body, /!approve/);
+    assert.doesNotMatch(notice.body, /⚠️/, "a customer-ready draft carries no warning");
+    assert.match(notice.body, /!approve · !edit <text> · !reject · !moreinfo/);
     assert.doesNotMatch(notice.body, /Observe mode/);
     assert.equal(draft.version, 1);
     assert.equal(draft.source, "ai");
@@ -463,8 +508,8 @@ describe("Approval Pilot and WhatsApp learning (real server code, real SQL)", { 
 
   test("a draft with no approved knowledge behind it is flagged as needing factual confirmation", async () => {
     const { notice, draft } = await askWithDraft(JANE, "How much is the bag?", { ready: false, reply: "It costs EC$99." });
-    assert.match(notice.body, /⚠️ confirm the facts before sending/);
-    assert.match(notice.body, /No approved knowledge backs this answer/);
+    assert.match(notice.body, /⚠️ No approved knowledge backs this answer/);
+    assert.match(notice.body, /!approve confirm · !edit <text> · !reject · !moreinfo/);
     assert.equal(draft.ready, false);
     assert.ok(draft.confirm_notes.length > 0);
   });
@@ -475,9 +520,9 @@ describe("Approval Pilot and WhatsApp learning (real server code, real SQL)", { 
     await customerSays(JANE, "Also, do you deliver to Gros Islet?");
     const all = await notices(JANE);
     assert.equal(all.length, 2);
-    assert.match(all[1].body, /Update on #E-/);
-    assert.match(all[1].body, /out of date/);
-    assert.match(all[1].body, /!edit/);
+    assert.match(all[1].body, /^#E-\w+ · .* — updated/);
+    assert.match(all[1].body, /earlier suggestion can no longer be approved/);
+    assert.match(all[1].body, /!send <text> · !moreinfo/);
   });
 
   // ── Approving ────────────────────────────────────────────────────────────
@@ -1012,7 +1057,15 @@ describe("Approval Pilot and WhatsApp learning (real server code, real SQL)", { 
     assert.equal(c.escalation_id, null);
     assert.equal(Number(c.confidence), 0.5);
     assert.equal((await knowledgeRows()).length, 0);
+    assert.equal((await feedbacks()).length, 0, "a routine knowledge suggestion stays in the dashboard unless WhatsApp confirmation is on");
+  });
+
+  test("passive learning posts a suggestion to the group only when the business opted in to confirming knowledge from WhatsApp", async () => {
+    await configure({ passive_learning_scope: "staff_group", knowledge_confirm_via_whatsapp: true });
+    analyzerScript = hoursItem;
+    await staffSays(hoursFact);
     assert.match(await lastFeedback(), /possible fact/);
+    assert.match(await lastFeedback(), /!confirm K-/);
   });
 
   test("passive learning never reads customer chats unless the admin chose the wider scope, and then only the business's OWN messages", async () => {

@@ -385,12 +385,6 @@ export interface StaffUpdateInput {
   afterStaffReply: boolean;
   /** Observe mode: nothing reaches the customer. */
   observeOnly?: boolean;
-  /** Approval Pilot: nothing is sent until an authorized person sends; the earlier AI suggestion may be out of date. */
-  pilot?: boolean;
-  /** Approval Pilot: the AI's fresh suggestion for the customer's latest message (the draft staff can now approve). */
-  draft?: { version: number; body: string; ready: boolean; notes: string[] } | null;
-  /** The customer's latest message, shown with a suggestion so staff see what is being answered. */
-  latestMessage?: string | null;
 }
 
 const MAX_SHOWN_CHANGES = 6;
@@ -423,35 +417,8 @@ function updateActions(changes: Change[], current: RequestSnapshot, afterStaffRe
   return actions.length > 0 ? actions : ["Review and respond to the customer"];
 }
 
-/**
- * Approval Pilot: the customer wrote again before staff acted. The AI has answered the NEW state of the conversation,
- * so the update carries that suggestion; approving it (quote this message, or include the code) sends exactly that text.
- */
-function buildPilotUpdateWithDraft(input: StaffUpdateInput, draft: NonNullable<StaffUpdateInput["draft"]>): string {
-  const lines = [`🔁 Update on #${input.refCode} · ${input.priority.toUpperCase()} · ${clip(input.customerLabel, 60)}`];
-  if (input.latestMessage) lines.push(`Customer: “${clip(input.latestMessage, 220)}”`);
-  if (input.afterStaffReply) lines.push("⚠️ Customer changed this AFTER staff replied");
-  const shown = input.changes.slice(0, 4);
-  lines.push("", "*What changed*", ...shown.map((c) => `• ${c.text}`));
-  if (input.changes.length > shown.length) lines.push(`• (+${input.changes.length - shown.length} more in the dashboard)`);
-  lines.push("", "*Request so far* (NOT confirmed)", ...currentRequestLines(input.current).slice(0, 6).map((l) => `• ${l}`));
-  lines.push(
-    "",
-    draft.ready ? `🤖 New AI suggestion v${draft.version} — ✅ customer-ready` : `🤖 New AI suggestion v${draft.version} — ⚠️ confirm the facts before sending`,
-    `“${clip(draft.body, 500)}”`
-  );
-  if (!draft.ready) for (const n of draft.notes) lines.push(`• ${n}`);
-  lines.push(
-    "",
-    `Reply to this message (or include #${input.refCode}): !approve · !edit <text> · !send <text> · !reject · !status · !teach <fact> · !close`,
-    draft.ready ? "The earlier suggestion is out of date. Nothing is sent until an authorized person sends." : "The earlier suggestion is out of date. Unconfirmed drafts need “!approve confirm”. Nothing is sent until an authorized person sends."
-  );
-  return lines.join("\n");
-}
-
 /** Concise update for the staff group: reference, who, what changed, the complete current request, what to do. */
 export function buildStaffUpdate(input: StaffUpdateInput): string {
-  if (input.pilot && input.draft) return buildPilotUpdateWithDraft(input, input.draft);
   const shown = input.changes.slice(0, MAX_SHOWN_CHANGES);
   const more = input.changes.length - shown.length;
   const lines = [`🔁 Update on #${input.refCode} · ${input.priority.toUpperCase()}`, `👤 ${clip(input.customerLabel, 80)}`];
@@ -460,14 +427,6 @@ export function buildStaffUpdate(input: StaffUpdateInput): string {
   if (more > 0) lines.push(`• (+${more} more in the dashboard)`);
   lines.push("", "*Current request* (NOT confirmed)", ...currentRequestLines(input.current).map((l) => `• ${l}`));
   lines.push("", "*Action needed*", ...updateActions(input.changes, input.current, input.afterStaffReply).map((a) => `• ${a}`));
-  if (input.pilot) {
-    lines.push(
-      "",
-      `↩️ Reply to this message (or include #${input.refCode}). Any earlier AI draft is out of date and can't be approved — write a new one with !edit <text>.`,
-      "Commands: !edit <text> · !send <text> · !status · !teach <fact> · !note <text> · !close"
-    );
-    return lines.join("\n");
-  }
   lines.push(
     "",
     input.observeOnly

@@ -11,7 +11,7 @@ outbox kind, and every customer reply still needs explicit staff approval.
 | Piece | Where |
 |---|---|
 | Order records (authoritative) | `ai_agent_orders`, history in `ai_agent_order_events`, delivery audit in `ai_agent_order_summary_runs` |
-| Extraction | The **existing** per-turn model call. Its JSON gains `order_target`, `other_orders`, item `variant`/`size` and `requested_for`; the prompt addition is sent only when tracking is on. **No extra model call**, no re-reading of old conversations. |
+| Extraction | Conversations the AI also answers: the **existing** per-turn model call (its JSON gains `order_target`, `other_orders`, item `variant`/`size` and `requested_for`; no extra call). Conversations the AI may **not** answer: a separate, small, incremental call (see "Monitoring every conversation"). |
 | Rules (pure, tested) | `lib/aiAgent/orders.ts` |
 | Server logic | `lib/server/aiAgent/orders.ts` (hooked into `handleCustomerTurn` in `decide.ts`) |
 | Scheduler | One mechanism: the bridge's outbox poll (`/api/bridge/ai-agent/outbox/claim`) runs `runDueOrderSummaries()` at most once a minute. No cron job to configure. |
@@ -99,16 +99,53 @@ with **no model call**. Refusals: unauthorized sender (answered in the group), f
 staff group when a separate Orders group exists), and a 30-second cooldown. In any other group the command is
 ignored silently and audited (`orders.update_rejected`). A retried bridge message cannot post twice.
 
+## Monitoring every conversation
+
+With `orders_tracking_enabled` on, **every genuine 1:1 customer conversation** the bridge forwards is read for orders, whether or not the AI may reply there:
+not on the allow-list, no contacts selected, excluded, **Manual Only**, staff takeover, Observe or Approval Pilot. Never read: groups (the staff group
+included), status broadcasts, newsletters, system chats. The agent master switch must be on (a disabled business is ignored before anything is read).
+
+**Monitoring never grants permission to reply.** The monitoring code has no outbox access (a test greps for it) and returns reason codes only; whether anything is
+ever sent stays with the existing gate and send policy.
+
+| Message | What happens |
+|---|---|
+| Customer, AI may answer | The existing single model call also fills the order (unchanged, no extra cost). |
+| Customer, AI may not answer | Joins the same batch as any other (rapid messages are analysed together, in order). Then: a free **pre-filter** (`lib/aiAgent/orderMonitor.ts`) skips pleasantries, media-only and messages with no order wording while no order is open; a bare "yes" or short "cancel it" for an open order is handled by the rules (no model call); everything else, **always when an order is open** (a follow-up may change it), makes **one small model call** that sees only the open orders, the last 8 messages and the new message(s). |
+| The business's own message in the chat (business phone / inbox) | Read only when an order is open and the wording could matter. It can only **flag** that order for a person (*staff wrote a confirmation / cancellation / change*, listed under Needs attention): it never creates an order, edits one, confirms or cancels one (the business phone cannot say *who* wrote, and staff verification stays a person's Confirm click), and does not count as customer activity. Never read: the agent's own sends coming back, and AI drafts (they are not messages). |
+
+Safeguards: every write is keyed by the batch/event id (a retried message changes nothing and costs no model call), writes are version-checked, staff-edited
+fields stay locked, and products/quantities/addresses/times survive only if the customer wrote them. Budget: at most **20 monitoring calls per chat and 300
+per business per hour**; beyond that a message is recorded as *not analysed* and reported. Every message leaves a reason code on its event
+(`orders_monitor_*`: analysed, filtered and why, over budget, failed), which is what the coverage note counts.
+
+### Coverage, honestly
+
+The report and the Orders tab say: conversations whose analysis **failed**; customer messages the bridge **stored but never forwarded** to the agent
+(detected by comparing `whatsapp_messages` with the agent's event log, ignoring the last 10 minutes); conversations skipped because the hourly budget was
+used; when tracking started. A clean report says it covers every customer chat the agent received. Messages the pre-filter judged to have no order wording
+are counted on the dashboard only.
+
+### Recovering missed orders (opt-in backfill)
+
+Orders tab → "Recover missed orders" (24 / 48 / 72 hours). Never automatic. It plans only the conversations that have a stored customer message the live
+path never read (no event, an errored event, or one the old rules stopped), skips conversations an earlier finished run covered, caps a run at 200
+conversations (the rest is reported on the run), reads at most 150 messages per conversation in chunks of 25, and applies them through the same rules
+(a "yes" in the past is **never** recorded; staff lines are context only). Progress is saved after every conversation, a step can be repeated safely (keys
+`backfill:<run>:<chat>:<chunk>`), and `ai_agent_order_backfill_runs` plus the audit log record who started it, the window, counts and failures. It reads
+stored messages and writes order records only. Retention of `whatsapp_messages` bounds how far back it can see.
+
 ## Settings (per business, Setup → "Daily orders"; all OFF by default)
 
 `orders_tracking_enabled`, `orders_summary_enabled`, `orders_group_jid` (empty = the staff group, e.g. the
-Approval Pilot group), `orders_timezone`, `orders_summary_hour`. Tracking respects the existing contact scope and
-per-customer modes: a customer the agent may not engage with is not tracked.
+Approval Pilot group), `orders_timezone`, `orders_summary_hour`. Tracking is **independent of the AI's reply permissions**
+(see "Monitoring every conversation"); it needs the agent switched on for the business.
 
 ## Deployment
 
 **Migration (run in the Supabase SQL editor, in this order, before deploying the app):**
-`supabase/migrations/20261101000000_ai_agent_daily_orders.sql` (needs 20261022–20261031 applied). Additive:
+`supabase/migrations/20261101000000_ai_agent_daily_orders.sql` (needs 20261022–20261031 applied), then
+`supabase/migrations/20261102000000_ai_agent_order_monitoring.sql` (one additive table for the opt-in backfill). Additive:
 three tables, six settings columns, `apply_ai_agent_order`, a replaced `claim_ai_agent_outbox` and
 `forget_ai_agent_customer` (which now also deletes the customer's tracked orders).
 
@@ -148,5 +185,8 @@ until the bridge is deployed.
 * Customer names come from the saved contact; otherwise the report says "Unnamed customer" next to the phone.
 * No retention job for fulfilled/cancelled orders yet (deleting a customer via the Memory tab does remove theirs).
 * A customer's yes counts only if a person wrote to them (inbox, `!send`) in the last 48 h and exactly one order is open; a phone confirmation is a *Confirm* click.
-* Coverage can only count conversations the agent saw an event for. A message the bridge never forwarded is invisible to it.
-* Prompt cost: when tracking is on, each model call carries ~350 extra instruction tokens and the open-order list.
+* A staff message in the chat can raise a flag but never creates an order, so an order the customer only described in a voice note and staff then wrote out is
+  recorded only once the customer says it in text (or staff add it in the dashboard).
+* Voice notes, images and stickers are not transcribed: media-only messages are counted (filtered) but carry no order text.
+* Cost: AI-eligible turns carry ~350 extra instruction tokens and the open-order list; monitoring-only turns make one small call (~760 instruction tokens +
+  open orders + 8 context lines, typically 1.2–1.5k input and 100–200 output tokens), capped per chat/business per hour.

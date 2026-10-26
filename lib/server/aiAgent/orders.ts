@@ -47,10 +47,11 @@ import {
   turnDrafts,
   turnIsConfirmation,
 } from "@/lib/aiAgent/orders";
+import { MONITOR_BUDGET_REASON, MONITOR_FAILED_REASONS, MONITOR_FILTERED_PREFIX, MONITOR_GATE_REASONS, monitorEligibleChat, type StaffAction, staffFlagFor } from "@/lib/aiAgent/orderMonitor";
 import { BLOCK_REASONS, failureReason, outboxState } from "@/lib/aiAgent/outboxStatus";
 import { agentDb, audit, loadSettings } from "@/lib/server/aiAgent/db";
 import { enqueue, OutboxInsert, OutboxRow } from "@/lib/server/aiAgent/outbox";
-import { businessLabel } from "@/lib/whatsapp";
+import { businessLabel, isOutbound } from "@/lib/whatsapp";
 
 export const ORDER_COLUMNS =
   "id, ref_code, business_slug, chat_id, contact_number, customer_name, status, items, fulfilment_method, delivery_preference, delivery_address, requested_for, notes, missing_fields, attention, source_message_ids, first_message_at, last_message_at, awaiting_since, manual_locked_fields, confirmed_by, confirmed_at, customer_confirmed_at, cancelled_at, cancel_reason, fulfilled_at, version, created_at, updated_at";
@@ -72,6 +73,29 @@ export async function loadOpenOrders(businessSlug: string, chatId: string): Prom
     .order("created_at");
   if (error) throw new Error(error.message);
   return (data ?? []) as TrackedOrder[];
+}
+
+/** What !moreinfo and the dashboard show about a chat's orders: the open ones plus anything cancelled in the last week. */
+export async function loadChatOrdersForInfo(businessSlug: string, chatId: string, now: Date = new Date()): Promise<{ orders: TrackedOrder[]; events: { order_id: string; kind: string; actor_kind: string; changes: Record<string, { before?: unknown; after?: unknown }>; created_at: string }[] }> {
+  const db = agentDb();
+  const since = new Date(now.getTime() - 7 * 24 * 3_600_000).toISOString();
+  const [open, cancelled] = await Promise.all([
+    db.from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).eq("chat_id", chatId).in("status", [...OPEN_ORDER_STATUSES]).order("created_at").limit(10),
+    db.from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).eq("chat_id", chatId).eq("status", "cancelled").gte("updated_at", since).order("created_at").limit(5),
+  ]);
+  if (open.error) throw new Error(open.error.message);
+  if (cancelled.error) throw new Error(cancelled.error.message);
+  const orders = [...((open.data ?? []) as TrackedOrder[]), ...((cancelled.data ?? []) as TrackedOrder[])];
+  if (orders.length === 0) return { orders, events: [] };
+  const ev = await db
+    .from("ai_agent_order_events")
+    .select("order_id, kind, actor_kind, changes, created_at")
+    .eq("business_slug", businessSlug)
+    .in("order_id", orders.map((o) => o.id))
+    .order("created_at", { ascending: false })
+    .limit(12);
+  if (ev.error) throw new Error(ev.error.message);
+  return { orders, events: (ev.data ?? []) as never };
 }
 
 /** Every outstanding order of ONE business. The slug filter is the isolation boundary. */
@@ -337,6 +361,8 @@ export interface TrackArgs {
   lastAt: string;
   /** Prefix of the idempotency keys: the batch or event id. A retried turn reuses it. */
   dedupeBase: string;
+  /** False when replaying history (backfill): a "yes" then is not an answer to anything staff just wrote, so it records nothing. Default true. */
+  allowConfirmation?: boolean;
   now?: Date;
 }
 
@@ -390,6 +416,10 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   //    person's message to the customer after the order became complete, within the last 48 hours. And unless the
   //    business has switched on customer confirmation, the yes is only RECORDED for staff to verify.
   if (turnIsConfirmation(segments)) {
+    if (args.allowConfirmation === false) {
+      result.reasons.push("order_confirmation_not_accepted");
+      return result;
+    }
     const target = open.length === 1 && open[0].status === "awaiting_confirmation" && isComplete(open[0].missing_fields) ? open[0] : null;
     if (!target) {
       result.reasons.push(open.length > 1 ? "order_confirmation_ambiguous" : "order_confirmation_not_accepted");
@@ -472,6 +502,63 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   }
   if (result.applied) result.reasons.push("orders_tracked");
   return result;
+}
+
+// ── Staff messages in the chat ───────────────────────────────────────────────
+
+export interface StaffFlagArgs {
+  businessSlug: string;
+  chatId: string;
+  /** The reference the model named, or null. With several open orders and no valid reference nothing is guessed. */
+  target: string | null;
+  action: StaffAction;
+  /** What staff wrote (kept, clipped, only in the order's history). */
+  text: string;
+  messageId: string;
+  key: string;
+}
+
+/**
+ * A message the business wrote in the chat (business phone or inbox) can only RAISE A FLAG on an existing open order,
+ * for a person to verify: "staff wrote a confirmation / cancellation / change". It never changes the order's content or
+ * status (WhatsApp cannot say which person wrote from the business phone, and staff verification is the rule), never
+ * creates an order, and does not count as customer activity.
+ */
+export async function flagOrderFromStaff(args: StaffFlagArgs): Promise<{ applied: boolean; reason: string }> {
+  const { businessSlug, chatId } = args;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const open = await loadOpenOrders(businessSlug, chatId);
+    const named = args.target ? open.find((o) => o.ref_code.toLowerCase() === args.target!.toLowerCase()) : undefined;
+    const order = named ?? (open.length === 1 ? open[0] : null);
+    if (!order) return { applied: false, reason: open.length === 0 ? "orders_monitor_skipped_no_open_order" : "orders_monitor_staff_ambiguous" };
+    const flag = staffFlagFor(args.action, order.attention);
+    if (!flag) return { applied: false, reason: "orders_monitor_staff_no_change" };
+    const plan = {
+      status: order.status,
+      attention: flag,
+      awaitingSince: order.awaiting_since,
+      missing: order.missing_fields,
+      event: "attention_flagged" as const,
+      confirmedByCustomer: false,
+      customerConfirmedAt: order.customer_confirmed_at,
+    };
+    const ctx = { chatId, phone: order.contact_number, messageIds: [args.messageId], firstAt: order.first_message_at, lastAt: order.last_message_at };
+    const res = await applyOrder({
+      businessSlug,
+      key: args.key,
+      existing: order,
+      row: rowFrom(order, fieldsOf(order), plan, ctx),
+      event: "staff_noted_in_chat",
+      actorKind: "staff",
+      actorId: null,
+      changes: { attention: { before: order.attention, after: flag }, staff_message: { before: null, after: args.text.replace(/\s+/g, " ").trim().slice(0, 200) } },
+      messageIds: [args.messageId],
+    });
+    if (res.result === "applied") return { applied: true, reason: `orders_monitor_staff_${args.action}` };
+    if (res.result === "duplicate" || res.result === "not_found") return { applied: false, reason: "orders_monitor_already_applied" };
+    // conflict: someone changed the order meanwhile; re-read and decide again.
+  }
+  return { applied: false, reason: "order_write_conflict" };
 }
 
 // ── Manual corrections (dashboard) ───────────────────────────────────────────
@@ -576,7 +663,7 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
       awaitingSince = now;
       changes.status = { before: order.status, after: status };
     }
-    if (order.attention === "check_if_duplicate" || order.attention === "cancellation_requested") attention = null;
+    if (order.attention === "check_if_duplicate" || order.attention === "cancellation_requested" || order.attention?.startsWith("staff_")) attention = null;
     // The customer said yes to the order as it was; a staff change to its content voids that.
     if (changedFields.some((f) => f !== "customer_name")) {
       customerConfirmedAt = null;
@@ -661,50 +748,72 @@ const tzOf = (s: AgentSettings) => s.orders_timezone || DEFAULT_ORDERS_TIMEZONE;
 const hourOf = (s: AgentSettings) => s.orders_summary_hour ?? DEFAULT_SUMMARY_HOUR;
 
 const COVERAGE_WINDOW_HOURS = 36;
-/** Gate / decision reasons meaning "the agent deliberately did not read this conversation for orders". */
-const NOT_ANALYSED_REASONS = new Set([
-  "contact_not_permitted",
-  "contact_excluded",
-  "unresolved_lid_identity",
-  "customer_mode_manual_only",
-  "human_takeover",
-  "staff_recently_active",
-]);
-/** Reasons meaning "it should have been analysed but was not". */
-const FAILED_REASONS = new Set(["orders_tracking_failed", "model_unavailable", "internal_error"]);
+/** A message stored this recently may simply not have been forwarded yet. */
+const FORWARD_GRACE_MS = 10 * 60_000;
 
 /**
- * What the report may honestly claim. Counts conversations (not messages) from the last 36 hours that were not
- * analysed, from the agent's own event log and batch queue, so nothing extra is stored.
+ * What the report may honestly claim. Counts conversations (and, for the bridge gap, messages) from the last 36 hours
+ * that were not analysed, from the agent's own event log, batch queue and the stored messages, so nothing extra is stored.
+ *
+ *   failed        the monitoring / tracking / model step errored (orders there may be missing)
+ *   skipped       a message the old rules stopped before any order reading and monitoring did not pick up
+ *   budget        not analysed because the hourly monitoring budget was used up
+ *   filtered      read by the free pre-filter only (pleasantries, no order wording): dashboard information
+ *   notForwarded  customer messages the bridge stored but never forwarded to the agent
  */
 export async function loadCoverage(settings: AgentSettings, now: Date): Promise<Coverage> {
   const slug = settings.business_slug;
-  const since = new Date(now.getTime() - COVERAGE_WINDOW_HOURS * 3_600_000).toISOString();
+  const windowStart = now.getTime() - COVERAGE_WINDOW_HOURS * 3_600_000;
+  // Nothing before tracking was switched on can be a gap.
+  const trackedFrom = settings.orders_tracking_since ? Date.parse(settings.orders_tracking_since) : Number.NaN;
+  const since = new Date(Number.isFinite(trackedFrom) ? Math.max(windowStart, trackedFrom) : windowStart).toISOString();
   const db = agentDb();
-  const [events, batches] = await Promise.all([
-    db.from("ai_agent_events").select("chat_id, status, reason_codes").eq("business_slug", slug).eq("kind", "customer_inbound").gte("created_at", since).limit(3000),
+  const [events, batches, stored] = await Promise.all([
+    db.from("ai_agent_events").select("chat_id, status, reason_codes, whatsapp_message_id, kind").eq("business_slug", slug).in("kind", ["customer_inbound", "staff_outbound", "ignored"]).gte("created_at", since).limit(6000),
     db.from("ai_agent_batches").select("chat_id, status, updated_at").eq("business_slug", slug).in("status", ["failed", "collecting", "processing"]).gte("last_message_at", since).limit(1000),
+    db.from("whatsapp_messages").select("whatsapp_message_id, chat_id, direction, message_body").eq("business_slug", slug).gte("timestamp", since).lte("timestamp", new Date(now.getTime() - FORWARD_GRACE_MS).toISOString()).limit(6000),
   ]);
   if (events.error) throw new Error(events.error.message);
   const failed = new Set<string>();
   const skipped = new Set<string>();
+  const budget = new Set<string>();
+  const seenIds = new Set<string>();
+  let filtered = 0;
   for (const e of events.data ?? []) {
+    if (e.whatsapp_message_id) seenIds.add(e.whatsapp_message_id as string);
+    if (e.kind === "ignored") continue;
     const codes = (e.reason_codes as string[] | null) ?? [];
-    if (e.status === "error" || codes.some((c) => FAILED_REASONS.has(c))) failed.add(e.chat_id as string);
-    else if (settings.orders_tracking_enabled ? codes.some((c) => NOT_ANALYSED_REASONS.has(c)) : false) skipped.add(e.chat_id as string);
+    if (e.status === "error" || codes.some((c) => MONITOR_FAILED_REASONS.has(c))) failed.add(e.chat_id as string);
+    else if (codes.includes(MONITOR_BUDGET_REASON)) budget.add(e.chat_id as string);
+    else if (settings.orders_tracking_enabled && e.kind === "customer_inbound" && codes.some((c) => MONITOR_GATE_REASONS.has(c)) && !codes.some((c) => c.startsWith("orders_monitor") || c.startsWith("order_"))) skipped.add(e.chat_id as string);
+    if (codes.some((c) => c.startsWith(MONITOR_FILTERED_PREFIX) && c !== "orders_monitor_already_applied")) filtered += 1;
   }
   for (const b of batches.data ?? []) {
     // A batch that failed, or has been waiting far longer than any quiet period, was not analysed (yet).
     const stuck = b.status !== "failed" && now.getTime() - Date.parse(b.updated_at as string) > 30 * 60_000;
     if (b.status === "failed" || stuck) failed.add(b.chat_id as string);
   }
-  for (const c of failed) skipped.delete(c);
+  for (const c of failed) {
+    skipped.delete(c);
+    budget.delete(c);
+  }
+  // A customer message the bridge stored but the agent never saw (bridge forwarding off, offline, or dropped it).
+  let notForwarded = 0;
+  if (!stored.error) {
+    for (const m of stored.data ?? []) {
+      if (isOutbound(m.direction as string) || !monitorEligibleChat(m.chat_id as string) || !(m.message_body as string | null)?.trim()) continue;
+      if (!seenIds.has(m.whatsapp_message_id as string)) notForwarded += 1;
+    }
+  }
   return {
     trackingOn: settings.orders_tracking_enabled === true,
     trackingSince: settings.orders_tracking_since ?? null,
     contactScope: settings.contact_scope,
     failedChats: failed.size,
     skippedChats: skipped.size,
+    budgetChats: budget.size,
+    filteredMessages: filtered,
+    notForwardedMessages: notForwarded,
     windowHours: COVERAGE_WINDOW_HOURS,
   };
 }

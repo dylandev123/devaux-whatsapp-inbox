@@ -63,7 +63,7 @@ test("the live path batches only when batching is active, and queued messages re
 
 test("a manual staff message is handled immediately, never queued behind a batch", () => {
   const live = body(decide, "export async function processBridgeMessage", "// An enabled business's message");
-  const staffAt = live.indexOf("handleManualStaffMessage(input, settings)");
+  const staffAt = live.indexOf("handleManualStaffMessage(input, settings, eventId)");
   const batchAt = live.indexOf("handleBatchedCustomerMessage");
   assert.ok(staffAt > 0 && batchAt > staffAt, "the fromMe branch is decided before the customer batching branch");
 });

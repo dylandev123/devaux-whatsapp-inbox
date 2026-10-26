@@ -464,8 +464,10 @@ export async function maybeExtractPassive(args: {
       sender_verified: !unverified,
       auto_approved: false,
     });
-    const confirmHint =
-      settings.knowledge_confirm_via_whatsapp === true ? "Reply !confirm K-… to add it or !discard K-… to drop it" : "An admin approves it in the dashboard (AI Agent → Review)";
+    // Routine knowledge suggestions stay in the dashboard (AI Agent → Review) unless the business opted in to confirming
+    // them from WhatsApp: only then is a post actionable, so only then does it go to the staff group.
+    if (settings.knowledge_confirm_via_whatsapp !== true) return { outbox: [], outcome: "passive:proposed" };
+    const confirmHint = "Reply !confirm K-… to add it or !discard K-… to drop it";
     const body = [
       `📚 I noticed ${stored.length === 1 ? "a possible fact" : `${stored.length} possible facts`} (not used yet${unverified ? " — UNVERIFIED: sent from the business account, so nobody can say who wrote it" : ""}):`,
       ...stored.slice(0, 3).map((s) => `• ${s.code}: “${clip(s.text, 140)}”`),

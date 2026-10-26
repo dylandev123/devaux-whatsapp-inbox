@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { Coverage } from "@/lib/aiAgent/orders";
-import { aiAgentApi, OrderEventView, OrderRunView, OrderView } from "@/lib/aiAgent/client";
+import { aiAgentApi, BackfillRunView, OrderEventView, OrderRunView, OrderView } from "@/lib/aiAgent/client";
 import type { AgentSettings } from "@/lib/aiAgent/engine";
 import { ATTENTION_TEXT, confirmationLabel, coverageLines, formatLine, MISSING_TEXT, ORDER_STATUSES, type OrderLine, type OrderStatus } from "@/lib/aiAgent/orders";
 import { useDebounced } from "@/components/admin/aiAgent/useDebounced";
@@ -300,6 +300,106 @@ function RunsCard({ businessSlug, runs, settings, onSent }: { businessSlug: stri
   );
 }
 
+const BACKFILL_STATUS: Record<BackfillRunView["status"], string> = { running: "in progress", done: "finished", failed: "failed", cancelled: "stopped" };
+
+/**
+ * Opt-in recovery of orders from the last 24-72 hours of stored messages that were never read for orders (customers the
+ * AI is not allowed to reply to). Nothing starts by itself; it reads stored messages only and never messages a customer.
+ */
+function BackfillCard({ businessSlug, enabled, onDone }: { businessSlug: string; enabled: boolean; onDone: () => void }) {
+  const [runs, setRuns] = useState<BackfillRunView[]>([]);
+  const [hours, setHours] = useState(48);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setRuns((await aiAgentApi.listBackfills(businessSlug)).runs);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load");
+    }
+  }, [businessSlug]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  /** Starts (or resumes) a run and keeps stepping it until it finishes, so the admin sees live progress. */
+  async function run(existing?: BackfillRunView) {
+    setWorking(true);
+    setError(null);
+    try {
+      let current = existing ?? (await aiAgentApi.startBackfill(businessSlug, hours)).run;
+      setRuns((cur) => [current, ...cur.filter((r) => r.id !== current.id)]);
+      while (current.status === "running") {
+        current = (await aiAgentApi.stepBackfill(businessSlug, current.id)).run;
+        setRuns((cur) => [current, ...cur.filter((r) => r.id !== current.id)]);
+      }
+      onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Backfill failed");
+    } finally {
+      setWorking(false);
+      void load();
+    }
+  }
+
+  async function cancel(r: BackfillRunView) {
+    try {
+      await aiAgentApi.cancelBackfill(businessSlug, r.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed");
+    }
+    void load();
+  }
+
+  const active = runs.find((r) => r.status === "running");
+  return (
+    <Card title="Recover missed orders" subtitle="Reads stored messages from customers the AI could not analyse before, and adds any orders found. Opt-in; nothing is sent to customers.">
+      <div className="flex flex-wrap items-center gap-2">
+        <select value={hours} onChange={(e) => setHours(Number(e.target.value))} disabled={working || Boolean(active)} className={`${inputClass} sm:max-w-[12rem]`}>
+          <option value={24}>Last 24 hours</option>
+          <option value={48}>Last 48 hours</option>
+          <option value={72}>Last 72 hours</option>
+        </select>
+        <button
+          type="button"
+          className={secondaryButton}
+          disabled={working || !enabled}
+          onClick={() => {
+            if (active) void run(active);
+            else if (window.confirm(`Look back ${hours} hours for orders that were never analysed?\n\nThis uses AI calls (one small call per batch of messages) and changes order records only. It can be run safely more than once.`)) void run();
+          }}
+        >
+          {working ? "Working…" : active ? "Resume" : "Start"}
+        </button>
+        {active && !working && (
+          <button type="button" className={dangerButton} onClick={() => void cancel(active)}>
+            Stop
+          </button>
+        )}
+        {!enabled && <span className="text-xs text-zinc-500">Turn on order tracking first.</span>}
+      </div>
+      {error && <div className="mt-2"><Notice tone="error">{error}</Notice></div>}
+      {runs.length > 0 && (
+        <ul className="mt-3 divide-y divide-zinc-100 rounded-md border border-zinc-200 text-xs">
+          {runs.map((r) => (
+            <li key={r.id} className="flex flex-wrap items-center gap-2 px-3 py-2">
+              <span className="font-medium text-zinc-800">Last {r.hours} h</span>
+              <span className="text-zinc-500">{BACKFILL_STATUS[r.status]}</span>
+              <span className="text-zinc-500">
+                {r.chats_done}/{r.chats_total} conversations · {r.messages_analysed} messages · {r.orders_touched} order change{r.orders_touched === 1 ? "" : "s"}
+                {r.failures > 0 ? ` · ${r.failures} could not be analysed` : ""}
+              </span>
+              {r.note && <span className="text-amber-700">{r.note}</span>}
+              <span className="ml-auto text-zinc-400">{formatWhen(r.created_at)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
 export function OrdersPanel({ businessSlug, settings }: { businessSlug: string; settings: AgentSettings }) {
   const [status, setStatus] = useState<"open" | "all" | OrderStatus>("open");
   const [query, setQuery] = useState("");
@@ -333,7 +433,13 @@ export function OrdersPanel({ businessSlug, settings }: { businessSlug: string; 
       {coverage && coverageLines(coverage, settings.orders_timezone ?? "America/St_Lucia").filter((l) => l.startsWith("⚠️") || l.startsWith("ℹ️")).map((l) => (
         <Notice key={l} tone={l.startsWith("⚠️") ? "warn" : "info"}>{l.replace(/\*/g, "")}</Notice>
       ))}
+      {coverage && (coverage.filteredMessages ?? 0) > 0 && (
+        <p className="text-xs text-zinc-500">
+          {coverage.filteredMessages} message{coverage.filteredMessages === 1 ? "" : "s"} in the last {coverage.windowHours} h had no order wording (thanks, greetings, questions) and were only checked by the free filter.
+        </p>
+      )}
       <RunsCard businessSlug={businessSlug} runs={runs} settings={settings} onSent={load} />
+      <BackfillCard businessSlug={businessSlug} enabled={settings.orders_tracking_enabled === true} onDone={load} />
       <Card title="Orders" subtitle="Orders found in customer conversations. Changes you make here are recorded with your name and never message the customer.">
         <div className="mb-3 flex flex-wrap gap-2">
           <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search name, phone, product, address, reference…" className={`${inputClass} sm:max-w-sm`} />

@@ -85,6 +85,9 @@ export const ATTENTION_TEXT: Record<string, string> = {
   cancellation_requested: "Customer may want to cancel — please check with them",
   check_if_duplicate: "May be a second copy of another order from this customer",
   customer_replied_yes: "Customer replied yes — staff to verify with them and confirm",
+  staff_confirmed_in_chat: "Staff wrote a confirmation in WhatsApp — verify it and press Confirm",
+  staff_cancelled_in_chat: "Staff wrote in WhatsApp that this was cancelled — verify and cancel it here",
+  staff_changed_in_chat: "Staff wrote about changes to this order in WhatsApp — check the order",
   other_customer_note: "Needs a staff look",
 };
 
@@ -488,11 +491,18 @@ export function needsAttention(o: TrackedOrder): boolean {
 export interface Coverage {
   trackingOn: boolean;
   trackingSince: string | null;
+  /** Kept for the dashboard. Order tracking no longer depends on it: every 1:1 customer conversation is read. */
   contactScope: string;
   /** Conversations in the window whose processing failed (or whose batch failed / is stuck). */
   failedChats: number;
-  /** Conversations in the window the agent deliberately did not analyse (excluded, manual-only, staff took over). */
+  /** Conversations in the window the old rules skipped and monitoring did not pick up (before it was switched on). */
   skippedChats: number;
+  /** Conversations not analysed because the hourly monitoring budget was used up. */
+  budgetChats?: number;
+  /** Messages the free pre-filter judged to carry no order wording (information only; not a gap). */
+  filteredMessages?: number;
+  /** Customer messages the bridge stored but never forwarded to the agent. */
+  notForwardedMessages?: number;
   windowHours: number;
 }
 
@@ -504,12 +514,13 @@ export function coverageLines(c: Coverage | undefined, tz: string): string[] {
     lines.push("⚠️ *Incomplete:* order tracking is switched OFF for this business. New conversations are not being read for orders, so this list only shows orders recorded earlier or entered by staff. Do not treat it as complete.");
     return lines;
   }
-  if (c.contactScope === "none") lines.push("⚠️ *Incomplete:* no customers are selected for the AI, so no conversations are being analysed.");
-  else if (c.contactScope === "selected") lines.push("ℹ️ Only conversations with customers selected for the AI are analysed.");
-  if (c.failedChats > 0) lines.push(`⚠️ ${c.failedChats} conversation${c.failedChats === 1 ? "" : "s"} could not be analysed in the last ${c.windowHours} h (processing error). Orders there may be missing: check the inbox.`);
-  if (c.skippedChats > 0) lines.push(`ℹ️ ${c.skippedChats} conversation${c.skippedChats === 1 ? " was" : "s were"} not analysed in the last ${c.windowHours} h (contact excluded, manual-only, or staff had taken over).`);
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  if (c.failedChats > 0) lines.push(`⚠️ ${plural(c.failedChats, "conversation", "conversations")} could not be analysed in the last ${c.windowHours} h (processing error). Orders there may be missing: check the inbox.`);
+  if ((c.notForwardedMessages ?? 0) > 0) lines.push(`⚠️ ${plural(c.notForwardedMessages ?? 0, "customer message", "customer messages")} in the last ${c.windowHours} h reached the inbox but not the AI agent (bridge not forwarding). Orders in them may be missing: check the inbox.`);
+  if ((c.budgetChats ?? 0) > 0) lines.push(`⚠️ ${plural(c.budgetChats ?? 0, "conversation was", "conversations were")} not analysed in the last ${c.windowHours} h because the hourly analysis limit was reached. Check the inbox.`);
+  if (c.skippedChats > 0) lines.push(`ℹ️ ${plural(c.skippedChats, "conversation was", "conversations were")} handled in the last ${c.windowHours} h before every conversation was being read for orders. Orders there may be missing.`);
   if (c.trackingSince) lines.push(`ℹ️ Tracking has been on since ${day(c.trackingSince)}; earlier conversations were not analysed.`);
-  if (lines.length === 0 || !lines.some((l) => l.startsWith("⚠️"))) lines.push("Lists only orders found in conversations the AI analysed.");
+  if (!lines.some((l) => l.startsWith("⚠️"))) lines.push("Covers every customer chat the agent received, including ones the AI does not reply in.");
   return lines;
 }
 

@@ -215,6 +215,7 @@ export async function createOrAppendEscalation(input: EscalateInput): Promise<Es
             intent: input.intent ?? target.context.intent ?? null,
             history: input.history?.length ? input.history : target.context.history ?? [],
             updates: nextUpdates,
+            ...(input.missing ? { missing: input.missing } : {}),
             ...(reopen ? { reopened_at: new Date().toISOString() } : {}),
           },
         })
@@ -258,6 +259,8 @@ export async function createOrAppendEscalation(input: EscalateInput): Promise<Es
           intent: input.intent ?? null,
           history: input.history ?? [],
           ...(input.draftMeta ? { draft_meta: input.draftMeta } : {}),
+          // What the AI could not work out: kept so !moreinfo and the dashboard can show it without another model call.
+          ...(input.missing?.length ? { missing: input.missing } : {}),
         },
         source_event_id: input.eventId,
       })

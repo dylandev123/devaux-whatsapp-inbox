@@ -9,26 +9,36 @@
 // twice or send text the approver did not see.
 
 import { createHash } from "crypto";
-import { canSendApproved, outboxAllowed } from "@/lib/aiAgent/engine";
-import type { AgentSettings } from "@/lib/aiAgent/engine";
+import { canSendApproved, customerMessageSegments, missingOrderFields, outboxAllowed } from "@/lib/aiAgent/engine";
+import type { AgentSettings, OrderRequestDraft } from "@/lib/aiAgent/engine";
+import { ATTENTION_TEXT, MISSING_TEXT } from "@/lib/aiAgent/orders";
 import {
   assessDraftReadiness,
+  buildMoreInfo,
   buildPilotDraftPost,
   buildStatusLine,
   type DraftReadiness,
   inferVerdict,
+  INFORMATIONAL_CODES,
+  MORE_INFO_BUSINESS_LIMIT,
+  MORE_INFO_COOLDOWN_SECONDS,
+  type MoreInfoInput,
   noteTexts,
   parseApproveArgs,
   parseEditArgs,
   parseRejectArgs,
   PILOT_REFUSAL_TEXT,
   type PilotRefusal,
+  type RejectVerdict,
+  splitNotes,
 } from "@/lib/aiAgent/pilot";
-import { checkExactSendSafety, WITHHOLD_TEXT } from "@/lib/aiAgent/staffAnswers";
+import { checkExactSendSafety, WITHHOLD_TEXT, type WithholdReason } from "@/lib/aiAgent/staffAnswers";
 import type { SenderAuthorization } from "@/lib/aiAgent/identity";
 import { agentDb, audit, loadActiveKnowledge } from "@/lib/server/aiAgent/db";
-import { customerWroteAfter, planCustomerSend } from "@/lib/server/aiAgent/customerSend";
+import { customerWroteAfter, planCustomerSend, type SendRequester } from "@/lib/server/aiAgent/customerSend";
 import { type EscalationRow, markEscalationAnswered } from "@/lib/server/aiAgent/escalations";
+import { loadIdentity } from "@/lib/server/aiAgent/identity";
+import { loadChatOrdersForInfo } from "@/lib/server/aiAgent/orders";
 import { type OutboxInsert, type OutboxRow, outboxRowById } from "@/lib/server/aiAgent/outbox";
 
 export const PILOT_DRAFT_KEY_PREFIX = "pilotdraft:";
@@ -430,6 +440,132 @@ async function citedKnowledgeChanged(businessSlug: string, draft: PilotDraftRow)
   });
 }
 
+/** Who is approving: a verified WhatsApp sender in the staff group, or an authenticated admin in the dashboard. */
+export interface Approver {
+  requester: SendRequester;
+  /** Stored as the draft's `decided_by` and in the audit log. */
+  approverId: string | null;
+  /** Audit actor: the WhatsApp sender id, or the admin's user id. */
+  actorId: string | null;
+  actorKind: "staff" | "admin";
+  /** The WhatsApp message id of the command, or a dashboard marker. */
+  messageId: string;
+  eventId: string | null;
+  /** A WhatsApp approval is handed to the bridge in the same response ('dispatched'); a dashboard one waits for its poll ('pending'). */
+  outboxStatus: "dispatched" | "pending";
+  via: "whatsapp" | "admin_ui";
+}
+
+export type ApproveCore =
+  | { kind: "approved"; draft: PilotDraftRow; outboxId: string | null; outcome: string; knowledgeChanged: boolean }
+  | { kind: "refused"; why: PilotRefusal; extra?: string }
+  | { kind: "withheld"; reason: WithholdReason; draft: PilotDraftRow };
+
+/**
+ * THE approval: used by the WhatsApp !approve and the dashboard's Approve button, so there is one policy and one
+ * send path. It applies, in order: Approval Pilot mode; the draft's wording still exists; an unconfirmed draft needs
+ * the approver's explicit confirmation; the central customer-send policy (planCustomerSend: business, contact
+ * permissions, takeover, recent human activity, staleness, expiry, duplicates, unknown-send holds); and finally the
+ * atomic approve_ai_agent_pilot_draft (draft id + text hash compare-and-set, outbox row in the same transaction).
+ */
+export async function approveDraftCore(args: {
+  settings: AgentSettings;
+  escalation: EscalationRow;
+  draft: PilotDraftRow;
+  confirm: boolean;
+  approver: Approver;
+}): Promise<ApproveCore> {
+  const { settings, escalation: e, draft, approver } = args;
+  if (settings.mode !== "approval_pilot") return { kind: "refused", why: "not_in_pilot" };
+  if (draft.content_purged_at) return { kind: "refused", why: "draft_replaced", extra: "no draft text is kept after the retention period" };
+
+  // A "customer-ready" draft is vouched for by the approved knowledge it cited. If any of that knowledge was
+  // changed, archived or has expired since, the claim is no longer verified: staff must confirm it again.
+  const knowledgeChanged = draft.ready && (await citedKnowledgeChanged(e.business_slug, draft));
+  if (knowledgeChanged && !args.confirm) {
+    return { kind: "refused", why: "needs_confirmation", extra: "knowledge this draft relied on was changed or has expired since it was written" };
+  }
+  if (!draft.ready && !args.confirm) return { kind: "refused", why: "needs_confirmation", extra: draft.confirm_notes.join("; ") };
+
+  // The one central policy. Nothing here relaxes any of it.
+  const plan = await planCustomerSend({
+    settings,
+    escalation: e,
+    requester: approver.requester,
+    text: draft.body,
+    basedOn: draft.basis_at,
+    validUntil: draft.valid_until,
+    eventId: approver.eventId,
+  });
+  if (!plan.decision.send || !plan.item) {
+    const reason = plan.decision.send ? "other_restriction" : plan.decision.reason;
+    await audit(e.business_slug, approver.actorKind, approver.actorId, "pilot.approve_withheld", { type: "escalation", id: e.id }, {
+      ref_code: e.ref_code,
+      draft_id: draft.id,
+      version: draft.version,
+      reason,
+      via: approver.via,
+      sender_id: approver.requester.kind === "staff" ? approver.requester.senderId : approver.approverId,
+    });
+    return { kind: "withheld", reason, draft };
+  }
+  // Same last line of defence as every item the live path enqueues.
+  if (!outboxAllowed(settings, plan.item)) return { kind: "refused", why: "not_in_pilot" };
+
+  const outcome = draft.source === "staff_edit" ? "edited" : !draft.ready || knowledgeChanged ? "approved_after_confirm" : "approved_as_is";
+  const { data, error } = await agentDb().rpc("approve_ai_agent_pilot_draft", {
+    p_business_slug: e.business_slug,
+    p_draft_id: draft.id,
+    p_expected_hash: draft.body_hash,
+    p_approver: approver.approverId,
+    p_message_id: approver.messageId,
+    p_outcome: outcome,
+    p_chat_id: plan.item.chatId,
+    p_to_jid: plan.item.toJid,
+    p_body: plan.item.body,
+    p_dedupe_key: plan.item.dedupeKey,
+    p_event_id: approver.eventId,
+    p_status: approver.outboxStatus,
+  });
+  if (error) throw new Error(error.message);
+  const row = (Array.isArray(data) ? data[0] : data) as { outbox_id: string | null; result: string } | undefined;
+  switch (row?.result) {
+    case "approved":
+      break;
+    case "already_approved":
+      return { kind: "refused", why: "already_approved" };
+    case "changed":
+      return { kind: "refused", why: "draft_changed" };
+    case "closed":
+      return { kind: "refused", why: "closed" };
+    case "duplicate_send":
+      return { kind: "refused", why: "duplicate_send" };
+    default:
+      return { kind: "refused", why: "draft_replaced" };
+  }
+
+  // The AI's draft went out unchanged (after the staff confirmed it if it needed that): it was right.
+  // Only fills an empty verdict: an admin's override or a staff verdict is never overwritten.
+  if (draft.source === "ai" && !draft.verdict && !knowledgeChanged) {
+    await agentDb().from("ai_agent_pilot_drafts").update({ verdict: "correct", verdict_source: "inferred" }).eq("id", draft.id).is("verdict", null);
+  }
+  await markEscalationAnswered(e, { body: null, actorId: approver.actorId, via: approver.via === "admin_ui" ? "admin_ui" : "whatsapp", notRelayed: null });
+  await audit(e.business_slug, approver.actorKind, approver.actorId, "pilot.approve", { type: "escalation", id: e.id }, {
+    ref_code: e.ref_code,
+    draft_id: draft.id,
+    version: draft.version,
+    body_hash: draft.body_hash,
+    source: draft.source,
+    outcome,
+    confirmed_by_staff: !draft.ready || knowledgeChanged,
+    knowledge_changed: knowledgeChanged,
+    via: approver.via,
+    sender_id: approver.requester.kind === "staff" ? approver.requester.senderId : approver.approverId,
+    outbox_id: row.outbox_id,
+  });
+  return { kind: "approved", draft, outboxId: row.outbox_id, outcome, knowledgeChanged };
+}
+
 export async function handleApprove(ctx: PilotCtx, body: string): Promise<PilotResult> {
   const { settings, escalation: e } = ctx;
   const denied = await guard(ctx, "approve", true);
@@ -440,92 +576,27 @@ export async function handleApprove(ctx: PilotCtx, body: string): Promise<PilotR
   if (!target.ok) return target.result;
   const draft = target.draft;
 
-  if (draft.content_purged_at) return refuse(ctx, "draft_replaced", "no draft text is kept after the retention period");
-
-  // A "customer-ready" draft is vouched for by the approved knowledge it cited. If any of that knowledge was
-  // changed, archived or has expired since, the claim is no longer verified: staff must confirm it again.
-  const knowledgeChanged = draft.ready && (await citedKnowledgeChanged(e.business_slug, draft));
-  if (knowledgeChanged && !args.confirm) {
-    return refuse(ctx, "needs_confirmation", "knowledge this draft relied on was changed or has expired since it was written");
-  }
-  if (!draft.ready && !args.confirm) return refuse(ctx, "needs_confirmation", draft.confirm_notes.join("; "));
-
-  // The one central policy: business, contact permissions, takeover, recent human activity, staleness,
-  // expiry, duplicates, unknown-send holds. Nothing here relaxes any of it.
-  const plan = await planCustomerSend({
+  const result = await approveDraftCore({
     settings,
     escalation: e,
-    requester: { kind: "staff", senderAuthorized: ctx.senderAuth.authorized, senderId: ctx.senderAuth.senderId },
-    text: draft.body,
-    basedOn: draft.basis_at,
-    validUntil: draft.valid_until,
-    eventId: ctx.eventId,
+    draft,
+    confirm: args.confirm,
+    approver: {
+      requester: { kind: "staff", senderAuthorized: ctx.senderAuth.authorized, senderId: ctx.senderAuth.senderId },
+      approverId: ctx.senderAuth.senderId ?? ctx.senderJid,
+      actorId: ctx.senderJid,
+      actorKind: "staff",
+      messageId: ctx.whatsappMessageId,
+      eventId: ctx.eventId,
+      outboxStatus: "dispatched",
+      via: "whatsapp",
+    },
   });
-  if (!plan.decision.send || !plan.item) {
-    const reason = plan.decision.send ? "other_restriction" : plan.decision.reason;
-    await audit(e.business_slug, "staff", ctx.senderJid, "pilot.approve_withheld", { type: "escalation", id: e.id }, {
-      ref_code: e.ref_code,
-      draft_id: draft.id,
-      version: draft.version,
-      reason,
-      sender_id: ctx.senderAuth.senderId,
-    });
-    return reply(ctx, `⚠️ #${e.ref_code}: draft v${draft.version} was NOT sent — ${WITHHOLD_TEXT[reason]}.`, `pilot:withheld_${reason}`);
+  if (result.kind === "refused") return refuse(ctx, result.why, result.extra);
+  if (result.kind === "withheld") {
+    return reply(ctx, `⚠️ #${e.ref_code}: draft v${draft.version} was NOT sent — ${WITHHOLD_TEXT[result.reason]}.`, `pilot:withheld_${result.reason}`);
   }
-  // Same last line of defence as every item the live path enqueues.
-  if (!outboxAllowed(settings, plan.item)) return refuse(ctx, "not_in_pilot");
-
-  const outcome = draft.source === "staff_edit" ? "edited" : !draft.ready || knowledgeChanged ? "approved_after_confirm" : "approved_as_is";
-  const { data, error } = await agentDb().rpc("approve_ai_agent_pilot_draft", {
-    p_business_slug: e.business_slug,
-    p_draft_id: draft.id,
-    p_expected_hash: draft.body_hash,
-    p_approver: ctx.senderAuth.senderId ?? ctx.senderJid,
-    p_message_id: ctx.whatsappMessageId,
-    p_outcome: outcome,
-    p_chat_id: plan.item.chatId,
-    p_to_jid: plan.item.toJid,
-    p_body: plan.item.body,
-    p_dedupe_key: plan.item.dedupeKey,
-    p_event_id: ctx.eventId,
-    p_status: "dispatched",
-  });
-  if (error) throw new Error(error.message);
-  const row = (Array.isArray(data) ? data[0] : data) as { outbox_id: string | null; result: string } | undefined;
-  switch (row?.result) {
-    case "approved":
-      break;
-    case "already_approved":
-      return refuse(ctx, "already_approved");
-    case "changed":
-      return refuse(ctx, "draft_changed");
-    case "closed":
-      return refuse(ctx, "closed");
-    case "duplicate_send":
-      return refuse(ctx, "duplicate_send");
-    default:
-      return refuse(ctx, "draft_replaced");
-  }
-
-  // The AI's draft went out unchanged (after the staff confirmed it if it needed that): it was right.
-  // Only fills an empty verdict: an admin's override or a staff verdict is never overwritten.
-  if (draft.source === "ai" && !draft.verdict && !knowledgeChanged) {
-    await agentDb().from("ai_agent_pilot_drafts").update({ verdict: "correct", verdict_source: "inferred" }).eq("id", draft.id).is("verdict", null);
-  }
-  await markEscalationAnswered(e, { body: null, actorId: ctx.senderJid, via: "whatsapp", notRelayed: null });
-  await audit(e.business_slug, "staff", ctx.senderJid, "pilot.approve", { type: "escalation", id: e.id }, {
-    ref_code: e.ref_code,
-    draft_id: draft.id,
-    version: draft.version,
-    body_hash: draft.body_hash,
-    source: draft.source,
-    outcome,
-    confirmed_by_staff: !draft.ready || knowledgeChanged,
-    knowledge_changed: knowledgeChanged,
-    sender_id: ctx.senderAuth.senderId,
-    outbox_id: row.outbox_id,
-  });
-  const queued = row.outbox_id ? [await outboxRowById(row.outbox_id)].filter((r): r is OutboxRow => Boolean(r)) : [];
+  const queued = result.outboxId ? [await outboxRowById(result.outboxId)].filter((r): r is OutboxRow => Boolean(r)) : [];
   return {
     outbox: canSendApproved(settings) ? [feedback(ctx, `📤 #${e.ref_code}: draft v${draft.version} approved — sending to ${label(e)}.`)] : [],
     queued,
@@ -603,6 +674,32 @@ export function draftPostItem(ctx: Pick<PilotCtx, "settings" | "escalation" | "e
 
 // ── !reject ──────────────────────────────────────────────────────────────────
 
+/** Drops the current draft. Conditional on it still being current: a draft approved a moment ago cannot be "rejected" after the fact. */
+export async function rejectDraft(args: {
+  draft: PilotDraftRow;
+  verdict: RejectVerdict | null;
+  note: string | null;
+  decidedBy: string | null;
+  messageId: string | null;
+}): Promise<boolean> {
+  const { data, error } = await agentDb()
+    .from("ai_agent_pilot_drafts")
+    .update({
+      status: "rejected",
+      outcome: "rejected",
+      decided_by: args.decidedBy,
+      decided_at: new Date().toISOString(),
+      decision_message_id: args.messageId,
+      ...(args.verdict ? { verdict: args.verdict, verdict_source: "staff" } : {}),
+      verdict_note: args.note,
+    })
+    .eq("id", args.draft.id)
+    .eq("status", "current")
+    .select("id");
+  if (error) throw new Error(error.message);
+  return (data ?? []).length > 0;
+}
+
 export async function handleReject(ctx: PilotCtx, body: string): Promise<PilotResult> {
   const { escalation: e } = ctx;
   const denied = await guard(ctx, "reject", true);
@@ -611,23 +708,8 @@ export async function handleReject(ctx: PilotCtx, body: string): Promise<PilotRe
   const target = await resolveTarget(ctx, null);
   if (!target.ok) return target.result;
   const draft = target.draft;
-  // Conditional on still being current: a draft approved a moment ago cannot be "rejected" after the fact.
-  const { data, error } = await agentDb()
-    .from("ai_agent_pilot_drafts")
-    .update({
-      status: "rejected",
-      outcome: "rejected",
-      decided_by: ctx.senderAuth.senderId ?? ctx.senderJid,
-      decided_at: new Date().toISOString(),
-      decision_message_id: ctx.whatsappMessageId,
-      ...(args.verdict ? { verdict: args.verdict, verdict_source: "staff" } : {}),
-      verdict_note: args.note,
-    })
-    .eq("id", draft.id)
-    .eq("status", "current")
-    .select("id");
-  if (error) throw new Error(error.message);
-  if ((data ?? []).length === 0) return refuse(ctx, "draft_replaced");
+  const rejected = await rejectDraft({ draft, verdict: args.verdict, note: args.note, decidedBy: ctx.senderAuth.senderId ?? ctx.senderJid, messageId: ctx.whatsappMessageId });
+  if (!rejected) return refuse(ctx, "draft_replaced");
   await audit(e.business_slug, "staff", ctx.senderJid, "pilot.reject", { type: "escalation", id: e.id }, {
     ref_code: e.ref_code,
     draft_id: draft.id,
@@ -656,6 +738,153 @@ export async function handleEscalationStatus(ctx: PilotCtx): Promise<PilotResult
     customerWroteSinceDraft: stale,
   });
   return reply(ctx, line, "pilot:status");
+}
+
+// ── !moreinfo (read-only) ────────────────────────────────────────────────────
+
+const ORDER_FIELD_TEXT: Record<string, string> = {
+  items: "Which products the customer wants",
+  quantity: "How many of each",
+  delivery_address: "Delivery address",
+  delivery_preference: "Delivery day/time",
+};
+
+const orderLineText = (i: { product: string; quantity: string | null; variant: string | null; size: string | null }) =>
+  `${i.quantity ?? "qty ?"} × ${i.product}${[i.variant, i.size].filter(Boolean).length ? ` (${[i.variant, i.size].filter(Boolean).join(", ")})` : ""}`;
+
+function changeText(field: string, c: { before?: unknown; after?: unknown } | undefined): string {
+  const show = (v: unknown) => (v === null || v === undefined ? "—" : typeof v === "object" ? "updated" : String(v).slice(0, 60));
+  return `${field.replace(/_/g, " ")}: ${show(c?.before)} → ${show(c?.after)}`;
+}
+
+/**
+ * Everything staff may want before approving, assembled from what is ALREADY stored: the escalation, the draft
+ * versions, the tracked orders and their history. No model call, and nothing is written. `quoted*` say which draft
+ * the quoted message showed, so an outdated one is labelled as such rather than silently replaced by the current one.
+ */
+export async function loadMoreInfo(args: {
+  settings: AgentSettings;
+  escalation: EscalationRow;
+  quotedDraftId?: string | null;
+  quotedNotice?: boolean;
+  quotedNoticeAt?: string | null;
+}): Promise<{ text: string; version: number | null; stale: boolean; actionable: boolean }> {
+  const { settings, escalation: e } = args;
+  const current = await currentDraft(e.business_slug, e.id);
+  const shown = args.quotedDraftId
+    ? await draftById(e.business_slug, e.id, args.quotedDraftId)
+    : args.quotedNotice
+      ? await draftShownByNotice(e.business_slug, e.id, args.quotedNoticeAt ?? null)
+      : current;
+
+  const wrote = shown ? await customerWroteAfter(e, shown.basis_at) : false;
+  let actionable: MoreInfoInput["actionable"];
+  if (!shown) actionable = { ok: false, reason: "there is no AI draft for this request" };
+  else if (shown.content_purged_at) actionable = { ok: false, reason: "the draft wording is no longer kept" };
+  else if (shown.status !== "current") actionable = { ok: false, reason: `draft v${shown.version} was ${shown.status}${current ? `; the current one is v${current.version}` : ""}` };
+  else {
+    const plan = await planCustomerSend({
+      settings,
+      escalation: e,
+      requester: { kind: "staff", senderAuthorized: true, senderId: null },
+      text: shown.body,
+      basedOn: shown.basis_at,
+      validUntil: shown.valid_until,
+    });
+    actionable = plan.decision.send ? { ok: true } : { ok: false, reason: WITHHOLD_TEXT[plan.decision.reason] };
+  }
+
+  const identity = await loadIdentity(e.business_slug, e.chat_id, e.contact_number);
+  const { orders, events } = await loadChatOrdersForInfo(e.business_slug, e.chat_id);
+  const refOf = new Map(orders.map((o) => [o.id, o.ref_code]));
+  const corrections = events.map((ev) => {
+    const fields = Object.entries(ev.changes ?? {}).map(([f, c]) => changeText(f, c)).slice(0, 3).join("; ");
+    return `${refOf.get(ev.order_id) ?? "order"} · ${ev.kind.replace(/_/g, " ")}${fields ? ` · ${fields}` : ""}`;
+  });
+
+  const ctx = e.context as { missing?: string[]; order_request?: OrderRequestDraft | null; questions?: string[] };
+  const requestOrder = ctx.order_request ?? null;
+  const missing = [
+    ...(ctx.missing ?? []),
+    ...(orders.length === 0 && requestOrder ? missingOrderFields(requestOrder).map((f) => ORDER_FIELD_TEXT[f]).filter(Boolean) : []),
+  ];
+  const notes = shown?.ready ? [] : (shown?.confirm_notes ?? []);
+  const { gaps, risks } = splitNotes([...notes, ...noteTexts(e.reason_codes.filter((c) => !INFORMATIONAL_CODES.has(c)))]);
+  const customerQuestions = gaps.length > 0 ? (ctx.questions ?? []).slice(-3).map((q) => `Customer asked: “${q}”`) : [];
+
+  const info: MoreInfoInput = {
+    refCode: e.ref_code,
+    customerName: e.customer_name,
+    phone: identity.phone,
+    priority: e.priority,
+    escalationStatus: e.status,
+    messages: customerMessageSegments(e.customer_message ?? ""),
+    draft: shown ? { version: shown.version, body: shown.body, ready: shown.ready, notes: shown.confirm_notes, source: shown.source, status: shown.status } : null,
+    currentVersion: current?.version ?? null,
+    actionable,
+    customerWroteSince: wrote,
+    orders: orders.map((o) => ({
+      ref: o.ref_code,
+      status: o.status,
+      items: o.items.map(orderLineText),
+      fulfilment: o.fulfilment_method,
+      address: o.delivery_address,
+      requestedFor: o.requested_for,
+      notes: o.notes,
+      missing: o.missing_fields.filter((m) => m in MISSING_TEXT).map((m) => MISSING_TEXT[m]),
+      attention: o.attention ? (ATTENTION_TEXT[o.attention] ?? ATTENTION_TEXT.other_customer_note) : null,
+      cancelledReason: o.status === "cancelled" ? (o.cancel_reason ?? "cancelled") : null,
+    })),
+    requestLines: requestOrder
+      ? [...requestOrder.items.map((i) => `${i.quantity ?? "qty ?"} × ${i.product}`), ...(requestOrder.delivery_preference ? [`Delivery/collection: ${requestOrder.delivery_preference}`] : []), ...(requestOrder.delivery_address ? [`Address: ${requestOrder.delivery_address}`] : [])]
+      : [],
+    corrections,
+    missing: [...new Set(missing)],
+    risks,
+    knowledgeGaps: [...gaps, ...customerQuestions],
+  };
+  return { text: buildMoreInfo(info), version: shown?.version ?? null, stale: Boolean(shown && (shown.status !== "current" || wrote)), actionable: actionable.ok };
+}
+
+/**
+ * `!moreinfo`: a separate, detailed staff-group message. Authorized senders only (it shows the customer's phone and
+ * order), read-only (no draft, order, escalation or approval state changes, nothing reaches the customer), no model
+ * call, and rate-limited so it can't turn the group into a firehose.
+ */
+export async function handleMoreInfo(ctx: PilotCtx): Promise<PilotResult> {
+  const { settings, escalation: e } = ctx;
+  if (!ctx.senderAuth.authorized) {
+    await audit(e.business_slug, "staff", ctx.senderJid, "pilot.moreinfo_refused", { type: "escalation", id: e.id }, {
+      ref_code: e.ref_code,
+      reason: "sender_not_authorized",
+      sender_id: ctx.senderAuth.senderId,
+    });
+    return refuse(ctx, "moreinfo_not_authorized");
+  }
+  // Cooldown per request and a business-wide ceiling. Silent (the answer is already in the group, just above).
+  const db = agentDb();
+  const now = Date.now();
+  const [perRequest, perBusiness] = await Promise.all([
+    db.from("ai_agent_outbox").select("id").eq("business_slug", e.business_slug).eq("escalation_id", e.id).eq("kind", "staff_feedback").like("dedupe_key", "moreinfo:%").gte("created_at", new Date(now - MORE_INFO_COOLDOWN_SECONDS * 1000).toISOString()).limit(1),
+    db.from("ai_agent_outbox").select("id").eq("business_slug", e.business_slug).eq("kind", "staff_feedback").like("dedupe_key", "moreinfo:%").gte("created_at", new Date(now - 10 * 60_000).toISOString()).limit(MORE_INFO_BUSINESS_LIMIT),
+  ]);
+  if (perRequest.error) throw new Error(perRequest.error.message);
+  if (perBusiness.error) throw new Error(perBusiness.error.message);
+  if ((perRequest.data ?? []).length > 0 || (perBusiness.data ?? []).length >= MORE_INFO_BUSINESS_LIMIT) {
+    await audit(e.business_slug, "staff", ctx.senderJid, "pilot.moreinfo_throttled", { type: "escalation", id: e.id }, { ref_code: e.ref_code, scope: (perRequest.data ?? []).length > 0 ? "request" : "business" });
+    return { outbox: [], queued: [], outcome: "pilot:moreinfo_throttled" };
+  }
+
+  const info = await loadMoreInfo({ settings, escalation: e, quotedDraftId: ctx.quotedDraftId, quotedNotice: ctx.quotedNotice, quotedNoticeAt: ctx.quotedNoticeAt });
+  await audit(e.business_slug, "staff", ctx.senderJid, "pilot.moreinfo", { type: "escalation", id: e.id }, {
+    ref_code: e.ref_code,
+    version: info.version,
+    stale: info.stale,
+    actionable: info.actionable,
+    sender_id: ctx.senderAuth.senderId,
+  });
+  const item: OutboxInsert = { ...feedback(ctx, info.text), dedupeKey: `moreinfo:${e.id}:${ctx.eventId}` };
+  return { outbox: canSendApproved(settings) ? [item] : [], queued: [], outcome: "pilot:moreinfo" };
 }
 
 /** Business-level `!status`: the open requests and what each is waiting for. Read-only, anyone in the group. */

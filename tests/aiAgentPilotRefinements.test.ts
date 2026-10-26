@@ -419,7 +419,7 @@ describe("Approval Pilot refinements (real server code, real SQL)", { skip: !pgA
     await configure({ passive_learning_scope: "staff_group" });
     await staffFrom(fact, { fromMe: true });
     assert.equal(analyzerCalls.length, 0);
-    await configure({ passive_learning_scope: "staff_group_and_chats" });
+    await configure({ passive_learning_scope: "staff_group_and_chats", knowledge_confirm_via_whatsapp: true });
     await staffFrom(fact, { fromMe: true });
     const [c] = await candidates();
     assert.equal(c.sender_verified, false);

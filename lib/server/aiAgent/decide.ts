@@ -35,7 +35,8 @@ import {
   missingOrderFields,
   staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
-import { assessDraftReadiness, buildPilotNotice } from "@/lib/aiAgent/pilot";
+import { assessDraftReadiness, buildPilotNotice, buildPilotUpdateNotice, pilotNoReplyNeeded } from "@/lib/aiAgent/pilot";
+import { gateAllowsMonitoring } from "@/lib/aiAgent/orderMonitor";
 import { type CustomerMode, customerModeAllowsKind, effectiveCustomerMode, modeAdjustedDecision } from "@/lib/aiAgent/customerMode";
 import {
   buildShadowRecord,
@@ -115,6 +116,7 @@ import {
 import { proposeReply } from "@/lib/server/aiAgent/model";
 import { isUpdateCommand, type TrackedOrder } from "@/lib/aiAgent/orders";
 import { handleUpdateCommand, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
+import { monitorCustomerTurn, monitorStaffMessage } from "@/lib/server/aiAgent/orderMonitor";
 import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
 import {
   BridgeOutboxItem,
@@ -226,7 +228,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
         escalationId: staff.escalationId,
       };
     } else if (input.fromMe) {
-      outcome = await handleManualStaffMessage(input, settings);
+      outcome = await handleManualStaffMessage(input, settings, eventId);
     } else if (batchingActive(settings)) {
       outcome = await handleBatchedCustomerMessage(input, settings, eventId);
     } else {
@@ -422,7 +424,7 @@ async function finishEvent(eventId: string, startedAt: number, outcome: Outcome,
 // A manual message from the business phone/inbox = a human is handling this
 // chat. Pause the agent there for auto_takeover_minutes. (Agent-originated
 // sends are never forwarded by the bridge — see the contract.)
-async function handleManualStaffMessage(input: BridgeMessageInput, settings: AgentSettings): Promise<Outcome> {
+async function handleManualStaffMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
   if (settings.auto_takeover_minutes > 0 && !input.chatId.endsWith("@g.us")) {
     await setConversationControl({
       businessSlug: input.businessSlug,
@@ -434,6 +436,21 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
       actorId: null,
     });
   }
+  // Order monitoring reads what the business writes in a customer chat too (a confirmation, a cancellation, a change),
+  // but it can only flag an existing order for a person to verify. Never a reply, never an order of its own.
+  const monitored = settings.orders_tracking_enabled
+    ? await monitorStaffMessage({
+        settings,
+        businessSlug: input.businessSlug,
+        chatId: input.chatId,
+        contactNumber: input.contactNumber,
+        text: input.text,
+        hasMedia: input.hasMedia,
+        whatsappMessageId: input.whatsappMessageId,
+        timestamp: input.timestamp,
+        eventId,
+      })
+    : { reasons: [] as string[] };
   // The business's own message in a customer chat may state a reusable fact. Only with the admin's explicit
   // "staff chats" scope; stored as a PENDING suggestion (never knowledge), never customer text.
   if (settings.passive_learning_scope === "staff_group_and_chats" && !input.chatId.endsWith("@g.us")) {
@@ -449,9 +466,9 @@ async function handleManualStaffMessage(input: BridgeMessageInput, settings: Age
       whatsappMessageId: input.whatsappMessageId,
       timestamp: input.timestamp,
     });
-    return { decision: "HUMAN", reasons: ["staff_message", ...(passive.outcome === "passive:skipped" ? [] : [passive.outcome.replace(":", "_")])], outbox: passive.outbox };
+    return { decision: "HUMAN", reasons: ["staff_message", ...monitored.reasons, ...(passive.outcome === "passive:skipped" ? [] : [passive.outcome.replace(":", "_")])], outbox: passive.outbox };
   }
-  return { decision: "HUMAN", reasons: ["staff_message"], outbox: [] };
+  return { decision: "HUMAN", reasons: ["staff_message", ...monitored.reasons], outbox: [] };
 }
 
 async function autoRepliesLastHour(businessSlug: string, chatId: string): Promise<number> {
@@ -699,11 +716,30 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
   const sendable = canSend(settings) && p.customerMode === "auto_reply";
 
   if (!p.gate.pass && p.gate.decision !== "ESCALATE") {
-    return { decision: p.gate.decision, reasons: p.gate.reasons, outbox: [] };
+    // The AI may not reply here (not allowed, Manual Only, staff took over…). Order monitoring is independent of that:
+    // it reads the turn for orders and never produces an outbox item, whatever it finds.
+    const monitored =
+      settings.orders_tracking_enabled && gateAllowsMonitoring(p.gate.reasons)
+        ? await monitorCustomerTurn({
+            settings,
+            businessSlug,
+            chatId,
+            contactNumber: ctx.contactNumber,
+            segments: turn.segments,
+            transcript: turn.transcript,
+            hasMedia: turn.hasMedia,
+            messageIds: turn.whatsappMessageIds,
+            firstAt: turn.firstAt,
+            lastAt: turn.lastAt,
+            dedupeBase: ctx.dedupeBase,
+          })
+        : { reasons: [] as string[] };
+    return { decision: p.gate.decision, reasons: [...p.gate.reasons, ...monitored.reasons], outbox: [] };
   }
 
   // "thanks", "ok", "hello": no staff update, no new escalation, and nothing sent while staff own the issue.
-  if (p.gate.pass && p.trivialTurn && (p.hasOpenEscalation || p.customerMode !== "auto_reply")) {
+  // In Approval Pilot a pleasantry never needs an approval, whoever owns the conversation.
+  if (p.gate.pass && p.trivialTurn && (p.hasOpenEscalation || p.customerMode !== "auto_reply" || settings.mode === "approval_pilot")) {
     return { decision: "NO_REPLY", reasons: ["trivial_acknowledgement"], outbox: [] };
   }
 
@@ -747,6 +783,16 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
 
   const r = p.resolution;
   const reasons = [...(p.gate.pass ? r!.reasons : p.gate.reasons), ...p.identityNotes, ...trackingReasons];
+  // Approval Pilot: a message that needs no answer (thanks, a reaction in words, small talk with no question, order
+  // change, cancellation or complaint in it) creates no approval request. It was stored and tracked above.
+  if (
+    settings.mode === "approval_pilot" &&
+    p.gate.pass &&
+    !p.hasOpenEscalation &&
+    pilotNoReplyNeeded({ trivialTurn: p.trivialTurn, intent: p.proposal?.intent ?? null, safeguards: p.safeguards, hasOrderRequest: Boolean(r?.orderRequest), segments: turn.segments })
+  ) {
+    return { decision: "NO_REPLY", reasons: [...reasons, "no_reply_needed"], outbox: [] };
+  }
   const engineDecision: AgentDecision = p.gate.pass ? r!.decision : "ESCALATE";
   // The customer's mode decides what the engine's decision becomes: Staff First turns a reply the AI
   // would have sent into an escalation carrying it as a draft; Manual Only does nothing.
@@ -887,17 +933,6 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
   return { ...common, decision, reasons, outbox: outbox.filter((o) => customerModeAllowsKind(p.customerMode, o.kind)) };
 }
 
-/** The order as collected so far, one short line per item or detail, for the pilot notice. Empty when there is none. */
-function orderSummaryLines(order: OrderRequestDraft | null): string[] {
-  if (!order || (order.items.length === 0 && !order.delivery_address && !order.delivery_preference)) return [];
-  return [
-    ...order.items.map((i) => `${i.quantity ?? "qty not given"} × ${i.product}`),
-    ...(order.delivery_preference ? [`Delivery/collection: ${order.delivery_preference}`] : []),
-    ...(order.delivery_address ? [`Address: ${order.delivery_address}`] : []),
-    ...(order.notes ? [`Note: ${order.notes}`] : []),
-  ];
-}
-
 const ORDER_FIELD_TEXT: Record<string, string> = {
   items: "Which products the customer wants",
   quantity: "How many of each",
@@ -1027,14 +1062,13 @@ async function notifyStaff(args: {
       // A first notice that only goes out after the customer wrote again (the earlier one never reached the group)
       // is still answered with the AI's latest suggestion.
       const draft = (await ensureAiDraft(escalation)) ?? (write.followUp ? await followUpDraft() : null);
+      const label = escalation.customer_name || escalation.contact_number || escalation.chat_id;
       body = buildPilotNotice({
         refCode: escalation.ref_code,
-        priority: escalation.priority,
-        customerLabel: [escalation.customer_name, escalation.contact_number].filter(Boolean).join(" · ") || escalation.chat_id,
+        customerLabel: label,
         messages: customerMessageSegments(escalation.customer_message ?? escalateInput.customerMessage),
         draft: draft ? { version: draft.version, body: draft.body, ready: draft.ready, notes: draft.confirm_notes } : null,
-        missing: escalateInput.missing ?? [],
-        order: orderSummaryLines(escalateInput.orderRequest ?? (escalation.context.order_request as OrderRequestDraft | null | undefined) ?? null),
+        warnings: current.cancelled ? ["Customer wants to cancel"] : [],
       });
     } else if (first) {
       body = staffNoticeFor(escalation, write.followUp ? originalEscalationInput(escalation, escalateInput) : escalateInput, false, observeOnly);
@@ -1043,20 +1077,31 @@ async function notifyStaff(args: {
       const changes = diffSnapshots(baseline, current);
       if (changes.length === 0) return { reasons: ["staff_update_not_material"], row: null };
       urgent = isUrgentChange(changes);
-      // Approval Pilot: the AI answers the new state of the conversation; that suggestion is the next draft to approve.
-      const draft = settings.mode === "approval_pilot" ? await followUpDraft() : null;
-      body = buildStaffUpdate({
-        refCode: escalation.ref_code,
-        priority: escalation.priority,
-        customerLabel: [escalation.customer_name, escalation.contact_number].filter(Boolean).join(" · ") || escalation.chat_id,
-        current,
-        changes,
-        afterStaffReply: Boolean(escalation.answered_at),
-        observeOnly: observeOnly && settings.mode !== "approval_pilot",
-        pilot: settings.mode === "approval_pilot",
-        draft: draft ? { version: draft.version, body: draft.body, ready: draft.ready, notes: draft.confirm_notes } : null,
-        latestMessage: args.turn.segments[args.turn.segments.length - 1] ?? null,
-      });
+      if (settings.mode === "approval_pilot") {
+        // Approval Pilot: the AI answers the new state of the conversation; that suggestion is the next draft to approve.
+        // One short replacement notice; the earlier suggestion is superseded and can no longer be approved.
+        const draft = await followUpDraft();
+        body = buildPilotUpdateNotice({
+          refCode: escalation.ref_code,
+          customerLabel: escalation.customer_name || escalation.contact_number || escalation.chat_id,
+          messages: args.turn.segments,
+          changes: changes.map((c) => c.text),
+          afterStaffReply: Boolean(escalation.answered_at),
+          urgent,
+          draft: draft ? { version: draft.version, body: draft.body, ready: draft.ready, notes: draft.confirm_notes } : null,
+          warnings: current.cancelled ? ["Customer wants to CANCEL"] : [],
+        });
+      } else {
+        body = buildStaffUpdate({
+          refCode: escalation.ref_code,
+          priority: escalation.priority,
+          customerLabel: [escalation.customer_name, escalation.contact_number].filter(Boolean).join(" · ") || escalation.chat_id,
+          current,
+          changes,
+          afterStaffReply: Boolean(escalation.answered_at),
+          observeOnly,
+        });
+      }
     }
 
     // Same last line of defence as every other item: only what the business's mode permits.
@@ -1107,7 +1152,10 @@ async function handleBatchedCustomerMessage(input: BridgeMessageInput, settings:
     ...gateData,
     now: new Date(),
   });
-  if (!gate.pass) return { decision: gate.decision, reasons: gate.reasons, outbox: [] };
+  // A chat the AI may not reply in is still read for orders when tracking is on: its messages join the same batch, so a
+  // customer's rapid messages are analysed together and in order. The batch's worker never produces a customer reply for it.
+  const monitoring = !gate.pass && settings.orders_tracking_enabled === true && gateAllowsMonitoring(gate.reasons);
+  if (!gate.pass && !monitoring) return { decision: gate.decision, reasons: gate.reasons, outbox: [] };
 
   const queued = await enqueueBatchMessage({
     businessSlug: input.businessSlug,
@@ -1119,7 +1167,7 @@ async function handleBatchedCustomerMessage(input: BridgeMessageInput, settings:
     hasMedia: input.hasMedia,
     messageAt: input.timestamp,
   });
-  const reasons = [BATCHED_REASON];
+  const reasons = [BATCHED_REASON, ...(monitoring ? ["orders_monitor_queued"] : [])];
   // A cancellation must not wait out the quiet period when staff are already working on this customer:
   // the batch becomes due now (the next sweep or cron run picks it up). Only the deadline moves — the
   // message is processed by the same worker, in the same order, as any other.

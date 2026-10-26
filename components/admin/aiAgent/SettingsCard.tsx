@@ -286,7 +286,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
           </p>
           <label className="flex items-center gap-2 text-sm text-zinc-700">
             <input type="checkbox" checked={ordersTracking} onChange={(e) => setOrdersTracking(e.target.checked)} />
-            Track orders from customer conversations (uses the existing AI analysis — no extra AI calls)
+            Track orders from ALL customer conversations, including customers the AI is not allowed to reply to (this never lets the AI reply; those chats use one small extra AI call per relevant message, with an hourly limit)
           </label>
           <label className="mt-2 flex items-center gap-2 text-sm text-zinc-700">
             <input type="checkbox" checked={ordersCustomerConfirms} onChange={(e) => setOrdersCustomerConfirms(e.target.checked)} />

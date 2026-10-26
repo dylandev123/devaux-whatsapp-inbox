@@ -381,6 +381,38 @@ export interface SimulationView {
   customerMode?: CustomerMode;
 }
 
+/** One pending request in the dashboard's approvals queue (see lib/server/aiAgent/approvals.ts). */
+export interface ApprovalItemView {
+  escalationId: string;
+  refCode: string;
+  customerName: string | null;
+  contactNumber: string | null;
+  priority: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  latestMessage: string;
+  messageCount: number;
+  draft: { id: string; version: number; body: string; ready: boolean; notes: string[]; source: "ai" | "staff_edit" | "staff_answer"; createdAt: string } | null;
+  stale: boolean;
+}
+
+export interface BackfillRunView {
+  id: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  hours: number;
+  chats_total: number;
+  chats_done: number;
+  messages_analysed: number;
+  orders_touched: number;
+  failures: number;
+  note: string | null;
+  started_by: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
 export type OrderView = TrackedOrder;
 export interface OrderRunView {
   id: string;
@@ -431,6 +463,18 @@ export const aiAgentApi = {
     extra: { version: number; patch?: Partial<Record<EditableOrderField, unknown>>; reason?: string }
   ) => api<{ order: OrderView }>("/api/ai-agent/orders", send("PATCH", { businessSlug: b, orderId, action, ...extra })),
   sendOrderSummary: (b: string) => api<{ ok: true }>("/api/ai-agent/orders", send("POST", { businessSlug: b })),
+  listApprovals: (b: string) => api<{ mode: string; items: ApprovalItemView[] }>(`/api/ai-agent/approvals${q(b)}`),
+  /** One request at a time: there is no bulk approval. `draftId` is the draft the admin was looking at. */
+  actOnApproval: (
+    b: string,
+    escalationId: string,
+    action: "approve" | "edit" | "reject" | "moreinfo",
+    extra: { draftId?: string; confirm?: boolean; text?: string; reason?: string } = {}
+  ) => api<{ ok: true; message: string; text?: string; draftId?: string }>("/api/ai-agent/approvals", send("POST", { businessSlug: b, escalationId, action, ...extra })),
+  listBackfills: (b: string) => api<{ runs: BackfillRunView[] }>(`/api/ai-agent/orders/backfill${q(b)}`),
+  startBackfill: (b: string, hours: number) => api<{ run: BackfillRunView }>("/api/ai-agent/orders/backfill", send("POST", { businessSlug: b, action: "start", hours })),
+  stepBackfill: (b: string, runId: string) => api<{ run: BackfillRunView }>("/api/ai-agent/orders/backfill", send("POST", { businessSlug: b, action: "continue", runId })),
+  cancelBackfill: (b: string, runId: string) => api<{ run: BackfillRunView }>("/api/ai-agent/orders/backfill", send("POST", { businessSlug: b, action: "cancel", runId })),
   getBusinesses: () =>
     api<{ businesses: import("@/lib/aiAgent/businessList").AgentBusiness[]; sessionsKnown: boolean }>("/api/ai-agent/businesses"),
   getSettings: (b: string) => api<SettingsResponse>(`/api/ai-agent/settings${q(b)}`),

@@ -7,21 +7,25 @@
 // the same central send policy as Assisted mode (planCustomerSend in lib/server/aiAgent/customerSend.ts).
 
 import { checkReplySafety, detectPromptInjection, type KnowledgeFact, type ModelProposal } from "./engine.ts";
+import { extractQuestions, isCancellation, isTrivialTurn } from "./escalationUpdates.ts";
 import { statesTemporaryCondition } from "./staffAnswers.ts";
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 /** Commands that act on one escalation's draft. */
-export const DRAFT_COMMANDS = ["approve", "edit", "reject"] as const;
+export const DRAFT_COMMANDS = ["approve", "edit", "reject", "moreinfo"] as const;
 /** Commands about the business's knowledge (and read-only status); they need no escalation. */
 export const BUSINESS_COMMANDS = ["teach", "confirm", "discard", "status"] as const;
 export type PilotCommand = (typeof DRAFT_COMMANDS)[number] | (typeof BUSINESS_COMMANDS)[number];
+
+/** "!more info" and "!more-info" are read as "!moreinfo". */
+export const MORE_INFO_SPELLING = /^!more[\s-]+info\b/i;
 
 const PILOT_COMMAND_PATTERN = new RegExp(`^!(${[...DRAFT_COMMANDS, ...BUSINESS_COMMANDS].join("|")})\\b\\s*`, "i");
 
 /** A message that STARTS with one of the pilot commands (never one that merely mentions it). */
 export function parsePilotCommand(text: string): { command: PilotCommand; body: string } | null {
-  const stripped = text.replace(/\s+/g, " ").trim();
+  const stripped = text.replace(/\s+/g, " ").trim().replace(MORE_INFO_SPELLING, "!moreinfo");
   const m = stripped.match(PILOT_COMMAND_PATTERN);
   if (!m) return null;
   return { command: m[1].toLowerCase() as PilotCommand, body: stripped.slice(m[0].length).trim() };
@@ -53,6 +57,24 @@ export function parseRejectArgs(body: string): { verdict: RejectVerdict | null; 
 export function parseEditArgs(body: string): { version: number | null; text: string } {
   const m = body.match(/^v(\d{1,3})\s+(.+)$/i);
   return m ? { version: Number(m[1]), text: m[2].trim() } : { version: null, text: body.trim() };
+}
+
+/**
+ * Approval Pilot: does this customer turn need NO reply at all? Thanks, an acknowledgement, small talk with no question.
+ * Never when the turn carries anything staff may need to act on: an order or an order change, a cancellation, a
+ * complaint or other safeguard topic, or a question. Conservative: when unsure, staff get the request.
+ */
+export function pilotNoReplyNeeded(input: {
+  trivialTurn: boolean;
+  intent: string | null;
+  safeguards: string[];
+  hasOrderRequest: boolean;
+  segments: string[];
+}): boolean {
+  if (input.safeguards.length > 0 || input.hasOrderRequest) return false;
+  if (input.segments.some(isCancellation)) return false;
+  if (input.trivialTurn || isTrivialTurn(input.segments)) return true;
+  return input.intent === "smalltalk" && extractQuestions(input.segments).length === 0;
 }
 
 // ── Draft readiness: customer-ready, or needs factual confirmation ───────────
@@ -91,7 +113,7 @@ const NOTE_TEXT: Record<string, string> = {
  * and a draft that only asks the customer for the next missing order detail states no fact that needs checking
  * (prices, stock, times and offers are still checked on their own). The missing details are listed in the notice.
  */
-const INFORMATIONAL_CODES = new Set(["verified_answer", "open_escalation", "collecting_order_details"]);
+export const INFORMATIONAL_CODES = new Set(["verified_answer", "open_escalation", "collecting_order_details"]);
 
 const STOCK_CLAIM =
   /\b(in stock|out of stock|sold out|back in stock|restocked|available|availability|(?:we|i)(?:'ve| have| got| still have| carry)\b(?!\s+(?:noted|added|changed|updated|passed|recorded|made|put|written|taken|logged|set)\b)[^.!?]{0,40}\b(?:it|them|that|some|plenty|enough|left|ready)|\d+\s+(?:left|remaining|in stock)|plenty (?:of|left)|ready (?:for|to) (?:pick ?up|collect))\b/i;
@@ -113,6 +135,16 @@ export function unsupportedClaimCodes(reply: string, sources: string[]): string[
   if (scheduled.some((t) => !lc.includes(t))) codes.push("unverified_schedule");
   if (OFFER_CLAIM.test(reply) && !OFFER_CLAIM.test(corpus)) codes.push("unverified_offer");
   return codes;
+}
+
+/** Notes about facts that approved knowledge does not contain (a knowledge gap), as opposed to other risks. */
+const GAP_NOTES = new Set(
+  ["unverified_answer", "unverified_price", "unverified_link", "unverified_stock", "unverified_schedule", "unverified_offer", "knowledge_changed"].map((c) => NOTE_TEXT[c])
+);
+
+/** Splits readiness notes into "not in approved knowledge" and "other reasons to be careful". */
+export function splitNotes(notes: string[]): { gaps: string[]; risks: string[] } {
+  return { gaps: notes.filter((n) => GAP_NOTES.has(n)), risks: notes.filter((n) => !GAP_NOTES.has(n)) };
 }
 
 /** Staff-readable notes for reason/safety codes (unknown codes are dropped, never shown raw). */
@@ -181,52 +213,172 @@ export function inferVerdict(original: string, final: string): DraftVerdict | nu
 
 // ── Staff-group wording ──────────────────────────────────────────────────────
 
+
 function clip(value: string | null | undefined, max: number): string {
   const t = (value ?? "").replace(/\s+/g, " ").trim();
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
-export const PILOT_COMMAND_HINT = "!approve · !edit <text> · !send <text> · !reject · !status · !teach <fact> · !close";
+/** The commands a notice shows. The advanced ones (!send, !status, !teach, !confirm, !close) still work; they are just not repeated every time. */
+export const NOTICE_COMMANDS = "!approve · !edit <text> · !reject · !moreinfo";
+export const NOTICE_COMMANDS_CONFIRM = "!approve confirm · !edit <text> · !reject · !moreinfo";
+export const NOTICE_COMMANDS_NO_DRAFT = "!send <text> · !moreinfo";
+
+/** The most warnings a notice carries: only what a person must act on before approving. */
+export const MAX_NOTICE_WARNINGS = 2;
+
+/** The few warnings a notice carries: urgent flags first, then why a draft is not customer-ready. At most two, short, nothing technical. */
+export function noticeWarnings(draft: { ready: boolean; notes: string[] } | null, extra: string[] = []): string[] {
+  const out = [...extra];
+  if (draft && !draft.ready) out.push(...draft.notes);
+  return out.map((w) => clip(w, 90)).filter(Boolean).slice(0, MAX_NOTICE_WARNINGS);
+}
 
 export interface PilotNoticeInput {
   refCode: string;
-  priority: string;
   customerLabel: string;
   /** The customer's messages, oldest first. */
   messages: string[];
   draft: { version: number; body: string; ready: boolean; notes: string[] } | null;
-  /** What the AI could not work out (its escalation reason, or the order details still missing). */
-  missing: string[];
-  /** The order collected so far (never confirmed), one short line per item or detail. Empty when this is not an order. */
-  order?: string[];
+  /** Essential, actionable warnings only. Everything else is in the dashboard and in !moreinfo. */
+  warnings?: string[];
 }
 
-/** The primary staff message in Approval Pilot: the request, the AI's independent suggestion, what is uncertain, the commands. */
+function commandLine(draft: PilotNoticeInput["draft"]): string {
+  return !draft ? NOTICE_COMMANDS_NO_DRAFT : draft.ready ? NOTICE_COMMANDS : NOTICE_COMMANDS_CONFIRM;
+}
+
+/**
+ * The primary staff message in Approval Pilot, deliberately short: who, what the customer said, the AI's exact
+ * suggestion (what !approve would send, word for word), the few warnings that matter, and the commands.
+ */
 export function buildPilotNotice(input: PilotNoticeInput): string {
   const shown = input.messages.length > 0 ? input.messages : ["(no text)"];
-  const lines = [`🔔 #${input.refCode} · ${input.priority.toUpperCase()} · ${clip(input.customerLabel, 60)}`];
-  lines.push(`Customer: “${clip(shown[shown.length - 1], 220)}”`);
-  if (shown.length > 1) lines.push(`(+${shown.length - 1} earlier message${shown.length === 2 ? "" : "s"} — see the dashboard)`);
-  lines.push("");
-  if (input.draft) {
-    lines.push(
-      input.draft.ready
-        ? `🤖 AI suggestion v${input.draft.version} — ✅ customer-ready`
-        : `🤖 AI suggestion v${input.draft.version} — ⚠️ confirm the facts before sending`,
-      `“${clip(input.draft.body, 500)}”`
-    );
-    if (!input.draft.ready) for (const n of input.draft.notes) lines.push(`• ${n}`);
-  } else {
-    lines.push("🤖 No AI suggestion — it needs a person to answer.");
-  }
-  const order = (input.order ?? []).filter(Boolean).slice(0, 6);
-  if (order.length > 0) lines.push("", "Order so far (not confirmed):", ...order.map((o) => `• ${clip(o, 120)}`));
-  const missing = input.missing.filter(Boolean).slice(0, 3);
-  if (missing.length > 0) lines.push("", "Missing / uncertain:", ...missing.map((m) => `• ${clip(m, 120)}`));
-  lines.push("", `Reply to this message (or include #${input.refCode}): ${PILOT_COMMAND_HINT}`);
-  lines.push(input.draft && !input.draft.ready ? "Nothing is sent until an authorized person sends. Unconfirmed drafts need “!approve confirm”." : "Nothing is sent until an authorized person sends.");
+  const lines = [`#${input.refCode} · ${clip(input.customerLabel, 60)}`, "", `Customer: “${clip(shown[shown.length - 1], 220)}”`, ""];
+  if (input.draft) lines.push("AI suggests:", `“${clip(input.draft.body, 600)}”`);
+  else lines.push("AI suggests: nothing — it needs a person to answer.");
+  const warnings = noticeWarnings(input.draft, input.warnings ?? []);
+  if (warnings.length > 0) lines.push("", ...warnings.map((w) => `⚠️ ${w}`));
+  lines.push("", commandLine(input.draft));
   return lines.join("\n");
 }
+
+/**
+ * The customer wrote again and the AI re-answered the new state of the conversation. One short replacement notice:
+ * what changed, the new exact suggestion, and a plain statement that the older one can no longer be approved.
+ */
+export function buildPilotUpdateNotice(input: PilotNoticeInput & { changes: string[]; afterStaffReply?: boolean; urgent?: boolean }): string {
+  const lines = [`#${input.refCode} · ${clip(input.customerLabel, 60)} — updated${input.urgent ? " ‼️" : ""}`];
+  const latest = input.messages[input.messages.length - 1];
+  if (latest) lines.push("", `Customer: “${clip(latest, 220)}”`);
+  const changes = input.changes.filter(Boolean).slice(0, 3);
+  if (changes.length > 0) lines.push(`Changed: ${clip(changes.join("; "), 200)}`);
+  lines.push("");
+  if (input.draft) lines.push("AI suggests (replaces the earlier one):", `“${clip(input.draft.body, 600)}”`);
+  else lines.push("AI suggests: nothing — it needs a person to answer.", "The earlier suggestion can no longer be approved.");
+  const warnings = noticeWarnings(input.draft, [...(input.afterStaffReply ? ["The customer changed this after staff replied"] : []), ...(input.warnings ?? [])]);
+  if (warnings.length > 0) lines.push("", ...warnings.map((w) => `⚠️ ${w}`));
+  lines.push("", `Quote this message: ${commandLine(input.draft)}`);
+  return lines.join("\n");
+}
+
+// ── !moreinfo: the full picture, from stored data only ──────────────────────
+
+export interface MoreInfoOrder {
+  ref: string;
+  status: string;
+  /** "2 × Monello Chicken · Large · 15kg" lines. */
+  items: string[];
+  fulfilment: string | null;
+  address: string | null;
+  requestedFor: string | null;
+  notes: string | null;
+  missing: string[];
+  /** Why a person should look (changed after confirmation, possible cancellation, staff wrote in the chat…). */
+  attention: string | null;
+  cancelledReason: string | null;
+}
+
+export interface MoreInfoInput {
+  refCode: string;
+  customerName: string | null;
+  /** Verified phone digits only; null = WhatsApp reported none we can trust. */
+  phone: string | null;
+  priority: string;
+  escalationStatus: string;
+  /** The customer's messages on this request, oldest first. */
+  messages: string[];
+  /** The draft the quoted message showed (or the current one when nothing was quoted). */
+  draft: { version: number; body: string; ready: boolean; notes: string[]; source: string; status: string } | null;
+  currentVersion: number | null;
+  /** The send policy's verdict on this draft right now (read-only): ok, or the plain reason it would be refused. */
+  actionable: { ok: true } | { ok: false; reason: string };
+  /** The customer wrote after the draft was made (it can no longer be approved). */
+  customerWroteSince: boolean;
+  orders: MoreInfoOrder[];
+  /** The request as the escalation holds it, when no tracked order exists. */
+  requestLines: string[];
+  /** Recent order changes, newest first, one line each ("quantity: 2 → 3"). */
+  corrections: string[];
+  missing: string[];
+  /** The AI's reasons to be careful (unverified price/stock/promise, sensitive, low confidence…), plain language. */
+  risks: string[];
+  /** Questions the customer asked that nothing in approved knowledge answers. */
+  knowledgeGaps: string[];
+}
+
+export const MORE_INFO_MAX_CHARS = 3500;
+
+/** Stale labels come first so nobody reads old information as current. */
+export function buildMoreInfo(input: MoreInfoInput): string {
+  const d = input.draft;
+  const stale = Boolean(d && (d.status !== "current" || input.customerWroteSince));
+  const who = [input.customerName ?? "Unnamed customer", input.phone ? `+${input.phone.replace(/^\+/, "")}` : "phone not verified"].join(" · ");
+  const out: string[] = [`ℹ️ #${input.refCode} · ${clip(who, 80)}`, `Request: ${input.escalationStatus} · priority ${input.priority}`];
+
+  if (stale) {
+    const why = d && d.status !== "current" ? `v${d.version} was ${d.status}${input.currentVersion ? ` (current is v${input.currentVersion})` : ""}` : "the customer wrote after this draft was made";
+    out.push(`⚠️ STALE — ${why}. It can't be approved. Details below are what was stored; check the latest message.`);
+  }
+  out.push(
+    input.actionable.ok
+      ? `✅ Actionable: ${d && !d.ready ? "!approve confirm" : "!approve"} would send the draft below.`
+      : `⛔ Not actionable: ${clip(input.actionable.reason, 160)}.`
+  );
+
+  const msgs = input.messages.slice(-6);
+  out.push("", `Customer said${input.messages.length > msgs.length ? ` (last ${msgs.length} of ${input.messages.length})` : ""}:`, ...msgs.map((m) => `• ${clip(m, 220)}`));
+
+  out.push("", d ? `AI draft v${d.version}${d.source === "staff_edit" ? " (edited by staff)" : d.source === "staff_answer" ? " (from a staff answer)" : ""} — ${d.ready ? "customer-ready" : "needs the facts confirmed"}:` : "AI draft: none", ...(d ? [`“${clip(d.body, 700)}”`] : []));
+
+  if (input.orders.length > 0) {
+    out.push("", "Order details:");
+    for (const o of input.orders.slice(0, 4)) {
+      out.push(`• ${o.ref} — ${o.status.replace(/_/g, " ")}`);
+      out.push(`   ${o.items.length > 0 ? o.items.map((i) => clip(i, 80)).join("; ") : "no products yet"}`);
+      const how = o.fulfilment === "delivery" ? "Delivery" : o.fulfilment === "collection" ? "Collection" : "Delivery/collection not stated";
+      out.push(`   ${how}${o.address ? ` — ${clip(o.address, 120)}` : ""}${o.requestedFor ? ` · wanted: ${clip(o.requestedFor, 60)}` : ""}`);
+      if (o.notes) out.push(`   Note: ${clip(o.notes, 120)}`);
+      if (o.missing.length > 0) out.push(`   Missing: ${o.missing.join(", ")}`);
+      if (o.attention) out.push(`   ⚠ ${clip(o.attention, 120)}`);
+      if (o.cancelledReason) out.push(`   Cancelled: ${clip(o.cancelledReason, 80)}`);
+    }
+    if (input.orders.length > 4) out.push(`• (+${input.orders.length - 4} more in the dashboard)`);
+  } else if (input.requestLines.length > 0) {
+    out.push("", "Request so far (not confirmed):", ...input.requestLines.slice(0, 8).map((l) => `• ${clip(l, 120)}`));
+  }
+  if (input.corrections.length > 0) out.push("", "Recent changes and cancellations:", ...input.corrections.slice(0, 6).map((c) => `• ${clip(c, 140)}`));
+  if (input.missing.length > 0) out.push("", "Missing or uncertain:", ...input.missing.slice(0, 6).map((m) => `• ${clip(m, 120)}`));
+  if (input.knowledgeGaps.length > 0) out.push("", "Not in approved knowledge:", ...input.knowledgeGaps.slice(0, 4).map((g) => `• ${clip(g, 140)}`));
+  if (input.risks.length > 0) out.push("", "Why the draft may be risky:", ...input.risks.slice(0, 5).map((r) => `• ${clip(r, 140)}`));
+  out.push("", "Read-only: nothing was changed or sent.");
+  const text = out.join("\n");
+  return text.length > MORE_INFO_MAX_CHARS ? `${text.slice(0, MORE_INFO_MAX_CHARS - 40)}…\n(shortened — see the dashboard)` : text;
+}
+
+/** Spam control: one !moreinfo answer per request every this many seconds, and at most this many per business per 10 minutes. */
+export const MORE_INFO_COOLDOWN_SECONDS = 45;
+export const MORE_INFO_BUSINESS_LIMIT = 12;
 
 /** A new draft version posted in the staff group (after !edit, or drafted from a staff answer). */
 export function buildPilotDraftPost(input: {
@@ -266,7 +418,8 @@ export type PilotRefusal =
   | "loose_approval"
   | "empty_edit"
   | "unsafe_edit"
-  | "duplicate_send";
+  | "duplicate_send"
+  | "moreinfo_not_authorized";
 
 export const PILOT_REFUSAL_TEXT: Record<PilotRefusal, (ref: string, extra?: string) => string> = {
   not_authorized: (ref) => `⚠️ #${ref}: you're not on this business's list of people who can approve or send customer replies — nothing was done. Ask an admin to add you.`,
@@ -285,6 +438,7 @@ export const PILOT_REFUSAL_TEXT: Record<PilotRefusal, (ref: string, extra?: stri
   empty_edit: (ref) => `⚠️ #${ref}: !edit needs the new wording, e.g. “!edit We open at 9am”. Nothing was changed.`,
   unsafe_edit: (ref) => `⚠️ #${ref}: that wording can't be used (it looks like it contains a secret or is too long). Nothing was changed.`,
   duplicate_send: (ref) => `ℹ️ #${ref}: this reply is already on its way — it won't be sent twice.`,
+  moreinfo_not_authorized: (ref) => `⚠️ #${ref}: !moreinfo shows customer details, so it is limited to the people who can approve replies. Ask an admin to add you.`,
 };
 
 /** The sentence staff read when they ask for `!status`. */

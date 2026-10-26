@@ -59,19 +59,17 @@ describe("order slots (pure rules)", () => {
     );
   });
 
-  test("the pilot notice shows the order so far without confirming it", () => {
+  test("the pilot notice stays compact: the order and what is missing are in !moreinfo, not in the notice", () => {
     const text = buildPilotNotice({
       refCode: "E-ABCDE",
-      priority: "normal",
-      customerLabel: "Jane · 17585550101",
+      customerLabel: "Jane",
       messages: ["Collection Friday morning"],
       draft: { version: 1, body: "Thanks Jane, I've noted that.", ready: false, notes: ["Stock, total and delivery for this order still need confirming"] },
-      missing: [],
-      order: ["2 × Monello Chicken 15kg", "Delivery/collection: Collection Friday morning"],
+      warnings: [],
     });
-    assert.match(text, /Order so far \(not confirmed\)/);
-    assert.match(text, /2 × Monello Chicken 15kg/);
-    assert.match(text, /#E-ABCDE/);
+    assert.match(text, /#E-ABCDE · Jane/);
+    assert.match(text, /⚠️ Stock, total and delivery for this order still need confirming/);
+    assert.doesNotMatch(text, /Order so far|Missing \/ uncertain/);
     assert.doesNotMatch(text, /order is confirmed/i);
   });
 });
@@ -243,13 +241,11 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
     let notice = await lastNotice();
     assert.match(notice.body, /#E-/);
     assert.match(notice.body, /Customer: “I want two bags of Monello”/);
-    assert.match(notice.body, /AI suggestion v1 — ✅ customer-ready/);
-    assert.match(notice.body, /Which Monello product and bag size/);
-    assert.match(notice.body, /Order so far \(not confirmed\)/);
-    assert.match(notice.body, /Missing \/ uncertain/);
-    assert.match(notice.body, /Delivery day\/time|Delivery address|How many/);
-    assert.match(notice.body, /!approve/);
-    assert.ok(notice.body.split("\n").length <= 22, "the group message stays concise");
+    assert.match(notice.body, /AI suggests:\n“[^”]*Which Monello product and bag size/);
+    assert.doesNotMatch(notice.body, /⚠️/, "a draft that only asks for the next detail needs no confirmation");
+    assert.doesNotMatch(notice.body, /Order so far|Missing \/ uncertain/, "the order and what is missing are in !moreinfo");
+    assert.match(notice.body, /!approve · !edit <text> · !reject · !moreinfo/);
+    assert.ok(notice.body.split("\n").length <= 9, "the group message stays compact");
 
     // An ordinary !approve (no "confirm") is enough for a pure clarifying question.
     const ok1 = await approveQuoting(notice.whatsapp_message_id);
@@ -277,9 +273,9 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
     assert.equal(escs[1].status, "notified");
     notice = await lastNotice();
     assert.notEqual(notice.escalation_id, escs[0].id);
-    assert.match(notice.body, /AI suggestion v1 — ✅ customer-ready/);
+    assert.match(notice.body, /AI suggests:/);
+    assert.doesNotMatch(notice.body, /⚠️/);
     assert.match(notice.body, /delivery or collection/);
-    assert.match(notice.body, /2 × Monello Chicken 15kg/);
     const ok2 = await approveQuoting(notice.whatsapp_message_id);
     const relay2 = ok2.outbox.filter((o) => o.kind === "staff_relay" && o.send);
     assert.equal(relay2[0].body, "Got it, two 15kg bags of Monello Chicken. Would you like delivery or collection?");
@@ -294,10 +290,9 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
       });
     await customerSays(JANE, "Collection please, Friday morning");
     notice = await lastNotice();
-    assert.match(notice.body, /confirm the facts before sending/, "a complete order is for staff to confirm");
-    assert.match(notice.body, /Stock, total and delivery for this order still need confirming/);
-    assert.match(notice.body, /2 × Monello Chicken 15kg/);
-    assert.match(notice.body, /Collection Friday morning/);
+    assert.match(notice.body, /!approve confirm/, "a complete order is for staff to confirm");
+    assert.match(notice.body, /⚠️/);
+    assert.ok((notice.body.match(/⚠️/g) ?? []).length <= 2, "only the essential warnings");
     assert.doesNotMatch(notice.body, /Address: /, "no address is demanded for a collection");
     const plain = await approveQuoting(notice.whatsapp_message_id);
     assert.equal(plain.outbox.filter((o) => o.kind === "staff_relay").length, 0, "an unconfirmed draft needs !approve confirm");
@@ -327,8 +322,9 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
     await customerSays(JANE, "Actually make it 3, and add one Monello Beef 5kg");
     const all = await notices();
     assert.equal(all.length, 2);
-    assert.match(all[1].body, /Update on #E-/);
-    assert.match(all[1].body, /New AI suggestion v2 — ✅ customer-ready/);
+    assert.match(all[1].body, /^#E-\w+ · .* — updated/);
+    assert.match(all[1].body, /AI suggests \(replaces the earlier one\)/);
+    assert.match(all[1].body, /Quote this message: !approve · !edit <text> · !reject · !moreinfo/);
     assert.match(all[1].body, /Monello Beef 5kg/);
     assert.match(all[1].body, /Monello Chicken 15kg/);
     const d = await drafts();
@@ -366,7 +362,7 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
     script = () => proposal({ reply: "Is that the chicken or the beef?", order_request: order([["Monello", "2"]]) });
     await customerSays(JANE, "and a 15kg one");
     const update = await lastNotice();
-    assert.match(update.body, /New AI suggestion v2/);
+    assert.match(update.body, /AI suggests \(replaces the earlier one\)/);
     await customerSays(JANE, "thanks");
     await approveQuoting(update.whatsapp_message_id);
     assert.equal((await customerBound()).length, 0);
@@ -388,9 +384,8 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
     await customerSays(JANE, "How much is a 15kg bag of Monello?");
     const n = await lastNotice();
     assert.doesNotMatch(n.body, /Order so far/, "a price question is not an order");
-    assert.match(n.body, /confirm the facts before sending/);
+    assert.match(n.body, /!approve confirm/);
     assert.match(n.body, /price in the draft is not in approved knowledge|No approved knowledge/);
-    assert.match(n.body, /Missing \/ uncertain/);
     assert.equal((await rows("select * from public.ai_agent_order_requests")).length, 0);
     const refused = await approveQuoting(n.whatsapp_message_id);
     assert.equal(refused.outbox.filter((o) => o.kind === "staff_relay").length, 0);
@@ -423,7 +418,7 @@ describe("Approval Pilot conversations (real server code, real SQL)", { skip: !p
     };
     await pg.run("update public.ai_agent_escalations set status = 'resolved';");
     await customerSays(JANE, "And the price of the 15kg Monello again?");
-    assert.match((await lastNotice()).body, /✅ customer-ready/);
+    assert.doesNotMatch((await lastNotice()).body, /⚠️/, "customer-ready: no warning");
   });
 
   test("an unauthorized approver and an ineligible customer: nothing is sent, nothing is posted", async () => {

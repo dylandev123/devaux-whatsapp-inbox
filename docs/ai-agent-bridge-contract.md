@@ -59,6 +59,11 @@ One entry per business that has agent settings; each business is configured inde
 for any other business is harmless (answered with `status: "ignored"`, nothing
 written), so a stale cache is safe.
 
+Order monitoring (`docs/ai-agent-daily-orders.md`): with `orders_tracking_enabled` the agent reads **every** forwarded 1:1 customer message for orders,
+including customers the AI may not answer, so the bridge must keep forwarding all inbound 1:1 messages (and human `fromMe` messages) for a business with
+`forwardMessages: true` and must **not** pre-filter by contact scope. Nothing else changes for the bridge; a message it stores but does not forward shows up in
+the report's coverage note.
+
 ### 3.2 `POST /api/bridge/ai-agent/message`
 
 Call **after** the message row is written to `whatsapp_messages`, for:

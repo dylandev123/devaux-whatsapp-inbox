@@ -203,7 +203,7 @@ export function isHumanControlActive(conversation: ConversationControl | null, n
   return new Date(conversation.human_until).getTime() > now.getTime();
 }
 
-function chatKind(chatId: string): "group" | "system" | "direct" {
+export function chatKind(chatId: string): "group" | "system" | "direct" {
   const id = chatId.trim().toLowerCase();
   if (id.endsWith("@g.us")) return "group";
   if (id === "broadcast" || id.endsWith("@broadcast") || id.endsWith("@newsletter")) return "system";
@@ -742,6 +742,35 @@ export function parseModelProposal(raw: string): ModelProposal {
   };
 }
 
+/** What order monitoring asks the model for: the order picture only, never a reply. */
+export interface OrderOnlyProposal {
+  intent: ModelProposal["intent"];
+  order_request: OrderRequestDraft | null;
+  order_target?: string | null;
+  other_orders?: AdditionalOrderDraft[];
+  /** Only meaningful when the NEW message was written by staff: what it says about an existing order. */
+  staff_action: "confirms" | "cancels" | "changes" | null;
+}
+
+/** Strict parse of the order-monitoring JSON. Throws on anything malformed — the caller records a failed analysis. */
+export function parseOrderOnlyProposal(raw: string): OrderOnlyProposal {
+  const cleaned = raw.trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
+  const parsed = JSON.parse(cleaned);
+  if (!parsed || typeof parsed !== "object") throw new Error("Model output is not an object");
+  const intent = ["question", "order", "complaint", "smalltalk", "other"].includes(parsed.intent) ? parsed.intent : "other";
+  const order = parsed.order_request && typeof parsed.order_request === "object" ? parsed.order_request : null;
+  const proposal = parseModelProposal(
+    JSON.stringify({ decision: "ESCALATE", intent, order_request: order, order_target: parsed.order_target, other_orders: parsed.other_orders })
+  );
+  return {
+    intent,
+    order_request: proposal.order_request,
+    ...(proposal.order_target ? { order_target: proposal.order_target } : {}),
+    ...(proposal.other_orders ? { other_orders: proposal.other_orders } : {}),
+    staff_action: ["confirms", "cancels", "changes"].includes(parsed.staff_action) ? parsed.staff_action : null,
+  };
+}
+
 // ── Staff group reply matching ───────────────────────────────────────────────
 
 export interface MatchableEscalation {
@@ -791,7 +820,7 @@ export const AGENT_MESSAGE_MARKERS = [
 ] as const;
 
 /** Approval Pilot's own staff-group posts (a draft version, the AI suggestion block). */
-const PILOT_ECHO = /Draft v\d+ for #E-|AI suggestion v\d+ —|Nothing is sent until an authorized person sends/;
+const PILOT_ECHO = /Draft v\d+ for #E-|AI suggestion v\d+ —|Nothing is sent until an authorized person sends|AI suggests(?: \(replaces the earlier one\))?:|!edit <text> · !reject · !moreinfo|^ℹ️ #E-[A-Z0-9]{4,8} ·/m;
 
 /** True for text the agent itself posts in the staff group (an echo, a forward, a copy-paste). */
 export function looksLikeAgentMessage(text: string): boolean {
@@ -850,12 +879,12 @@ export function matchStaffReply(
     return { kind: "unmatched" };
   }
 
-  if (target.status === "resolved" || target.status === "cancelled") {
+  const stripped = message.text.replace(REF_PATTERN, " ").replace(/\s+/g, " ").trim().replace(/^!more[\s-]+info\b/i, "!moreinfo");
+  const cmd = stripped.match(/^!(send|note|close|takeover|resume|approve|edit|reject|moreinfo|status|teach|confirm|discard)\b\s*/i);
+  // A closed request can still be read (!moreinfo is read-only); every other command is refused.
+  if ((target.status === "resolved" || target.status === "cancelled") && cmd?.[1].toLowerCase() !== "moreinfo") {
     return { kind: "closed", escalationId: target.id, refCode: target.ref_code };
   }
-
-  const stripped = message.text.replace(REF_PATTERN, " ").replace(/\s+/g, " ").trim();
-  const cmd = stripped.match(/^!(send|note|close|takeover|resume|approve|edit|reject|status|teach|confirm|discard)\b\s*/i);
   let command: StaffGroupCommand;
   let body: string;
   if (cmd) {
