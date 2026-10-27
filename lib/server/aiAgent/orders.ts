@@ -816,6 +816,8 @@ export async function flagOrderFromStaff(args: StaffFlagArgs): Promise<{ applied
 
 /** "keep" = staff keep their value for the fields the customer contradicted (`conflictFields`, default all). */
 export type ManualAction = "edit" | "confirm" | "cancel" | "fulfil" | "keep";
+/** "reopen" (undo a completion) is only reachable from the WhatsApp order command, not the dashboard route. */
+type ManualActionInternal = ManualAction | "reopen";
 
 export interface ManualInput {
   businessSlug: string;
@@ -828,7 +830,7 @@ export interface ManualInput {
   idempotencyKey?: string | null;
   /** WhatsApp commands: refuse when a customer/AI/dashboard change landed after the command was written. */
   notChangedSince?: string | null;
-  action: ManualAction;
+  action: ManualActionInternal;
   expectedVersion?: number | null;
   patch?: Partial<Record<EditableOrderField, unknown>>;
   conflictFields?: string[];
@@ -920,7 +922,7 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
   if (input.expectedVersion != null && input.expectedVersion !== order.version) {
     return fail(409, "This order changed since you opened it — reload and try again", "conflict");
   }
-  if (!isOpenStatus(order.status)) return fail(409, `The order is already ${order.status}`, "closed");
+  if (action === "reopen" ? order.status !== "fulfilled" : !isOpenStatus(order.status)) return fail(409, `The order is already ${order.status}`, "closed");
   if (input.notChangedSince && (await changedSince(order.id, input.notChangedSince))) {
     return fail(409, "This order changed after the command was written", "stale");
   }
@@ -982,12 +984,18 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
     cancelledAt = now;
     cancelReason = (input.reason ?? "").trim().slice(0, 300) || "cancelled by staff";
     changes.status = { before: order.status, after: status, reason: cancelReason };
+  } else if (action === "reopen") {
+    // Back to where completion found it: confirmed if a person had confirmed it, else by what the order still lacks.
+    status = order.confirmed_at ? "confirmed" : isComplete(computeMissing(fields)) ? "awaiting_confirmation" : "possible";
+    changes.status = { before: order.status, after: status };
+    changes.fulfilled_at = { before: order.fulfilled_at, after: null };
   } else if (action === "keep") {
     if (settle(input.conflictFields ?? Object.keys(conflicts)) === 0) return fail(400, "Nothing to keep", "invalid");
   } else {
     status = "fulfilled";
     fulfilledAt = now;
     changes.status = { before: order.status, after: status };
+    changes.fulfilled_at = { before: null, after: now };
   }
 
   const row: OrderRow = {
@@ -1519,7 +1527,13 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
 
   // ── a change ──
   const action = command.action;
-  if (!isOpenStatus(order.status)) return reject("closed", ORDER_REPLY.closed(order));
+  // A redelivery of a message that already completed/reopened the order falls through to its idempotent path below.
+  const redelivered = (action.type === "complete" || action.type === "reopen") && (await keyExists(`wa:${slug}:${args.whatsappMessageId}`));
+  if (!redelivered) {
+    if (action.type === "complete" && order.status === "fulfilled") return reject("no_change", ORDER_REPLY.alreadyCompleted(order));
+    if (action.type === "reopen" && order.status !== "fulfilled") return reject("no_change", ORDER_REPLY.notCompleted(order));
+    if (action.type !== "reopen" && !isOpenStatus(order.status)) return reject("closed", ORDER_REPLY.closed(order));
+  }
   const writtenAt = args.timestamp && !Number.isNaN(Date.parse(args.timestamp)) ? args.timestamp : null;
   if (writtenAt && now.getTime() - Date.parse(writtenAt) > MAX_COMMAND_AGE_MS) {
     return reject("too_old", `⚠️ That command was written more than 2 hours ago, so it was not applied to ${displayRefText(order)}. Send it again if it is still right.`);
@@ -1544,6 +1558,14 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
       success = (o) => ORDER_REPLY.confirmed(o, order.status, names);
       break;
     }
+    case "complete":
+      run = updateOrderManually({ ...base, action: "fulfil" });
+      success = (o) => ORDER_REPLY.completed(o, names);
+      break;
+    case "reopen":
+      run = updateOrderManually({ ...base, action: "reopen" });
+      success = (o) => ORDER_REPLY.reopened(o, names);
+      break;
     case "cancel":
       run = updateOrderManually({ ...base, action: "cancel", reason: "cancelled by staff via WhatsApp" });
       success = (o) => ORDER_REPLY.cancelled(o, order.status, names);

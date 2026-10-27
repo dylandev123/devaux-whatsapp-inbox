@@ -104,6 +104,11 @@ async function makeOrder(c: Customer, text: string, d: Draft = draft(), at: stri
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const refOf = (prefix: string, i: number) => `O-${prefix.slice(0, 3)}${ALPHABET[Math.floor(i / 32)]}${ALPHABET[i % 32]}`.slice(0, 7);
 const ORDER_TEXT = "a bag of Monello Chicken 25kg, bring it to Cap Estate";
+/** "!update" has a cooldown between manual reports; tests that read it several times clear it first. */
+const freshReport = async () => {
+  await pg.run("truncate public.ai_agent_order_summary_runs;");
+  return reply(await groupSays("!update"));
+};
 const reply = (res: { outbox: { body: string; to: string }[] }) => res.outbox.map((o) => o.body).join("\n---\n");
 
 describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvailable && "PostgreSQL binaries not installed" }, () => {
@@ -554,6 +559,115 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.doesNotMatch(text, /\?|quantity needed|Needs quantity/);
     assert.match(reply(await groupSays(`!moreinfo ${ref(o)}`)), /• Monello — quantity needed/);
     assert.equal((await allOrders())[0].items[0].quantity, null);
+  });
+
+  // ── Completing and reopening ───────────────────────────────────────────────
+
+  test("!order #REF completed marks it completed with time and staff identity, and it leaves !update", async () => {
+    const jane = await makeOrder(JANE, ORDER_TEXT);
+    const marcus = await makeOrder(MARCUS, ORDER_TEXT);
+    const calls = modelCalls;
+    const res = await groupSays(`!order ${ref(jane)} completed`);
+    assert.equal(res.outbox.length, 1);
+    assert.equal(res.outbox[0].to, GROUP);
+    assert.match(res.outbox[0].body, new RegExp(`✔️ ${ref(jane)} .*: completed\\. .*The customer was not messaged\\.`));
+    const after = (await allOrders()).find((o) => o.id === jane.id)!;
+    assert.equal(after.status, "fulfilled");
+    assert.ok(after.fulfilled_at);
+    const last = (await orderEvents(jane.id)).at(-1)!;
+    assert.deepEqual([last.kind, last.actor_kind, last.actor_id], ["staff_whatsapp_fulfil", "staff", "17585550001"]);
+    assert.deepEqual(last.changes.status, { before: "awaiting_confirmation", after: "fulfilled" });
+    assert.equal(await auditCount("order.fulfil"), 1);
+    // Gone from the report, the other order stays; history and the order itself are kept and still viewable.
+    const report = await freshReport();
+    assert.doesNotMatch(report, new RegExp(ref(jane)));
+    assert.match(report, new RegExp(ref(marcus)));
+    const info = reply(await groupSays(`!order ${ref(jane)}`));
+    assert.match(info, /Status: Completed/);
+    assert.match(info, /Completed .* by 17585550001/);
+    assert.match(reply(await groupSays("!order jane")), /No active order matches/);
+    // No model call, no customer message, no delivery side effect.
+    assert.equal(modelCalls, calls);
+    assert.equal(await customerBound(), 0);
+    assert.equal(await notToAGroup(), 0);
+  });
+
+  test("completing twice (same message or a new one) adds no second event and no second notice", async () => {
+    const o = await makeOrder(JANE, ORDER_TEXT);
+    const first = await groupSays(`!order ${ref(o)} completed`, { id: "DONE-1" });
+    const redelivered = await groupSays(`!order ${ref(o)} completed`, { id: "DONE-1" });
+    assert.equal(first.outbox.length, 1);
+    assert.equal(redelivered.status, "duplicate");
+    // A worker retry that gets past the message log: same WhatsApp message, new internal event.
+    const base = { settings: await settingsOf(), fromGroup: GROUP, command: { kind: "update" as const, selector: { type: "ref" as const, ref: o.ref_code }, action: { type: "complete" as const } },
+      senderAuth: { authorized: true, senderId: "17585550001" }, senderJid: STAFF, whatsappMessageId: "DONE-1", timestamp: new Date().toISOString(), now: new Date() };
+    const retry = await orders.handleOrderCommand({ ...base, eventId: "evt-retry" });
+    assert.equal(retry.outbox[0].dedupeKey, "ordercmd:dog_food:DONE-1:ack", "keyed by the WhatsApp message, so the group sees one notice");
+    const again = await groupSays(`!order ${ref(o)} completed`);
+    assert.match(reply(again), /already completed — no change/);
+    const fulfilEvents = (await orderEvents(o.id)).filter((e) => e.kind === "staff_whatsapp_fulfil");
+    assert.equal(fulfilEvents.length, 1);
+    assert.equal((await allOrders())[0].version, o.version + 1);
+  });
+
+  test("!order #REF reopen restores a completed order to its working state; reopening twice or an open order changes nothing", async () => {
+    const o = await makeOrder(JANE, ORDER_TEXT);
+    await groupSays(`!update ${ref(o)} confirmed`);
+    await groupSays(`!order ${ref(o)} completed`);
+    assert.doesNotMatch(await freshReport(), new RegExp(ref(o)));
+    const res = await groupSays(`!order ${ref(o)} reopen`, { id: "REOPEN-1" });
+    assert.match(reply(res), new RegExp(`↩️ ${ref(o)} .*: reopened \\(confirmed\\)\\. It shows in !update again\\.`));
+    const [after] = await allOrders();
+    assert.equal(after.status, "confirmed");
+    assert.equal(after.fulfilled_at, null);
+    assert.match(await freshReport(), new RegExp(ref(o)));
+    const events = await orderEvents(o.id);
+    assert.deepEqual(events.at(-1)!.changes.status, { before: "fulfilled", after: "confirmed" });
+    assert.equal(events.at(-1)!.actor_id, "17585550001");
+    assert.equal(events.filter((e) => e.kind === "staff_whatsapp_fulfil").length, 1, "the completion stays in the history");
+    assert.equal((await groupSays(`!order ${ref(o)} reopen`, { id: "REOPEN-1" })).status, "duplicate");
+    assert.match(reply(await groupSays(`!order ${ref(o)} reopen`)), /is not completed \(confirmed\) — nothing to reopen/);
+    assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "staff_whatsapp_reopen").length, 1);
+    // An order that was never confirmed returns to awaiting confirmation.
+    const m = await makeOrder(MARCUS, ORDER_TEXT);
+    await groupSays(`!order ${ref(m)} completed`);
+    await groupSays(`!order ${ref(m)} reopen`);
+    assert.equal((await allOrders()).find((x) => x.id === m.id)!.status, "awaiting_confirmation");
+    assert.equal(await customerBound(), 0);
+  });
+
+  test("completing needs an authorized sender in the configured group; a stranger, another group or another business changes nothing", async () => {
+    const o = await makeOrder(JANE, ORDER_TEXT);
+    assert.match(reply(await groupSays(`!order ${ref(o)} completed`, { sender: STRANGER })), /Only authorized staff/);
+    assert.match(reply(await groupSays(`!order ${ref(o)} completed`, { sender: null })), /Only authorized staff/);
+    assert.equal((await groupSays(`!order ${ref(o)} completed`, { group: OTHER_GROUP })).status, "ignored");
+    assert.match(reply(await groupSays(`!order ${ref(o)} completed`, { group: SEA_GROUP, biz: "by_sea" })), /No order .* found\. Nothing changed\./);
+    assert.equal((await allOrders())[0].status, "awaiting_confirmation");
+    // Reopening is guarded the same way.
+    await groupSays(`!order ${ref(o)} completed`);
+    assert.match(reply(await groupSays(`!order ${ref(o)} reopen`, { sender: STRANGER })), /Only authorized staff/);
+    assert.equal((await groupSays(`!order ${ref(o)} reopen`, { group: SEA_GROUP, biz: "by_sea" })).outbox.length, 1);
+    assert.equal((await allOrders())[0].status, "fulfilled");
+    assert.equal((await orderEvents(o.id)).length, 2, "only the creation and the one authorized completion");
+  });
+
+  test("a missing order, a cancelled order or a non-reference selector is refused without a change", async () => {
+    const o = await makeOrder(JANE, ORDER_TEXT);
+    assert.match(reply(await groupSays("!order #ZZZZ9 completed")), /No order #ZZZZ9 found\. Nothing changed\./);
+    assert.match(reply(await groupSays("!order #ZZZZ9 reopen")), /No order #ZZZZ9 found/);
+    assert.match(reply(await groupSays("!order jane completed")), /Order commands/);
+    assert.equal((await allOrders())[0].status, "awaiting_confirmation");
+    await groupSays(`!update ${ref(o)} cancelled`);
+    assert.match(reply(await groupSays(`!order ${ref(o)} completed`)), /is already cancelled — nothing changed/);
+    assert.match(reply(await groupSays(`!order ${ref(o)} reopen`)), /is not completed \(cancelled\)/);
+    assert.equal((await allOrders())[0].status, "cancelled");
+  });
+
+  test("a completed order cannot be edited by !update until it is reopened", async () => {
+    const o = await makeOrder(JANE, ORDER_TEXT);
+    await groupSays(`!order ${ref(o)} completed`);
+    assert.match(reply(await groupSays(`!update ${ref(o)} 5 bags`)), /is already completed — nothing changed/);
+    assert.equal((await allOrders())[0].items[0].quantity, "1");
   });
 
   // ── The report ─────────────────────────────────────────────────────────────

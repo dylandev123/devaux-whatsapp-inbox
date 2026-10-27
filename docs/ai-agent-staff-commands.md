@@ -29,7 +29,7 @@ Every command is read from the START of a message and is handled before escalati
 
 ## Orders (unchanged; documented in `!rules`)
 
-`!update` (today's report), `!update #REF confirmed|cancelled|2 bags|delivery tomorrow`, `!order <name|phone|#REF>`, `!moreinfo #REF` —
+`!update` (today's report), `!update #REF confirmed|cancelled|2 bags|delivery tomorrow`, `!order <name|phone|#REF>`, `!order #REF completed`, `!order #REF reopen`, `!moreinfo #REF` —
 in the Orders group (the staff group unless a separate Orders group is set). There is no `!orders`, `!done` or order `!confirm`:
 `!confirm K-ABCD` still means *approve a suggested knowledge fact* and nothing else.
 

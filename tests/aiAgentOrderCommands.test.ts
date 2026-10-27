@@ -48,6 +48,25 @@ const order = (over: Partial<TrackedOrder> = {}): TrackedOrder => ({
   ...over,
 });
 
+describe("completed / reopen parsing", () => {
+  test("!order <REF> completed|reopen parses to an update action on a reference", () => {
+    for (const [text, type] of [["!order #QU6U9 completed", "complete"], ["!order #qu6u9 Complete", "complete"], ["!order QU6U9 reopen", "reopen"], ["!order #QU6U9 reopened", "reopen"]] as const) {
+      assert.deepEqual(parseOrderCommand(text), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type } }, text);
+    }
+  });
+  test("only a reference can complete or reopen; a name or phone gets help; plain lookups are unchanged", () => {
+    assert.deepEqual(parseOrderCommand("!order jane completed"), { kind: "help", reason: "order" });
+    assert.deepEqual(parseOrderCommand("!order 17582867466 reopen"), { kind: "help", reason: "order" });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9"), { kind: "info", selector: { type: "ref", ref: "O-QU6U9" } });
+    assert.deepEqual(parseOrderCommand("!order jane"), { kind: "search", query: "jane" });
+    assert.equal(parseOrderCommand("!update #QU6U9 completed")?.kind, "help");
+  });
+  test("completed orders read as completed in replies", () => {
+    assert.match(ORDER_REPLY.closed(order({ status: "fulfilled" })), /already completed/);
+    assert.match(moreInfoReply({ order: order({ status: "fulfilled", fulfilled_at: "2026-10-27T15:05:00Z" }), name: undefined, events: [{ kind: "staff_whatsapp_fulfil", actor_kind: "staff", actor_id: "17585550001@s.whatsapp.net", created_at: "2026-10-27T15:05:00Z", changes: { status: { before: "confirmed", after: "fulfilled" } } }], timezone: "America/St_Lucia" }), /Status: Completed\nPhone[\s\S]*Completed 27 Oct, 11:05 by 17585550001$/m);
+  });
+});
+
 describe("compact references", () => {
   test("O-QU6U9 is shown and typed as #QU6U9, in any case", () => {
     assert.equal(displayRef("O-QU6U9"), "#QU6U9");

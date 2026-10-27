@@ -44,7 +44,7 @@ export const STAFF_COMMANDS: readonly CommandDoc[] = [
 
   // ── Orders ──
   { name: "update", section: "Orders", usage: "!update [#REF confirmed|cancelled|2 bags|delivery tomorrow]", summary: "Alone: today's order report. With an order code: confirm, cancel or change that order.", example: "!update #QU6U9 confirmed", needs: "Used in the Orders group (the staff group unless a separate Orders group is set).", who: "authorized", readOnly: false },
-  { name: "order", section: "Orders", usage: "!order <name, phone or #REF>", summary: "Find active orders, or show one order in full.", example: "!order #QU6U9", needs: "Used in the Orders group.", who: "authorized", readOnly: true },
+  { name: "order", section: "Orders", usage: "!order <name, phone or #REF> | #REF completed | #REF reopen", summary: "Find active orders, show one in full, mark it completed (leaves !update; history kept; customer not messaged) or reopen it.", example: "!order #QU6U9 completed", needs: "Used in the Orders group. Completing needs the order code.", who: "authorized", readOnly: false },
 
   // ── AI Learning ──
   { name: "teach", section: "AI Learning", usage: "!teach [for 6h|until YYYY-MM-DD] <fact>", summary: "Propose a business fact for the AI to learn.", example: "!teach We deliver to Gros Islet on Fridays", needs: "Optional: quote a request to tie the fact to it.", who: "authorized", readOnly: false },

@@ -144,6 +144,8 @@ can message a customer.
 | `!update #QU6U9 delivery tomorrow` | Sets the requested delivery day. "tomorrow"/weekdays are turned into a calendar day from when the command was written, in the business's timezone. |
 | `!order <name or phone>` | Lists matching **active** orders (up to 5). |
 | `!moreinfo #QU6U9` or `!order #QU6U9` | Full details: status, phone, name and where it came from, items, delivery, who edited what, the last 5 changes. |
+| `!order #QU6U9 completed` | Marks the order completed (status `fulfilled`, `fulfilled_at` set, staff sender recorded as the event's actor). It leaves `!update` and `!order <name>` at once; the order and its history stay and `!order #QU6U9` still shows it ("Completed … by …"). Internal only: nothing is sent to the customer and no delivery is triggered. Needs a reference, not a name or phone. Repeating it (same or new message) changes nothing and records no second event. |
+| `!order #QU6U9 reopen` | Undoes a completion: back to `confirmed` if a person had confirmed it, otherwise `awaiting_confirmation` (or `possible` if details are missing). Only for completed orders; cancelled ones stay cancelled. |
 
 Rules: a selector (`#REF`, a phone number of 6+ digits, or a name) must identify exactly **one** active order; with two or more nothing changes and the
 choices are listed. References also find closed orders (to say "already cancelled"). A change goes through the **same function as the dashboard's buttons**

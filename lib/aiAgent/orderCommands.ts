@@ -9,6 +9,8 @@
 //   !update #QU6U9 delivery tomorrow   change the requested delivery date
 //   !order <name or phone>          search active orders
 //   !order #QU6U9 / !moreinfo #QU6U9   full details of one order
+//   !order #QU6U9 completed         mark it done (status "fulfilled"): it leaves !update, its history stays
+//   !order #QU6U9 reopen            undo an accidental completion
 //
 // A selector is a reference (#QU6U9), a phone number, or a customer name. Whatever it is, it must identify exactly ONE
 // active order; with two or more matches nothing is changed and the choices are listed. No model is involved.
@@ -38,7 +40,9 @@ export type UpdateAction =
   | { type: "confirm" }
   | { type: "cancel" }
   | { type: "quantity"; quantity: number }
-  | { type: "delivery"; when: string };
+  | { type: "delivery"; when: string }
+  | { type: "complete" }
+  | { type: "reopen" };
 
 export type OrderCommand =
   | { kind: "report" }
@@ -109,6 +113,12 @@ export function parseOrderCommand(raw: string): OrderCommand | null {
   if (m) {
     const query = m[1].trim();
     if (!query) return { kind: "help", reason: "order" };
+    // Completing or reopening needs an order REFERENCE: a name or phone could match the wrong order.
+    const done = query.match(/^(.*?)\s+(complete|completed|reopen|reopened)$/i);
+    if (done) {
+      const sel = parseSelector(done[1]);
+      return sel?.type === "ref" ? { kind: "update", selector: sel, action: { type: /^reopen/i.test(done[2]) ? "reopen" : "complete" } } : { kind: "help", reason: "order" };
+    }
     const s = parseSelector(query);
     if (s?.type === "ref") return { kind: "info", selector: s };
     return query.length <= MAX_SELECTOR ? { kind: "search", query } : { kind: "help", reason: "order" };
@@ -181,7 +191,7 @@ const label = (o: TrackedOrder, names?: OrderNames) => `${displayRef(o.ref_code)
 
 const itemsOneLine = (o: TrackedOrder) => (o.items.length > 0 ? o.items.map(orderItemText).join("; ") : "no products yet");
 
-const STATUS_NAME: Record<string, string> = { possible: "possible", awaiting_confirmation: "awaiting confirmation", confirmed: "confirmed", fulfilled: "fulfilled", cancelled: "cancelled" };
+const STATUS_NAME: Record<string, string> = { possible: "possible", awaiting_confirmation: "awaiting confirmation", confirmed: "confirmed", fulfilled: "completed", cancelled: "cancelled" };
 
 export const ORDER_HELP = [
   "ℹ️ Order commands:",
@@ -189,6 +199,8 @@ export const ORDER_HELP = [
   "!update #REF confirmed | cancelled | 2 bags | delivery tomorrow",
   "!order <name or phone> — find an order",
   "!moreinfo #REF — order details",
+  "!order #REF completed — mark done (leaves !update)",
+  "!order #REF reopen — undo a completion",
   "#REF is the code shown in the report, e.g. #QU6U9.",
 ].join("\n");
 
@@ -202,7 +214,12 @@ export const ORDER_REPLY = {
       ...(orders.length > 5 ? [`…and ${orders.length - 5} more`] : []),
       "Example: !update #REF confirmed",
     ].join("\n"),
-  closed: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is already ${o.status} — nothing changed.`,
+  closed: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is already ${STATUS_NAME[o.status] ?? o.status} — nothing changed.`,
+  alreadyCompleted: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is already completed — no change.`,
+  notCompleted: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is not completed (${STATUS_NAME[o.status] ?? o.status}) — nothing to reopen.`,
+  // Internal bookkeeping only, like confirmation: the customer is not told and nothing is delivered or sent.
+  completed: (o: TrackedOrder, names?: OrderNames) => `✔️ ${label(o, names)}: completed. It no longer shows in !update. The customer was not messaged. Undo: !order ${displayRef(o.ref_code)} reopen`,
+  reopened: (o: TrackedOrder, names?: OrderNames) => `↩️ ${label(o, names)}: reopened (${STATUS_NAME[o.status] ?? o.status}). It shows in !update again.`,
   alreadyConfirmed: (o: TrackedOrder, names?: OrderNames) => `ℹ️ ${label(o, names)} is already confirmed — no change.`,
   // Internal bookkeeping only: nothing here is, or implies, a message to the customer.
   confirmed: (o: TrackedOrder, before: string, names?: OrderNames) =>
@@ -234,6 +251,7 @@ export function searchReply(query: string, found: TrackedOrder[], names?: OrderN
 export interface OrderEventLine {
   kind: string;
   actor_kind: string;
+  actor_id?: string | null;
   created_at: string;
   changes: Record<string, { before?: unknown; after?: unknown }>;
 }
@@ -255,6 +273,12 @@ function changeText(changes: OrderEventLine["changes"]): string {
 
 const NAME_SOURCE_TEXT: Record<string, string> = { staff: "entered by staff", saved: "saved contact", profile: "WhatsApp profile name" };
 
+/** "Completed 27 Oct, 14:05 by 1758…" from the order's own record and the event that completed it. */
+function completionLine(o: TrackedOrder, events: (OrderEventLine & { actor_id?: string | null })[], when: (iso: string | null) => string | null): string {
+  const by = events.find((e) => (e.changes?.status as { after?: unknown } | undefined)?.after === "fulfilled")?.actor_id;
+  return `Completed ${when(o.fulfilled_at) ?? ""}${by ? ` by ${clip(by.replace(/@.*$/, ""), 30)}` : ""}`.trim();
+}
+
 /** Everything the dashboard has about one order, short enough for WhatsApp. */
 export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | undefined; events: OrderEventLine[]; timezone: string }): string {
   const { order: o, name, events, timezone } = args;
@@ -273,7 +297,7 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
         ? `Awaiting confirmation${o.customer_confirmed_at ? " (customer replied yes — staff to verify)" : ""}`
         : o.status === "possible"
           ? "Possible order — details incomplete"
-          : o.status.charAt(0).toUpperCase() + o.status.slice(1);
+          : (o.status === "fulfilled" ? "Completed" : o.status.charAt(0).toUpperCase() + o.status.slice(1));
   const lines = [
     `🔎 *${orderDisplayName(o, name ? { [o.id]: name } : undefined) ?? phone ?? "Unknown customer"} · ${displayRef(o.ref_code)}*`,
     `Status: ${status}`,
@@ -287,6 +311,7 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     ...(o.attention ? [`⚠️ ${clip(o.attention.replace(/_/g, " "), 60)}`] : []),
     `First message ${when(o.first_message_at) ?? "?"} · last ${when(o.last_message_at) ?? "?"}`,
     ...(o.manual_locked_fields.length > 0 ? [`Edited by staff: ${o.manual_locked_fields.join(", ").replace(/_/g, " ")}`] : []),
+    ...(o.status === "fulfilled" ? [completionLine(o, events, when)] : []),
     ...(o.status === "cancelled" ? [`Cancelled ${when(o.cancelled_at) ?? ""}${o.cancel_reason ? ` — ${clip(o.cancel_reason, 80)}` : ""}`.trim()] : []),
   ];
   // Values taken from the customer's earlier orders rather than from this conversation, so staff can check them.
