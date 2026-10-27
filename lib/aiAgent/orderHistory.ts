@@ -67,15 +67,18 @@ export interface HistoryCue {
 const USUAL = /\b(?:the |my )?usual\b|\bas (?:usual|always)\b|\bsame as always\b|\bregular order\b/i;
 const SAME_PRODUCT = /\bsame\s+(?!as\b|again\b|order\b|thing\b|stuff\b|one\b|location\b|place\b|address\b|spot\b)([a-z0-9][a-z0-9 ]{1,30}?)\s+(?:as|like)\s+(?:last time|before|usual|previously)\b/i;
 const SAME_LOCATION = /\bsame\s+(?:location|place|address|spot|delivery (?:address|location|spot))\b|\b(?:deliver|bring|send|drop)\w*\s+(?:it\s+|them\s+)?(?:to\s+|at\s+)?the same (?:place|location|address|spot)\b/i;
+// "My usual location" points at the PLACE, not at the usual order: it must not also trigger an items repeat.
+const USUAL_PLACE = /\b(?:the |my )?(?:usual|regular|normal|default|saved)\s+(?:delivery\s+)?(?:location|place|address|spot)\b/i;
 const ELSEWHERE = /\b(?:some|any)(?:where|place) else\b|\b(?:a |an )?(?:different|another|new|other) (?:location|place|address|spot)\b/i;
 const THIS_TIME = /\bthis time\b/i;
 
 export function detectHistoryCue(texts: string[]): HistoryCue {
   const text = texts.join("\n");
   const elsewhere = ELSEWHERE.test(text);
-  const sameLocation = !elsewhere && SAME_LOCATION.test(text);
-  const usual = USUAL.test(text);
-  const last = detectRepeatOrderRequest(text.replace(USUAL, ""));
+  const sameLocation = !elsewhere && (SAME_LOCATION.test(text) || USUAL_PLACE.test(text));
+  const withoutPlace = text.replace(USUAL_PLACE, " ");
+  const usual = USUAL.test(withoutPlace);
+  const last = detectRepeatOrderRequest(withoutPlace.replace(USUAL, ""));
   const thisTime = THIS_TIME.test(text);
   const repeat: HistoryCue["repeat"] = usual ? "usual" : last || thisTime ? "last" : null;
   const named = repeat ? SAME_PRODUCT.exec(text)?.[1] : undefined;
@@ -151,6 +154,9 @@ export function usualOrder(pool: HistoryOrder[]): { lines: OrderLine[]; ref: str
 
 // ── Resolving a turn against the history ─────────────────────────────────────
 
+/** Where a filled address came from when it is the staff-saved default rather than an earlier order's reference. */
+export const SAVED_LOCATION_SOURCE = "saved location";
+
 export interface HistoryFill {
   /** Lines to add where the order does not already hold that product. */
   items: OrderLine[];
@@ -172,6 +178,8 @@ export interface FillContext {
   /** The lines the customer's own words (and the model's grounded reading) already give this turn. */
   draftItems: OrderLine[];
   draftAddress: string | null;
+  /** The customer's staff-saved default delivery location, if any. "Same place" / "usual location" resolve to it first. */
+  defaultLocation?: string | null;
 }
 
 const emptyFill = (): HistoryFill => ({ items: [], address: null, setDelivery: false, clearAddress: false, sources: {}, unresolved: [] });
@@ -207,6 +215,11 @@ export function resolveFromHistory(history: HistoryOrder[], cue: HistoryCue, tur
 
   if (cue.elsewhere) {
     fill.clearAddress = Boolean(ctx.current?.delivery_address);
+  } else if (cue.sameLocation && !ctx.draftAddress && !ctx.current?.delivery_address && ctx.defaultLocation) {
+    // The location staff saved for this customer beats an address inferred from their last order.
+    fill.address = ctx.defaultLocation;
+    fill.setDelivery = ctx.current?.fulfilment_method !== "collection";
+    fill.sources.delivery_address = SAVED_LOCATION_SOURCE;
   } else if (cue.sameLocation && !ctx.draftAddress && !ctx.current?.delivery_address) {
     const place = history.filter((o) => !(ctx.current && o.id === ctx.current.id) && hasVerifiedAddress(o)).sort(newest)[0];
     if (!place) fill.unresolved.push("delivery_address: no verified earlier address");

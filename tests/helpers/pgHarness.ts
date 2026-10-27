@@ -29,6 +29,8 @@ const MIGRATIONS = [
   "20261103000000_ai_agent_order_field_conflicts.sql",
   "20261104000000_ai_agent_auto_learning.sql",
   "20261105000000_ai_agent_learning_refinements.sql",
+  "20261106000000_ai_agent_customer_staff_memory.sql",
+  "20261107000000_ai_agent_staff_memory_clear_expiry.sql",
 ];
 
 const BOOTSTRAP = `

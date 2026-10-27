@@ -14,6 +14,7 @@
 //                'Needs adding', and open order requests. Never a purchase.
 
 import type { ChatIdentity } from "./identity.ts";
+import { detectSavedLocationCue } from "./customerCommands.ts";
 import { detectPromptInjection, type OrderItem, type OrderRequestDraft } from "./engine.ts";
 
 // ── Keys: who a memory belongs to ────────────────────────────────────────────
@@ -325,6 +326,12 @@ export interface MemoryBrief {
   /** customer_ai_profile fields: AI inferences, may be stale or wrong. */
   inferences: Record<string, string>;
   repeat: RepeatResolution;
+  /** Staff-saved default delivery location (!location). Absent/null = none saved. Never inferred from orders. */
+  defaultLocation?: { value: string; setAt: string | null } | null;
+  /** Staff-confirmed customer notes (!remember). Kept apart from customer-stated facts and from business knowledge. */
+  staffNotes?: string[];
+  /** The customer's message points at their saved place ("same place", "usual location"). */
+  savedLocationCue?: boolean;
 }
 
 export const EMPTY_BRIEF: MemoryBrief = {
@@ -340,6 +347,7 @@ const MAX_VERIFIED_WHEN_REPEAT = 5;
 const MAX_UNCONFIRMED = 2;
 const MAX_FACTS = 6;
 const MAX_INFERENCE_CHARS = 200;
+const MAX_STAFF_NOTES = 6;
 
 export function buildMemoryBrief(input: {
   orders: OrderRecord[];
@@ -347,6 +355,7 @@ export function buildMemoryBrief(input: {
   profile: Record<string, string>;
   messageText: string;
   now: Date;
+  staffMemory?: { location: { value: string; setAt: string | null } | null; notes: string[] };
 }): MemoryBrief {
   const repeat = resolveRepeatOrder(input.orders, input.messageText);
   const usable = input.orders.filter((o) => !o.excluded).sort(newestFirst);
@@ -379,6 +388,9 @@ export function buildMemoryBrief(input: {
     facts: ranked,
     inferences,
     repeat,
+    defaultLocation: input.staffMemory?.location ?? null,
+    staffNotes: (input.staffMemory?.notes ?? []).slice(0, MAX_STAFF_NOTES),
+    savedLocationCue: detectSavedLocationCue(input.messageText),
   };
 }
 
@@ -405,6 +417,17 @@ export function renderMemoryBrief(brief: MemoryBrief): string {
   if (brief.facts.length) {
     lines.push("REMEMBERED FACTS:", brief.facts.map((f) => `- ${FACT_LABEL[f.kind]}: ${f.content}`).join("\n"));
   }
+  if (brief.staffNotes?.length) {
+    lines.push("STAFF NOTES ABOUT THIS CUSTOMER (confirmed by staff; internal, do not quote them to the customer):", brief.staffNotes.map((n) => `- ${n}`).join("\n"));
+  }
+  if (brief.defaultLocation) {
+    lines.push(
+      `SAVED DELIVERY LOCATION (set by staff, verified): ${brief.defaultLocation.value}`,
+      "Use it only when the customer says same/usual place or location, and say it back so they can confirm. If they give a different address, that is for this order only: never say the saved location was changed (only staff can change it)."
+    );
+  } else if (brief.savedLocationCue) {
+    lines.push("The customer pointed at a saved/usual delivery place but NO location is saved for them. Do NOT guess one: ask where to deliver.");
+  }
   if (Object.keys(brief.inferences).length) {
     lines.push("AI INFERENCES (unverified, may be stale or wrong; never state them as fact):", JSON.stringify(brief.inferences));
   }
@@ -423,6 +446,7 @@ export function renderMemoryBrief(brief: MemoryBrief): string {
 export function historyLinesForStaff(brief: MemoryBrief): string[] {
   const clip = (s: string) => (s.length > 130 ? `${s.slice(0, 129)}…` : s);
   const out: string[] = [];
+  if (brief.defaultLocation) out.push(`📍 Saved delivery location: ${brief.defaultLocation.value}`);
   for (const o of brief.verifiedOrders.slice(0, 2)) out.push(`✔ Confirmed order: ${o.description}`);
   for (const o of brief.unconfirmedOrders.slice(0, 1)) out.push(`✘ Earlier request, never confirmed: ${o.description}`);
   for (const f of brief.facts) {

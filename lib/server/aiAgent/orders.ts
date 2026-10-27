@@ -42,6 +42,7 @@ import {
   resolveFromHistory,
   upgradeGenericLines,
 } from "@/lib/aiAgent/orderHistory";
+import { loadStaffLocationSafe } from "@/lib/server/aiAgent/customerStaffMemory";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
 import {
   buildOrderSummary,
@@ -581,6 +582,9 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   if (args.useHistory !== false && args.history === undefined && pointsBack) {
     history = await loadCustomerHistory(businessSlug, args.chatIds ?? [chatId], args.phone).catch(() => []);
   }
+  // The staff-saved default delivery location answers "same place" / "usual location" before any earlier order does.
+  // Read-only here: nothing in the order flow can change it (only the staff !location command does).
+  const savedLocation = cue.sameLocation ? await loadStaffLocationSafe(businessSlug, [...(args.phone ? [args.phone] : []), ...(args.chatIds ?? [chatId]).map((id) => `chat:${id}`)]) : null;
 
   // A turn that only points back ("same as last time") or only adjusts a quantity ("another bag") has no draft of its own:
   // it still updates the order, from the customer's records and words.
@@ -662,6 +666,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
             current: cur ? { id: cur.id, items: cur.items, delivery_address: cur.delivery_address, fulfilment_method: cur.fulfilment_method } : null,
             draftItems: refined.items.map(toLine),
             draftAddress: refined.delivery_address,
+            defaultLocation: savedLocation?.content ?? null,
           })
         : { items: [], address: null, setDelivery: false, clearAddress: false, sources: {}, unresolved: [] };
     const planned = fillFor(existing);

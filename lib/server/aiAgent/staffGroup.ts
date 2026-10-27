@@ -42,6 +42,8 @@ import {
   WITHHOLD_TEXT,
 } from "@/lib/aiAgent/staffAnswers";
 import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
+import { parseCustomerCommand } from "@/lib/aiAgent/customerCommands";
+import { handleCustomerCommand } from "@/lib/server/aiAgent/customerCommands";
 import { handleOrderCommand } from "@/lib/server/aiAgent/orders";
 import { agentDb, audit, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
 import { customerGate, planCustomerSend, sha } from "@/lib/server/aiAgent/customerSend";
@@ -206,6 +208,22 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
       timestamp: input.timestamp,
     });
     return { outbox: result.outbox, queued: result.queued, outcome: result.outcome, escalationId: null };
+  }
+  // Customer commands ("!rules", "!help", "!customer", "!location", "!remember"): handled before any escalation matching, for
+  // the same reason as the order commands. A reply to a customer's notice with "!location Cap Estate" is a location, never
+  // an "answer" to that escalation. Authorization, the customer and every argument are checked in handleCustomerCommand.
+  const customerCommand = looksLikeAgentMessage(input.text) ? null : parseCustomerCommand(input.text);
+  if (customerCommand) {
+    const result = await handleCustomerCommand({
+      settings,
+      command: customerCommand,
+      quotedMessageId: input.quotedMessageId,
+      senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone),
+      senderJid: input.senderJid,
+      eventId: input.eventId,
+      whatsappMessageId: input.whatsappMessageId,
+    });
+    return { outbox: result.outbox, outcome: result.outcome, escalationId: null };
   }
   const { candidates, quotedDraft, quotedNotice, quotedNoticeAt } = await matchCandidates(settings.business_slug, input.text, input.quotedMessageId);
   // Approval Pilot: only an explicit !command ever sends — a casual "send it" is not one.
