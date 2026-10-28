@@ -371,11 +371,11 @@ describe("!update: what is new or changed", () => {
 describe("the command menu matches the parsers", () => {
   test("!rules documents !orders (every view), !update, !order and the completion commands", () => {
     const text = buildRulesMessages().join("\n");
-    for (const part of ["!orders [today|tomorrow|<date>|all|overdue|missing|undated]", "!orders complete all", "!update [#REF", "!order <name, phone or #REF> | #REF completed | #REF reopen | #REF teach <instruction>"]) assert.ok(text.includes(part), part);
+    for (const part of ["!orders [today|tomorrow|<date>|all|overdue|missing|undated|review]", "!orders complete all", "!update [#REF", "!order <name, phone or #REF> | #REF completed | #REF reopen | #REF teach <instruction>"]) assert.ok(text.includes(part), part);
     const doc = STAFF_COMMANDS.find((c) => c.name === "orders")!;
     assert.deepEqual([doc.section, doc.who, doc.readOnly], ["Orders", "authorized", false], "!orders complete all can change orders, so the entry is no longer read-only");
-    for (const word of ["overdue", "missing", "undated", "all", "complete all", "B-ABCDE"]) assert.match(doc.summary, new RegExp(word));
+    for (const word of ["overdue", "missing", "undated", "review", "South Deliveries", "all", "complete all", "B-ABCDE"]) assert.match(doc.summary, new RegExp(word));
     // Everything the registry advertises for !orders really parses to the orders command.
-    for (const arg of ["", "today", "tomorrow", "30 Oct", "all", "overdue", "missing", "undated"]) assert.equal(parseOrderCommand(`!orders ${arg}`.trim(), { now: NOW, timezone: TZ })?.kind, "orders", arg);
+    for (const arg of ["", "today", "tomorrow", "30 Oct", "all", "overdue", "missing", "undated", "review"]) assert.equal(parseOrderCommand(`!orders ${arg}`.trim(), { now: NOW, timezone: TZ })?.kind, "orders", arg);
   });
 });

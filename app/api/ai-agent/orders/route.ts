@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { DEFAULT_ORDERS_TIMEZONE, isOpenStatus, ORDER_STATUSES, type EditableOrderField, type OrderStatus } from "@/lib/aiAgent/orders";
+import { classifyDeliveryRegion } from "@/lib/aiAgent/deliveryRegions";
 import { effectiveDate, effectiveMethod } from "@/lib/aiAgent/orderDefaults";
 import { bucketOf, countOrders, dayContext, dayLabel, orderDate, orderGaps, selectOrders, type OrdersView } from "@/lib/aiAgent/orderViews";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
@@ -23,7 +24,7 @@ import {
 // and written to the order's history and the audit log. Nothing here can message a customer.
 export const dynamic = "force-dynamic";
 
-const VIEWS = ["all", "today", "tomorrow", "overdue", "missing", "undated"] as const;
+const VIEWS = ["all", "today", "tomorrow", "overdue", "missing", "undated", "review"] as const;
 
 export async function GET(request: Request) {
   const admin = await requireAdmin();
@@ -71,6 +72,9 @@ export async function GET(request: Request) {
           date_source: day.source,
           display_name: names[o.id]?.name ?? null,
           name_source: names[o.id]?.source ?? null,
+          // Southern deliveries are grouped by where they go. Computed from the CURRENT address every time, so correcting the
+          // address moves the order; a collection, a missing, ambiguous or unlisted address is never south.
+          south_group: effectiveMethod(o).method === "delivery" ? (() => { const r = classifyDeliveryRegion(o.delivery_address); return r.region === "south" ? r.group : null; })() : null,
           fulfilment_date: date,
           fulfilment_date_label: date ? dayLabel(date) : null,
           bucket: isOpenStatus(o.status) ? bucketOf(o, ctx) : null,

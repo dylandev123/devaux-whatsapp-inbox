@@ -237,15 +237,15 @@ describe("replies", () => {
       timezone: "America/St_Lucia",
     });
     assert.match(info, /Status: Awaiting confirmation/);
-    assert.match(info, /Name: saved contact/);
+    assert.doesNotMatch(info, /Name:|saved contact|profile name/, "no source label in the order details");
     assert.match(info, /Edited by staff: items/);
     assert.match(info, /Recent changes:\n• 26 Oct, 10:05 ai: ai update — items 1 × Monello → 2 × Monello/);
     assert.ok(info.length < 1200);
   });
-  test("a stored default day is never presented as the customer's words", () => {
+  test("the day line shows the actual date only: no 'default' or 'no day given' wording, and no words attributed to the customer", () => {
     const show = (requested_for: string | null) => moreInfoReply({ order: order({ requested_for }), name: undefined, events: [], timezone: "America/St_Lucia" });
-    assert.match(show("Thu 29 Oct (default)"), /Day: Thu 29 Oct \(default — no day given\)/);
-    assert.match(show("Thu 29 Oct (default, morning)"), /Day: Thu 29 Oct \(default; they said “morning”\)/);
-    assert.doesNotMatch(show("Thu 29 Oct (default)"), /they said/);
+    assert.match(show("Thu 29 Oct (default)"), /^Day: Thu 29 Oct$/m);
+    assert.match(show("Thu 29 Oct (default, morning)"), /^Day: Thu 29 Oct · morning$/m);
+    assert.doesNotMatch(show("Thu 29 Oct (default)"), /they said|no day given|\(default/);
   });
 });

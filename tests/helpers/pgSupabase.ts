@@ -17,6 +17,14 @@ const ident = (name: string) => {
   return `"${name}"`;
 };
 
+/** A select column: a plain name, or PostgREST's `alias:column->key->>key` JSON path (the only path shape the app uses). */
+function column(spec: string): string {
+  const m = /^([a-z_][a-z0-9_]*):([a-z_][a-z0-9_]*)((?:->>?[A-Za-z_][A-Za-z0-9_]*)+)$/i.exec(spec);
+  if (!m) return ident(spec);
+  const path = m[3].replace(/->>?([A-Za-z_][A-Za-z0-9_]*)/g, (all, key: string) => `${all.startsWith("->>") ? "->>" : "->"}'${key}'`);
+  return `${ident(m[2])}${path} as ${ident(m[1])}`;
+}
+
 function lit(value: unknown): string {
   if (value === null || value === undefined) return "null";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -178,7 +186,7 @@ class Query implements PromiseLike<Result> {
 
   private sql(): string {
     const t = `public.${ident(this.table)}`;
-    const cols = this.columns.trim() === "*" ? "*" : this.columns.split(",").map((c) => ident(c.trim())).join(", ");
+    const cols = this.columns.trim() === "*" ? "*" : this.columns.split(",").map((c) => column(c.trim())).join(", ");
     const wrap = (inner: string) => `select coalesce(json_agg(r), '[]'::json) from (${inner}) r`;
     switch (this.op) {
       case "select": {

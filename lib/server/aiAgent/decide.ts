@@ -73,8 +73,12 @@ import {
   loadCustomerContext,
   loadOpenOrderRequest,
   loadRecentMessages,
+  loadTurnQuote,
   OpenOrderRequest,
+  productHints,
+  readTurnPictures,
 } from "@/lib/server/aiAgent/context";
+import { type ConversationLine, isAffirmation } from "@/lib/aiAgent/staffDelivery";
 import {
   BatchRow,
   claimBatches,
@@ -536,7 +540,7 @@ interface Pipeline {
   usage: ShadowUsage | null;
   /** Daily order tracking: present only when the business has it on and this is a live turn. */
   orderTrackingFailed?: boolean;
-  orderTracking: { open: TrackedOrder[]; rawProposal: Pick<ModelProposal, "order_request" | "order_target" | "other_orders"> | null; customerWords: string[]; history: HistoryOrder[]; intent?: ModelProposal["intent"] | null } | null;
+  orderTracking: { open: TrackedOrder[]; rawProposal: Pick<ModelProposal, "order_request" | "order_target" | "other_orders"> | null; customerWords: string[]; pictureWords: string[]; recent: ConversationLine[]; quotedId: string | null; history: HistoryOrder[]; intent?: ModelProposal["intent"] | null } | null;
 }
 
 /**
@@ -609,8 +613,11 @@ async function runPipeline(args: {
   if (!args.text.trim()) return empty;
 
   const tracking = Boolean(settings?.orders_tracking_enabled) && Boolean(chatId) && !args.asOf;
+  const knowledgeLoad = loadActiveKnowledge(businessSlug);
+  // A photo the customer's words point at is read once (cached); knowledge only helps spell what is printed on a label.
+  const pictureOptions = { turnTexts: args.segments ?? [args.text], turnAt: new Date().toISOString(), knownProducts: async () => productHints(await knowledgeLoad) };
   const [knowledge, context, openOrder, openEscalation, recentReplies, trackedOpen, orderHistory, wideMessages] = await Promise.all([
-    loadActiveKnowledge(businessSlug),
+    knowledgeLoad,
     chatId && identity
       ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text, { before: args.asOf })
       : Promise.resolve(null),
@@ -623,8 +630,17 @@ async function runPipeline(args: {
     tracking && identity ? loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => [] as HistoryOrder[]) : Promise.resolve([] as HistoryOrder[]),
     // A wider look at the customer's own recent words (a database read, no model tokens): an order built over several
     // messages must still be checked against everything the customer wrote for it, not only the last dozen lines.
-    tracking ? loadRecentMessages(businessSlug, chatId!, args.excludeMessageIds, ORDER_CONTEXT_FETCH).catch(() => []) : Promise.resolve([]),
+    // It also shows photos the customer's words point at (read once, cached), voice messages as "not transcribed" and what a reply replied to.
+    tracking
+      ? loadRecentMessages(businessSlug, chatId!, args.excludeMessageIds, ORDER_CONTEXT_FETCH, pictureOptions).catch(() => [])
+      : Promise.resolve([]),
   ]);
+  // The turn's own photos and voice messages, beside the customer's words (the recent-lines loader leaves the turn's own messages out).
+  const turnPictures = tracking ? await readTurnPictures(businessSlug, chatId!, args.excludeMessageIds, pictureOptions) : { note: null, pictureWords: [] as string[] };
+  const turnText = turnPictures.note ? `${args.transcript ?? args.text}\n${turnPictures.note}` : (args.transcript ?? args.text);
+  // With order tracking on, the reply model reads the same annotated lines (a photo's label, "voice message — not transcribed",
+  // what a message replied to). Without it nothing about the transcript changes.
+  if (tracking && context && wideMessages.length > 0) context.transcript = wideMessages.slice(-TRANSCRIPT_LINES).map((m) => ({ who: m.who, text: m.text, at: m.at }));
 
   const safeguards = detectSafeguards(args.text);
   // The request the customer is building: the collected order request, else what the escalation they
@@ -654,7 +670,7 @@ async function runPipeline(args: {
     ? { proposal: null, model: null, error: null }
     : await proposeReply({
         businessSlug,
-        messageText: args.transcript ?? args.text,
+        messageText: turnText,
         knowledge,
         context,
         pendingOrder: priorOrder,
@@ -673,8 +689,12 @@ async function runPipeline(args: {
   const customerWords = [
     args.text,
     ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? []),
-    ...orderContextWindow(wideMessages, new Date().toISOString()).forGrounding.filter((m) => m.who === "Customer").map((m) => m.text),
+    ...orderContextWindow(wideMessages, new Date().toISOString()).forGrounding.filter((m) => m.who === "Customer").map((m) => m.rawText),
   ];
+  // What is printed on a photo the customer pointed at: grounds a product, never a quantity, an address or a day.
+  const pictureTexts = [...wideMessages.flatMap((m) => m.pictureWords), ...turnPictures.pictureWords];
+  const recentLines: ConversationLine[] = wideMessages.map((m) => ({ who: m.who, text: m.rawText, at: m.at, id: m.id ?? null, quotedId: m.quotedId ?? null }));
+  const segmentsOfTurn = args.segments ?? [args.text];
   // The raw drafts are kept for order tracking, which grounds them against the order they target (not the legacy request).
   let rawProposal = proposal ? { order_request: proposal.order_request, order_target: proposal.order_target, other_orders: proposal.other_orders } : null;
   // "Same as usual, plus 4 pool salt" can make the reply path hand the turn to staff without asking the model anything. The order book
@@ -687,7 +707,7 @@ async function runPipeline(args: {
       openOrders: ordersForModel(trackedOpen),
       orderHistory: historyForModel(orderHistory) ?? undefined,
       transcript: (context?.transcript ?? []).map((t) => ({ who: t.who, text: t.text })),
-      newMessages: args.transcript ?? args.text,
+      newMessages: turnText,
       author: "customer",
     }).catch(() => null);
     if (res?.proposal) {
@@ -696,7 +716,7 @@ async function runPipeline(args: {
     }
   }
   if (proposal?.order_request) {
-    const grounded = groundOrderDraft(proposal.order_request, priorOrder, customerWords);
+    const grounded = groundOrderDraft(proposal.order_request, priorOrder, customerWords, pictureTexts);
     // What the customer plainly said (a quantity, delivery or collection) is recorded even if the model left it out,
     // so they are never asked again for something they already told us.
     proposal = { ...proposal, order_request: grounded ? refineOrderDraft(grounded, [args.text], customerWords) : grounded };
@@ -732,10 +752,25 @@ async function runPipeline(args: {
     customerMode,
     trivialTurn,
     usage: modelResult.usage ?? null,
-    orderTracking: Array.isArray(trackedOpen) ? { open: trackedOpen, rawProposal, customerWords, history: orderHistory, intent: orderOnlyIntent } : null,
+    orderTracking: Array.isArray(trackedOpen)
+      ? {
+          open: trackedOpen,
+          rawProposal,
+          customerWords,
+          pictureWords: pictureTexts,
+          recent: recentLines,
+          // Only a bare yes needs to know which message it answered: one query, and only then.
+          quotedId: segmentsOfTurn.every(isAffirmation) && chatId ? await loadTurnQuote(businessSlug, chatId, args.excludeMessageIds) : null,
+          history: orderHistory,
+          intent: orderOnlyIntent,
+        }
+      : null,
     orderTrackingFailed: trackedOpen === "failed",
   };
 }
+
+/** How many recent lines the reply model reads. */
+const TRANSCRIPT_LINES = 12;
 
 /** Gate codes meaning "the agent may not engage with this contact". */
 const PERMISSION_CODES = ["contact_not_permitted", "contact_excluded", "unresolved_lid_identity"];
@@ -821,6 +856,9 @@ async function handleCustomerTurn(turn: CustomerTurn, ctx: TurnContext): Promise
         proposal: p.orderTracking.rawProposal,
         segments: turn.segments,
         customerWords: p.orderTracking.customerWords,
+        pictureWords: p.orderTracking.pictureWords,
+        recent: p.orderTracking.recent,
+        quotedId: p.orderTracking.quotedId,
         chatIds: p.identity?.chatIds,
         history: p.orderTracking.history,
         messageIds: turn.whatsappMessageIds,

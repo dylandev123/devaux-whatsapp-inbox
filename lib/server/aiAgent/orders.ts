@@ -48,6 +48,8 @@ import {
 import { loadStaffLocationSafe } from "@/lib/server/aiAgent/customerStaffMemory";
 import { type AddressEvent, type AddressProvenance, addressProvenance, isInferredAddress, sameAddress } from "@/lib/aiAgent/orderAddress";
 import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote, keepDefaultedDay, nameStated, withCreationDefaults, withDeliveryContact } from "@/lib/aiAgent/orderDefaults";
+import { classifyOrderIntent, INTENT_REASON_CODE, staffRecentlyOfferedDelivery } from "@/lib/aiAgent/orderIntent";
+import { agreedDeliveryDate, type ConversationLine, isAffirmation } from "@/lib/aiAgent/staffDelivery";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
 import { buildOrdersView, buildUpdateSummary, countOrders, dayContext, type OrderEventRow, orderDate, type OrdersView, summarizeUpdates } from "@/lib/aiAgent/orderViews";
 import {
@@ -70,6 +72,7 @@ import {
   mergeDraft,
   MISSING_TEXT,
   OPEN_ORDER_STATUSES,
+  ORDER_REVIEW_ATTENTION,
   type OrderNames,
   OrderFields,
   OrderLine,
@@ -546,6 +549,12 @@ export interface TrackArgs {
   segmentTimes?: string[];
   /** The customer's recent words, for grounding. */
   customerWords: string[];
+  /** Text printed on a photo the customer pointed at: grounds a product, variant or size, never a quantity, address or day. */
+  pictureWords?: string[];
+  /** Earlier lines of the chat (customer and staff, oldest first, excluding this turn): order intent and staff-agreed delivery days. */
+  recent?: ConversationLine[];
+  /** WhatsApp id of the message the customer replied to, when the bridge supplied it. */
+  quotedId?: string | null;
   messageIds: string[];
   firstAt: string;
   lastAt: string;
@@ -607,6 +616,34 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   };
 
   let open = await loadOpenOrders(businessSlug, chatId);
+
+  // 0. A bare "yes" to a delivery day staff offered ("Would you like us to put you down for tomorrow?" / "Yes sure"): the day
+  //    staff named, counted from THEIR message, becomes the order's day; and an order that was only held for review because
+  //    nothing asked for it is now plainly one. Only with exactly one open order, never over a staff-set day, and never when
+  //    something changed the day after the offer was made.
+  if (args.allowConfirmation !== false && segments.every(isAffirmation)) {
+    const agreed = agreedDeliveryDate({ segments, at: args.lastAt, recent: args.recent ?? [], quotedId: args.quotedId, timezone: tz });
+    if (agreed) {
+      const target = open.length === 1 ? open[0] : null;
+      if (!target) result.reasons.push(open.length === 0 ? "order_agreed_day_no_order" : "order_agreed_day_ambiguous");
+      else {
+        const outcome = await applyDeliveryDay({
+          businessSlug,
+          order: target,
+          day: agreed,
+          source: agreed.basis === "commitment" ? "staff_commitment" : "staff_offer_accepted",
+          actor: "customer",
+          key: `${args.dedupeBase}:agreed`,
+          messageIds: args.messageIds,
+          lastAt: args.lastAt,
+          timezone: tz,
+        });
+        result.reasons.push(outcome.reason);
+        if (outcome.applied) result.applied += 1;
+        open = await loadOpenOrders(businessSlug, chatId);
+      }
+    }
+  }
 
   // 1. A customer's yes. It is attributed to an order only when there is exactly ONE open order in the chat and it
   //    is complete and awaiting confirmation: with anything else open, "yes" could mean any of them, so nothing
@@ -721,7 +758,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       }
     }
     // The model may only restate what the customer wrote: ground against the order it targets, not another.
-    const grounded = groundOrderDraft({ ...draft, items: plainItems }, existing ? asDraft(existing) : null, args.customerWords);
+    const grounded = groundOrderDraft({ ...draft, items: plainItems }, existing ? asDraft(existing) : null, args.customerWords, args.pictureWords);
     if (!grounded) continue;
     // The customer's own delivery/collection words win, so "I'll collect instead" can replace "delivery".
     grounded.delivery_preference = groundDeliveryPreference(draft.delivery_preference, args.customerWords) ?? grounded.delivery_preference;
@@ -738,6 +775,30 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     ];
     // Plainly stated quantities and delivery/collection are recorded even when the model left them out.
     const refined = refineOrderDraft(grounded, segments, args.customerWords);
+    // Is this really an order? An invoice, quotation, price or product discussion names products without anyone asking for a
+    // delivery. A NEW order candidate is classified from the customer's words, the staff replies around them and what it holds;
+    // an order that already exists is never cancelled or demoted by this, and a doubtful one is held for review, off every list.
+    const recentLines = args.recent ?? [];
+    // "Same as last time" / "the usual" is itself a request for goods to be supplied again.
+    const intent = pointsBack
+      ? ({ kind: "confirmed", reason: "explicit_request" } as const)
+      : classifyOrderIntent({
+          segments,
+          recent: recentLines,
+          modelIntent: args.intent,
+          items: refined.items.map((i) => ({ quantity: i.quantity ?? null, product: i.product })),
+          hasAddress: Boolean(refined.delivery_address || existing?.delivery_address),
+          hasDay: Boolean(refined.requested_for),
+          staffAgreement: false,
+        });
+    if (!result.reasons.includes(INTENT_REASON_CODE[intent.reason])) result.reasons.push(INTENT_REASON_CODE[intent.reason]);
+    if (!existing && intent.kind === "non_order") {
+      result.reasons.push("order_not_created_non_order");
+      continue;
+    }
+    const heldForReview = !existing && intent.kind === "possible";
+    const clearsReview = Boolean(existing) && existing!.attention === ORDER_REVIEW_ATTENTION && intent.kind === "confirmed" && (intent.reason === "explicit_request" || intent.reason === "stated_order");
+    if (heldForReview && !result.reasons.includes("order_held_for_review")) result.reasons.push("order_held_for_review");
     // Identity and contact details the customer GAVE (checked against their own words, never invented):
     //  * a name only when no reliable profile/contact name exists, so the verified identity is never overwritten;
     //  * a different delivery number goes into the notes, never into contact_number (the verified sender stays the customer);
@@ -826,9 +887,12 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       const plan = planOrderUpdate({ existing: cur, fields, contentChanged: changed, customerTexts: segments, outboundSinceAwaiting: false, now });
       // Pointing at an earlier order that could not be matched safely is for a person to look at; never guessed.
       const unresolvedFlag = fill.unresolved.length > 0 && !plan.attention ? "history_unresolved" : null;
-      const attention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : (unresolvedFlag ?? plan.attention);
+      const baseAttention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : (unresolvedFlag ?? plan.attention);
+      // A doubtful new order is held for review (on no delivery list); a later plain request on a held order releases it.
+      const releasesReview = Boolean(cur) && cur!.attention === ORDER_REVIEW_ATTENTION && clearsReview;
+      const attention = !cur && heldForReview ? ORDER_REVIEW_ATTENTION : releasesReview ? null : baseAttention;
       const flagged = Boolean(cur) && unresolvedFlag !== null;
-      if (cur && plan.event === "no_change" && !changed && !conflictsChanged && !flagged && !confirmsAddress) return null;
+      if (cur && plan.event === "no_change" && !changed && !conflictsChanged && !flagged && !confirmsAddress && !releasesReview) return null;
       const finalPlan = { ...plan, attention };
       const itemsChanged = merged.changes.some((c) => c.field === "items");
       const inferredItems = [...(fillItems.length > 0 && fill.sources.items ? [fill.sources.items] : []), ...nominatedRefs, ...upgradedRefs];
@@ -846,7 +910,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
         event:
           cur && !changed && conflictsChanged && finalPlan.event === "no_change"
             ? "locked_field_conflict"
-            : cur && !changed && flagged && finalPlan.event === "no_change"
+            : cur && !changed && (flagged || releasesReview) && finalPlan.event === "no_change"
               ? "attention_flagged"
               : confirmsAddress && !changed && finalPlan.event === "no_change"
                 ? "address_confirmed"
@@ -859,6 +923,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
           ...(conflictsChanged ? { field_conflicts: { before: cur?.field_conflicts ?? {}, after: conflicts } } : {}),
           ...(removal && removal.removed.length > 0 && merged.changes.some((c) => c.field === "items") ? { removed_items: { before: removal.removed.map((i) => i.product), after: null } } : {}),
           ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}),
+          ...(cur && cur.attention !== finalPlan.attention && (cur.attention === ORDER_REVIEW_ATTENTION || finalPlan.attention === ORDER_REVIEW_ATTENTION) ? { attention: { before: cur.attention, after: finalPlan.attention } } : {}),
           ...(Object.keys(inferred).length > 0 ? { inferred: { before: null, after: inferred } } : {}),
           ...(created && created.defaulted.length > 0 ? { defaulted: { before: null, after: { fields: created.defaulted, basis: ctx.firstAt, timezone: tz } } } : {}),
         },
@@ -923,6 +988,85 @@ export async function flagOrderFromStaff(args: StaffFlagArgs): Promise<{ applied
     if (res.result === "applied") return { applied: true, reason: `orders_monitor_staff_${args.action}` };
     if (res.result === "duplicate" || res.result === "not_found") return { applied: false, reason: "orders_monitor_already_applied" };
     // conflict: someone changed the order meanwhile; re-read and decide again.
+  }
+  return { applied: false, reason: "order_write_conflict" };
+}
+
+// ── A delivery day staff stated or the customer accepted ─────────────────────
+
+export type DeliveryDaySource = "staff_commitment" | "staff_offer_accepted";
+
+export interface DeliveryDayArgs {
+  businessSlug: string;
+  order: TrackedOrder;
+  /** The day, from the STAFF message's own timestamp (staffDelivery.ts). */
+  day: { date: string; label: string; staffAt: string; staffMessageId: string | null; phrase: string };
+  source: DeliveryDaySource;
+  /** Who the history credits: staff for their own commitment, the customer for accepting an offer. */
+  actor: "staff" | "customer";
+  key: string;
+  messageIds: string[];
+  lastAt: string;
+  timezone: string;
+}
+
+/** True when anything changed the order's day after `since` (a customer's new day, a staff edit, a repair). */
+async function dayChangedSince(orderId: string, since: string): Promise<boolean> {
+  const { data, error } = await agentDb().from("ai_agent_order_events").select("changes").eq("order_id", orderId).gt("created_at", since).limit(50);
+  if (error) throw new Error(error.message);
+  return (data ?? []).some((e) => Boolean((e.changes as Record<string, unknown> | null)?.requested_for));
+}
+
+/**
+ * Records the delivery day staff committed to (or the customer accepted) on ONE order. What it never does: touch a day staff
+ * edited (a locked field), overwrite a day set after the staff message, guess between several orders, or message anyone. The
+ * order's history keeps where the day came from (`date_source`); the order itself shows only the date. An order held for
+ * review is released: staff committing to deliver it, or offering and the customer accepting, makes it a plain order.
+ */
+export async function applyDeliveryDay(a: DeliveryDayArgs): Promise<{ applied: boolean; reason: string }> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const fresh = (await loadOpenOrders(a.businessSlug, a.order.chat_id)).find((o) => o.id === a.order.id);
+    if (!fresh) return { applied: false, reason: "order_day_order_closed" };
+    if (fresh.manual_locked_fields.includes("requested_for")) return { applied: false, reason: "order_day_locked" };
+    if (await dayChangedSince(fresh.id, a.day.staffAt)) return { applied: false, reason: "order_day_changed_since" };
+    const current = effectiveDate(fresh, a.timezone);
+    // Staff committing to deliver (or offering and the customer accepting) is a plain order, whatever the first message looked like.
+    const releases = fresh.attention === ORDER_REVIEW_ATTENTION;
+    const sameDay = current.date === a.day.date && current.source === "stated";
+    if (sameDay && !releases) return { applied: false, reason: "order_day_already_set" };
+    // A time of day the customer gave ("morning") stays beside the date.
+    const time = (fresh.requested_for ?? "").match(/\b(morning|afternoon|evening|noon|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i)?.[1];
+    const requestedFor = sameDay ? fresh.requested_for : `${a.day.label}${time ? ` (${time.toLowerCase()})` : ""}`;
+    const fields = { ...fieldsOf(fresh), requested_for: requestedFor };
+    const plan = {
+      status: fresh.status,
+      attention: releases ? null : fresh.attention,
+      awaitingSince: fresh.awaiting_since,
+      missing: computeMissing(fields),
+      event: "no_change" as const,
+      confirmedByCustomer: false,
+      customerConfirmedAt: fresh.customer_confirmed_at,
+    };
+    // A staff message is not customer activity; the customer accepting an offer is.
+    const ctx = { chatId: fresh.chat_id, phone: fresh.contact_number, messageIds: a.messageIds, firstAt: fresh.first_message_at, lastAt: a.actor === "customer" ? a.lastAt : fresh.last_message_at };
+    const res = await applyOrder({
+      businessSlug: a.businessSlug,
+      key: a.key,
+      existing: fresh,
+      row: rowFrom(fresh, fields, plan, ctx),
+      event: "delivery_day_agreed",
+      actorKind: a.actor,
+      actorId: null,
+      changes: {
+        ...(sameDay ? {} : { requested_for: { before: fresh.requested_for, after: requestedFor } }),
+        ...(releases ? { attention: { before: fresh.attention, after: null } } : {}),
+        // Provenance, for the order's history only: where the day came from and the words that said it.
+        date_source: { before: null, after: { source: a.source, staff_message_id: a.day.staffMessageId, staff_message_at: a.day.staffAt, phrase: a.day.phrase.slice(0, 160) } },
+      },
+      messageIds: a.messageIds,
+    });
+    if (res.result === "applied") return { applied: true, reason: releases && sameDay ? "order_released_from_review" : "order_day_from_staff" };
+    if (res.result === "duplicate" || res.result === "not_found") return { applied: false, reason: "orders_monitor_already_applied" };
   }
   return { applied: false, reason: "order_write_conflict" };
 }

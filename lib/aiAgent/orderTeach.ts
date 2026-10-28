@@ -371,6 +371,8 @@ export function bulkScope(orders: TrackedOrder[], ctx: DayContext): BulkScope {
   for (const o of orders) {
     if (!isOpenStatus(o.status)) continue;
     const bucket = bucketOf(o, ctx);
+    // An order waiting for review is not an order yet: a bulk completion never touches it.
+    if (bucket === "review") continue;
     if (bucket === "today") scope.today.push(o);
     else scope.excluded[bucket] += 1;
   }

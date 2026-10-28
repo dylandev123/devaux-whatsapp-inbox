@@ -6,6 +6,7 @@ import { aiAgentApi, BackfillRunView, OrderCountsView, OrderEventView, OrderRunV
 import type { AgentSettings } from "@/lib/aiAgent/engine";
 import { ATTENTION_TEXT, CONFLICT_LABEL, conflictFields, conflictValueText, confirmationLabel, coverageLines, displayRef, formatLine, MISSING_TEXT, ORDER_STATUSES, type OrderLine, type OrderStatus } from "@/lib/aiAgent/orders";
 import { ADDRESS_ORIGIN_LABEL } from "@/lib/aiAgent/orderAddress";
+import { timeOfDay } from "@/lib/aiAgent/orderViews";
 import { useDebounced } from "@/components/admin/aiAgent/useDebounced";
 import { Badge, Card, dangerButton, formatWhen, inputClass, Notice, primaryButton, secondaryButton } from "@/components/admin/aiAgent/ui";
 
@@ -196,9 +197,9 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
           {order.fulfilment_method === "collection" ? "Collection" : order.fulfilment_method === "delivery" ? "Delivery" : "Delivery (default)"}
         </span>
         <span className={`rounded px-1.5 py-0.5 font-medium ${order.bucket === "overdue" ? "bg-red-50 text-red-700" : order.fulfilment_date ? "bg-zinc-100 text-zinc-700" : "bg-amber-50 text-amber-800"}`}>
-          {order.fulfilment_date_label ? `For ${order.fulfilment_date_label}${order.bucket === "overdue" ? " — overdue" : order.bucket === "today" ? " (today)" : order.bucket === "tomorrow" ? " (tomorrow)" : ""}${order.date_source === "default" ? " · default day" : ""}` : order.bucket === "overdue" ? "Day unclear — overdue" : "Day unclear"}
+          {order.bucket === "review" ? "Possible order — on no delivery list yet" : order.fulfilment_date_label ? `For ${order.fulfilment_date_label}${order.bucket === "overdue" ? " — overdue" : order.bucket === "today" ? " (today)" : order.bucket === "tomorrow" ? " (tomorrow)" : ""}${timeOfDay(order.requested_for) ? ` · ${timeOfDay(order.requested_for)}` : ""}` : order.bucket === "overdue" ? "Day unclear — overdue" : "Day unclear"}
         </span>
-        {order.requested_for && <span className="text-zinc-500">“{order.requested_for}”</span>}
+        {order.date_source === "unreadable" && order.requested_for && <span className="text-zinc-500">“{order.requested_for}”</span>}
         {order.delivery_address && <span>— {order.delivery_address}</span>}
         {order.delivery_address && order.address_origin && (
           <span
@@ -620,13 +621,14 @@ function RepairCard({ businessSlug, onApplied }: { businessSlug: string; onAppli
   );
 }
 
-type TabId = "today" | "tomorrow" | "overdue" | "missing" | "undated" | "open" | "fulfilled" | "cancelled";
+type TabId = "today" | "tomorrow" | "overdue" | "missing" | "undated" | "review" | "open" | "fulfilled" | "cancelled";
 const TABS: { id: TabId; label: string; status: "open" | OrderStatus; view: OrderViewName; count?: keyof OrderCountsView }[] = [
   { id: "today", label: "Today", status: "open", view: "today", count: "today" },
   { id: "tomorrow", label: "Tomorrow", status: "open", view: "tomorrow", count: "tomorrow" },
   { id: "overdue", label: "Overdue", status: "open", view: "overdue", count: "overdue" },
   { id: "missing", label: "Missing information", status: "open", view: "missing", count: "missing" },
   { id: "undated", label: "Day unclear", status: "open", view: "undated", count: "undated" },
+  { id: "review", label: "Review", status: "open", view: "review", count: "review" },
   { id: "open", label: "All outstanding", status: "open", view: "all", count: "open" },
   { id: "fulfilled", label: "Completed", status: "fulfilled", view: "all" },
   { id: "cancelled", label: "Cancelled", status: "cancelled", view: "all" },
@@ -637,15 +639,18 @@ const EMPTY_TEXT: Record<TabId, string> = {
   overdue: "No overdue orders.",
   missing: "Every outstanding order has the essentials.",
   undated: "Every outstanding order has a clear day.",
+  review: "Nothing is waiting to be confirmed as an order.",
   open: "No outstanding orders.",
   fulfilled: "No completed orders match.",
   cancelled: "No cancelled orders match.",
 };
 
-/** Orders grouped by the day they are for, then Delivery / Collection / not stated (outstanding views only). */
+/** Orders grouped by the day they are for, then Delivery (with South Deliveries) / Collection (outstanding views only). */
 function GroupedOrders({ orders, businessSlug, onChanged }: { orders: OrderView[]; businessSlug: string; onChanged: () => void }) {
+  // An order that might not be an order is in no day: it has its own group at the end until staff confirm or cancel it.
+  const review = orders.filter((o) => o.bucket === "review");
   const days: { key: string; label: string; orders: OrderView[] }[] = [];
-  for (const o of orders) {
+  for (const o of orders.filter((x) => x.bucket !== "review")) {
     const key = o.fulfilment_date ?? "none";
     let day = days.find((d) => d.key === key);
     if (!day) {
@@ -654,30 +659,115 @@ function GroupedOrders({ orders, businessSlug, onChanged }: { orders: OrderView[
     }
     day.orders.push(o);
   }
+  const list = (items: OrderView[]) => (
+    <ul className="divide-y divide-zinc-100 rounded-md border border-zinc-200">
+      {items.map((o) => (
+        <OrderCard key={`${o.id}:${o.version}`} businessSlug={businessSlug} order={o} onChanged={onChanged} />
+      ))}
+    </ul>
+  );
   return (
     <div className="flex flex-col gap-4">
-      {days.map((day) => (
-        <section key={day.key}>
-          <h3 className="mb-1 text-sm font-semibold text-zinc-800">
-            {day.label} <span className="font-normal text-zinc-500">({day.orders.length})</span>
-          </h3>
-          {(["delivery", "collection"] as const).map((method) => {
-            const group = day.orders.filter((o) => (o.fulfilment_method ?? "delivery") === method);
-            if (group.length === 0) return null;
-            return (
-              <div key={method} className="mb-2">
-                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{method === "delivery" ? "Delivery" : "Collection"}</p>
-                <ul className="divide-y divide-zinc-100 rounded-md border border-zinc-200">
-                  {group.map((o) => (
-                    <OrderCard key={`${o.id}:${o.version}`} businessSlug={businessSlug} order={o} onChanged={onChanged} />
-                  ))}
-                </ul>
+      {days.map((day) => {
+        const deliveries = day.orders.filter((o) => (o.fulfilment_method ?? "delivery") === "delivery");
+        const south = deliveries.filter((o) => o.south_group);
+        const rest = deliveries.filter((o) => !o.south_group);
+        const groups = [...new Set(south.map((o) => o.south_group as string))];
+        const collections = day.orders.filter((o) => o.fulfilment_method === "collection");
+        return (
+          <section key={day.key}>
+            <h3 className="mb-1 text-sm font-semibold text-zinc-800">
+              {day.label} <span className="font-normal text-zinc-500">({day.orders.length})</span>
+            </h3>
+            {rest.length > 0 && (
+              <div className="mb-2">
+                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Delivery</p>
+                {list(rest)}
               </div>
-            );
-          })}
+            )}
+            {south.length > 0 && (
+              <div className="mb-2">
+                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">South deliveries <span className="font-normal normal-case text-zinc-400">({south.length})</span></p>
+                {groups.map((group) => (
+                  <div key={group} className="mb-1.5">
+                    <p className="mb-0.5 text-xs font-medium text-zinc-700">📍 {group}</p>
+                    {list(south.filter((o) => o.south_group === group))}
+                  </div>
+                ))}
+              </div>
+            )}
+            {collections.length > 0 && (
+              <div className="mb-2">
+                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Collection</p>
+                {list(collections)}
+              </div>
+            )}
+          </section>
+        );
+      })}
+      {review.length > 0 && (
+        <section>
+          <h3 className="mb-1 text-sm font-semibold text-amber-800">
+            Might not be an order <span className="font-normal text-zinc-500">({review.length})</span>
+          </h3>
+          <p className="mb-1 text-xs text-zinc-500">On no delivery list. Confirm it if it is an order; cancel it if it is not.</p>
+          {list(review)}
         </section>
-      ))}
+      )}
     </div>
+  );
+}
+
+const FINDING_LABEL: Record<string, string> = { might_not_be_order: "Might not be an order", delivery_day: "Delivery day", picture_unresolved: "Photo" };
+
+/** READ-ONLY: where an existing order's own conversation points somewhere other than what the order says. Applies nothing. */
+function ConversationReviewCard({ businessSlug }: { businessSlug: string }) {
+  const [result, setResult] = useState<Awaited<ReturnType<typeof aiAgentApi.orderReview>> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function run() {
+    setBusy(true);
+    setError(null);
+    try {
+      setResult(await aiAgentApi.orderReview(businessSlug));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to check the orders");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Card title="Check orders against their conversations" subtitle="Read-only. Looks for orders that may not be orders, delivery days staff agreed with the customer and photos nobody resolved. Nothing is changed here: you decide, using the usual actions on each order.">
+      <button type="button" className={secondaryButton} disabled={busy} onClick={() => void run()}>
+        {busy ? "Checking…" : result ? "Check again" : "Check outstanding orders"}
+      </button>
+      {error && <Notice tone="error">{error}</Notice>}
+      {result && (
+        <div className="mt-3 flex flex-col gap-3">
+          <p className="text-xs text-zinc-500">
+            Checked {result.checked} outstanding order{result.checked === 1 ? "" : "s"}{result.skipped > 0 ? ` (${result.skipped} older ones not checked)` : ""}. {result.reviews.length === 0 ? "Nothing to suggest." : `${result.reviews.length} with suggestions.`}
+          </p>
+          {result.reviews.map((r) => (
+            <div key={r.orderId} className="rounded-md border border-zinc-200 p-3 text-sm">
+              <p className="font-mono text-xs font-semibold text-zinc-900">{displayRef(r.ref)}</p>
+              {r.findings.map((f, i) => (
+                <div key={i} className="mt-2">
+                  <p className="text-zinc-800"><span className="font-medium">{FINDING_LABEL[f.kind] ?? f.kind}:</span> {f.summary}</p>
+                  {(f.current || f.suggested) && (
+                    <p className="text-xs text-zinc-600">{f.current ?? "—"} → <span className="font-medium">{f.suggested ?? "—"}</span></p>
+                  )}
+                  <ul className="mt-1 text-xs text-zinc-500">
+                    {f.evidence.map((e, j) => (
+                      <li key={j}>{formatWhen(e.at)} · {e.who}: “{e.text}”</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -739,11 +829,12 @@ export function OrdersPanel({ businessSlug, settings }: { businessSlug: string; 
       <RunsCard businessSlug={businessSlug} runs={runs} settings={settings} onSent={load} />
       <BackfillCard businessSlug={businessSlug} enabled={settings.orders_tracking_enabled === true} onDone={load} />
       <RepairCard businessSlug={businessSlug} onApplied={load} />
+      <ConversationReviewCard businessSlug={businessSlug} />
       <Card title="Orders" subtitle="Grouped by the day each order is for, not the day the message arrived. Changes you make here are recorded with your name and never message the customer.">
         <div className="mb-3 flex flex-wrap gap-1" role="tablist" aria-label="Order views">
           {TABS.map((t) => {
             const n = t.count && counts ? counts[t.count] : null;
-            const hot = (t.id === "overdue" || t.id === "missing") && (n ?? 0) > 0;
+            const hot = (t.id === "overdue" || t.id === "missing" || t.id === "review") && (n ?? 0) > 0;
             return (
               <button
                 key={t.id}

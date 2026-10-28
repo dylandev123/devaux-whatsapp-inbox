@@ -100,7 +100,17 @@ export const ATTENTION_TEXT: Record<string, string> = {
   staff_changed_in_chat: "Staff wrote about changes to this order in WhatsApp — check the order",
   history_unresolved: "Customer referred to an earlier order or place that could not be matched safely — please check",
   other_customer_note: "Needs a staff look",
+  review_order_intent: "Might not be an order (an invoice, price or product discussion, or no clear request) — confirm it, or cancel it",
 };
+
+/**
+ * The flag on an order that might not be one (see orderIntent.ts). Such an order is kept for a person to look at, but it is
+ * never listed as a delivery for any day until staff confirm it. Confirming it clears the flag; cancelling closes it.
+ */
+export const ORDER_REVIEW_ATTENTION = "review_order_intent";
+
+/** Open, and waiting for a person to say whether it is an order at all. */
+export const isUnderReview = (o: Pick<TrackedOrder, "status" | "attention">): boolean => isOpenStatus(o.status) && o.attention === ORDER_REVIEW_ATTENTION;
 
 // ── Field helpers ────────────────────────────────────────────────────────────
 
@@ -608,7 +618,14 @@ export function isReliableName(value: string | null | undefined): boolean {
 const cleanName = (value: string | null | undefined): string | null =>
   isReliableName(value) ? (value ?? "").replace(INVISIBLE, "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().replace(/^[!/]+/, "") : null;
 
-export type NameSource = "staff" | "saved" | "profile";
+/**
+ * Where a customer name came from. Only values whose origin is actually known get a specific source:
+ *   staff    typed or corrected by staff (the order's locked name, or the name staff entered on the customer's profile)
+ *   saved    the name saved for this contact on the business phone (WhatsApp address book, Baileys Contact.name)
+ *   profile  the customer's own WhatsApp profile name (pushName)
+ *   order    the name the order recorded when it was created: its origin was not kept, so it is never called a profile or saved name
+ */
+export type NameSource = "staff" | "saved" | "profile" | "order";
 
 export interface ResolvedName {
   /** The best reliable name, or null (the phone is the fallback). */
@@ -621,7 +638,7 @@ export interface ResolvedName {
 export interface NameSources {
   /** The order's own name when staff edited it (a locked field). */
   orderNameLocked?: string | null;
-  /** First + last name entered on the customer's profile by staff. */
+  /** First + last name staff entered on the customer's profile in the Inbox. */
   crmName?: string | null;
   /** The name saved for this contact on the linked phone (Baileys Contact.name). */
   savedName?: string | null;
@@ -631,14 +648,17 @@ export interface NameSources {
   orderName?: string | null;
 }
 
-/** Staff-entered name first, then the saved contact name, then the WhatsApp profile name. Unreliable values never win. */
+/**
+ * Staff-entered name first (a staff correction is never overridden), then the saved contact name, then the WhatsApp profile
+ * name, then whatever the order recorded; the phone is the fallback. Unreliable values (numbers, JIDs, placeholders) never win.
+ */
 export function pickCustomerName(s: NameSources): ResolvedName {
   const tiers: [NameSource, string | null | undefined][] = [
     ["staff", s.orderNameLocked],
     ["staff", s.crmName],
     ["saved", s.savedName],
     ["profile", s.profileName],
-    ["profile", s.orderName],
+    ["order", s.orderName],
   ];
   const usable = tiers.map(([source, v]) => [source, cleanName(v)] as const).filter((t): t is readonly [NameSource, string] => Boolean(t[1]));
   const all = [...new Set(usable.map((t) => t[1]))];

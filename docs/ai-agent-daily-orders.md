@@ -5,6 +5,9 @@ WhatsApp group at 8:00 AM (America/St_Lucia)** (today's and tomorrow's orders). 
 to see what is outstanding, and `!update` for a short list of what is new or changed. Orders are organised by the
 day they are **for**, not the day the message arrived: see "Order days, `!orders` and `!update`" below.
 
+> Later changes (order intent and review, staff-agreed delivery days, customer photos, South Deliveries, no "default day" wording in
+> order details) are described in [order understanding](ai-agent-order-understanding.md).
+
 It never messages a customer, and Approval Pilot is unchanged: tracking and reporting add no customer-bound
 outbox kind, and every customer reply still needs explicit staff approval.
 

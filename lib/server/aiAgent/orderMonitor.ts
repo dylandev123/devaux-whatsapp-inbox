@@ -17,12 +17,13 @@ import {
   orderContextWindow,
   type StaffAction,
 } from "@/lib/aiAgent/orderMonitor";
-import { loadCustomerDisplayName, loadRecentMessages } from "@/lib/server/aiAgent/context";
-import { agentDb, audit } from "@/lib/server/aiAgent/db";
+import { loadCustomerDisplayName, loadRecentMessages, loadTurnQuote, productHints, readTurnPictures } from "@/lib/server/aiAgent/context";
+import { agentDb, audit, loadActiveKnowledge } from "@/lib/server/aiAgent/db";
+import { readStaffDeliveryDate, isAffirmation } from "@/lib/aiAgent/staffDelivery";
 import { loadIdentity } from "@/lib/server/aiAgent/identity";
 import { proposeOrderUpdate } from "@/lib/server/aiAgent/model";
 import { historyForModel, type HistoryOrder } from "@/lib/aiAgent/orderHistory";
-import { flagOrderFromStaff, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
+import { applyDeliveryDay, flagOrderFromStaff, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders, tzOf } from "@/lib/server/aiAgent/orders";
 
 export interface MonitorResult {
   /** Reason codes for the event. Never empty. */
@@ -90,7 +91,12 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
     const customerName = await loadCustomerDisplayName(identity, a.contactNumber, chatId);
     let proposal: Parameters<typeof trackOrders>[0]["proposal"] = null;
     let intent: string | null = null;
-    const window = orderContextWindow(await loadRecentMessages(businessSlug, chatId, a.messageIds, ORDER_CONTEXT_FETCH), a.firstAt);
+    // The recent conversation, with the photos the customer's words point at read once (cached), voice messages marked as not
+    // transcribed and replies showing what they replied to.
+    const pictureOptions = { turnTexts: a.segments, turnAt: a.lastAt, knownProducts: async () => productHints(await loadActiveKnowledge(businessSlug)) };
+    const window = orderContextWindow(await loadRecentMessages(businessSlug, chatId, a.messageIds, ORDER_CONTEXT_FETCH, pictureOptions), a.firstAt);
+    // The turn's own photos and voice messages: the customer's "this one" under a picture.
+    const turnPictures = await readTurnPictures(businessSlug, chatId, a.messageIds, pictureOptions);
     const recent = window.forModel;
     // The customer's earlier orders: shown to the model in compact form and used by the server to resolve "same as last time".
     const history: HistoryOrder[] = plan.action === "analyse" ? await loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => []) : [];
@@ -107,7 +113,7 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
         openOrders: ordersForModel(open),
         orderHistory: historyForModel(history) ?? undefined,
         transcript: recent,
-        newMessages: a.transcript,
+        newMessages: turnPictures.note ? `${a.transcript}\n${turnPictures.note}` : a.transcript,
         author: "customer",
       });
       if (!res.proposal) {
@@ -127,7 +133,10 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
       proposal,
       segments: a.segments,
       // Grounding: the customer's own words only (this turn, and their earlier messages in the stored history).
-      customerWords: [...a.segments, ...window.forGrounding.filter((m) => m.who === "Customer").map((m) => m.text)],
+      customerWords: [...a.segments, ...window.forGrounding.filter((m) => m.who === "Customer").map((m) => m.rawText)],
+      pictureWords: [...window.forGrounding.flatMap((m) => m.pictureWords), ...turnPictures.pictureWords],
+      recent: window.forGrounding.map((m) => ({ who: m.who, text: m.rawText, at: m.at, id: m.id ?? null, quotedId: m.quotedId ?? null })),
+      quotedId: a.segments.every(isAffirmation) ? await loadTurnQuote(businessSlug, chatId, a.messageIds) : null,
       chatIds: identity.chatIds,
       history,
       messageIds: a.messageIds,
@@ -167,6 +176,28 @@ export async function monitorStaffMessage(a: MonitorStaffArgs): Promise<MonitorR
     const key = `${a.eventId}:staffflag`;
     if (await alreadyApplied(a.eventId)) return { reasons: ["orders_monitor_already_applied"] };
     const open = await loadOpenOrders(businessSlug, chatId);
+    // A delivery day staff COMMIT to ("we will deliver tomorrow") is read by rules, no model: counted from this message's own
+    // time in the business's timezone, applied to the one open order unless staff set its day, and only when nothing changed the
+    // day after this message. Offers, questions and refusals are not commitments (staffDelivery.ts).
+    const when = a.timestamp && !Number.isNaN(Date.parse(a.timestamp)) ? new Date(a.timestamp) : null;
+    const commitment = when && open.length > 0 ? readStaffDeliveryDate(a.text, when, tzOf(a.settings)) : null;
+    if (commitment?.kind === "commitment" && commitment.date && commitment.label) {
+      if (open.length > 1) return { reasons: ["orders_monitor_staff_day_ambiguous"] };
+      const done = await applyDeliveryDay({
+        businessSlug,
+        order: open[0],
+        day: { date: commitment.date, label: commitment.label, staffAt: when!.toISOString(), staffMessageId: a.whatsappMessageId, phrase: commitment.phrase ?? "" },
+        source: "staff_commitment",
+        actor: "staff",
+        key: `${a.eventId}:staffday`,
+        messageIds: [a.whatsappMessageId],
+        lastAt: when!.toISOString(),
+        timezone: tzOf(a.settings),
+      });
+      // Handled: no second reading of the same sentence. If it could not be applied (staff set the day), the normal reading
+      // below still raises its flag for a person to check.
+      if (done.applied) return { reasons: [done.reason] };
+    }
     const plan = monitorPrefilter({ author: "staff", segments: [a.text], hasMedia: a.hasMedia, openOrders: open.length });
     if (plan.action !== "analyse") return { reasons: [plan.reason] };
     if (monitorBudgetExceeded(await callsLastHour(businessSlug, chatId))) {

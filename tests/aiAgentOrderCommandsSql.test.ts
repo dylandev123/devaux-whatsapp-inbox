@@ -810,9 +810,10 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.deepEqual(last.changes.requested_for, { before, after: "Fri 30 Oct (30 Oct)" });
     assert.match(await nextReport("!orders 30 Oct"), new RegExp(ref(o)));
     assert.doesNotMatch(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
-    // "Whenever" names no day: recorded, and the business default applies (said so, not silently).
+    // "Whenever" names no day: recorded, and the reply names the day the order is now for (without "default" wording).
     const loose = await groupSays(`!update ${ref(o)} delivery whenever you can`);
-    assert.match(reply(loose), /No specific day in that, so the order uses the default day/);
+    assert.match(reply(loose), /No specific day in that, so the order is for \w{3} \d{1,2} \w{3}/);
+    assert.doesNotMatch(reply(loose), /default/);
     // Words that are not a day are recorded too, but the order is then honestly "day unclear".
     const vague = await groupSays(`!update ${ref(o)} delivery sometime next week`);
     assert.match(reply(vague), /not a date I can read, so the order's day is unclear/);

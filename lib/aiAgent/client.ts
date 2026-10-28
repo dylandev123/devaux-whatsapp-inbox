@@ -432,7 +432,7 @@ export interface BackfillRunView {
 /** An order plus the best name the Inbox knows (staff-entered, saved contact, then WhatsApp profile name). */
 export type OrderView = TrackedOrder & {
   display_name?: string | null;
-  name_source?: "staff" | "saved" | "profile" | null;
+  name_source?: "staff" | "saved" | "profile" | "order" | null;
   /** The day the order is for (YYYY-MM-DD, business timezone) and how it reads; null when none could be read. */
   fulfilment_date?: string | null;
   fulfilment_date_label?: string | null;
@@ -441,7 +441,9 @@ export type OrderView = TrackedOrder & {
   /** "stated": a readable day was given; "default": the 9 AM business default; "unreadable": words nobody can read. */
   date_source?: "stated" | "default" | "unreadable";
   /** Where the order belongs today (open orders only). */
-  bucket?: "overdue" | "today" | "tomorrow" | "later" | "undated" | null;
+  bucket?: "overdue" | "today" | "tomorrow" | "later" | "undated" | "review" | null;
+  /** The reviewed southern destination ("Vieux Fort", "Laborie"…) of a DELIVERY, from its current address; null when not clearly south. */
+  south_group?: string | null;
   /** Missing essentials, as field keys ("items", "quantity", "fulfilment_method", "delivery_address", "requested_for"). */
   gaps?: string[];
   /** The default delivery location staff saved for this customer, shown beside the order's own address. */
@@ -459,7 +461,7 @@ export interface RepairPreviewView {
   truncated: number;
 }
 export type RepairOutcomeView = "applied" | "already_applied" | "changed_since_preview" | "nothing_to_apply" | "not_found" | "conflict";
-export type OrderViewName = "all" | "today" | "tomorrow" | "overdue" | "missing" | "undated";
+export type OrderViewName = "all" | "today" | "tomorrow" | "overdue" | "missing" | "undated" | "review";
 export interface OrderCountsView {
   open: number;
   today: number;
@@ -469,6 +471,8 @@ export interface OrderCountsView {
   undated: number;
   missing: number;
   attention: number;
+  /** Open orders that might not be orders: on no delivery list until a person confirms them. */
+  review: number;
 }
 export interface OrderRunView {
   id: string;
@@ -513,6 +517,8 @@ export const aiAgentApi = {
     api<{ orders: OrderView[]; runs: OrderRunView[]; coverage: import("@/lib/aiAgent/orders").Coverage; counts: OrderCountsView; timezone: string; today: string }>(
       `/api/ai-agent/orders${q(b, `&status=${status}&view=${view}&q=${encodeURIComponent(query)}`)}`
     ),
+  /** READ-ONLY: where the conversation behind an existing order points somewhere other than what the order says. */
+  orderReview: (b: string) => api<{ reviews: import("@/lib/aiAgent/orderReview").OrderReview[]; checked: number; skipped: number }>(`/api/ai-agent/orders/review${q(b)}`),
   orderEvents: (b: string, orderId: string) => api<{ events: OrderEventView[] }>(`/api/ai-agent/orders${q(b, `&orderId=${encodeURIComponent(orderId)}`)}`),
   updateOrder: (
     b: string,

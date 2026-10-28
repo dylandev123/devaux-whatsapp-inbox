@@ -2,7 +2,7 @@
 // tests/aiAgentOrderCommands.test.ts. The server side (lib/server/aiAgent/orders.ts handleOrderCommand) loads the
 // orders, checks who may do what, and applies the change through the same code the Orders dashboard uses.
 //
-//   !orders [today|tomorrow|<date>|all|overdue|missing|undated]   what is outstanding, by the day it is for (read-only)
+//   !orders [today|tomorrow|<date>|all|overdue|missing|undated|review]   what is outstanding, by the day it is for (read-only)
 //   !update                         what is new or changed since the last update (read-only)
 //   !update #QU6U9 confirmed        staff-confirm one order
 //   !update #QU6U9 cancelled        cancel it
@@ -21,8 +21,8 @@
 
 import { normalizeText } from "./escalationUpdates.ts";
 import { addressProvenance, addressSourceLine } from "./orderAddress.ts";
-import { type DateSource, effectiveDate, effectiveMethod, isDefaultedDay } from "./orderDefaults.ts";
-import { dayLabel, orderDate, parseOrdersView, type OrdersView } from "./orderViews.ts";
+import { type DateSource, effectiveDate, effectiveMethod } from "./orderDefaults.ts";
+import { dayLabel, orderDate, parseOrdersView, timeOfDay, type OrdersView } from "./orderViews.ts";
 import { BULK_HELP, MAX_INSTRUCTION, parseProposalCode, TEACH_HELP, type ProposalKind } from "./orderTeach.ts";
 import {
   DEFAULT_ORDERS_TIMEZONE,
@@ -236,7 +236,7 @@ const STATUS_NAME: Record<string, string> = { possible: "possible", awaiting_con
 export const ORDER_HELP = [
   "ℹ️ Order commands:",
   "!orders — outstanding orders for today and tomorrow",
-  "!orders today | tomorrow | 30 Oct | all | overdue | missing | undated",
+  "!orders today | tomorrow | 30 Oct | all | overdue | missing | undated | review",
   "!update — what is new or changed since the last update",
   "!update #REF confirmed | cancelled | 2 bags | delivery tomorrow",
   "!order <name or phone> — find an order",
@@ -257,6 +257,8 @@ export const ORDERS_HELP = [
   "!orders overdue — older, still open",
   "!orders missing — lacking products, quantity, delivery/collection, address or day",
   "!orders undated — no day given",
+  "!orders review — possible orders that are on no list until you confirm them",
+  "Deliveries to the south are grouped under 🧭 South Deliveries on each day.",
   "!orders complete all — complete today's outstanding orders (preview, then !confirm B-CODE)",
 ].join("\n");
 
@@ -291,7 +293,7 @@ export const ORDER_REPLY = {
       source === "stated"
         ? ""
         : source === "default"
-          ? ` ℹ️ No specific day in that, so the order uses the default day${defaultDay ? ` (${dayLabel(defaultDay)})` : ""}.`
+          ? ` ℹ️ No specific day in that${defaultDay ? `, so the order is for ${dayLabel(defaultDay)}` : ""}.`
           : " ⚠️ That is not a date I can read, so the order's day is unclear. Use e.g. “delivery 30 Oct” or “delivery tomorrow”."
     }`,
   sameDelivery: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} already has that date — no change.`,
@@ -334,8 +336,6 @@ function changeText(changes: OrderEventLine["changes"]): string {
   return parts.join("; ") || "noted";
 }
 
-const NAME_SOURCE_TEXT: Record<string, string> = { staff: "entered by staff", saved: "saved contact", profile: "WhatsApp profile name" };
-
 /** "Completed 27 Oct, 14:05 by 1758…" from the order's own record and the event that completed it. */
 function completionLine(o: TrackedOrder, events: (OrderEventLine & { actor_id?: string | null })[], when: (iso: string | null) => string | null): string {
   const by = events.find((e) => (e.changes?.status as { after?: unknown } | undefined)?.after === "fulfilled")?.actor_id;
@@ -365,20 +365,15 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     `🔎 *${orderDisplayName(o, name ? { [o.id]: name } : undefined) ?? phone ?? "Unknown customer"} · ${displayRef(o.ref_code)}*`,
     `Status: ${status}`,
     ...(phone ? [`Phone: ${phone}`] : []),
-    ...(name?.name && name.source ? [`Name: ${NAME_SOURCE_TEXT[name.source]}`] : []),
     ...(o.items.length > 0 ? o.items.map((i) => `• ${orderItemText(i)}`) : ["• no products yet"]),
     `Method: ${effectiveMethod(o).method}${effectiveMethod(o).defaulted ? " (default)" : ""}${o.delivery_address ? ` · ${clip(o.delivery_address, 120)}` : ""}`,
     ...(o.delivery_address ? [addressSourceLine(addressProvenance(o, events))].filter((l): l is string => Boolean(l)) : []),
     ...(() => {
+      // The actual date only. Whether it was said, agreed by staff or defaulted stays in the order's history, not in this line.
       const day = effectiveDate(o, timezone);
       if (day.source === "unreadable") return [`When: ${clip(o.requested_for ?? "", 80)} — no date read`];
-      const shown = dayLabel(day.date!);
-      if (day.source === "default") {
-        // A stored "Thu 29 Oct (default)" is the business rule's own value, not the customer's words; only a time of day they gave is theirs.
-        const said = isDefaultedDay(o.requested_for) ? ((o.requested_for ?? "").match(/\(default, (.+)\)$/)?.[1] ?? null) : o.requested_for;
-        return [`Day: ${shown} (default${said ? `; they said “${clip(said, 40)}”` : " — no day given"})`];
-      }
-      return [`Day: ${shown} (${clip(o.requested_for ?? "", 60)})`];
+      const time = timeOfDay(o.requested_for);
+      return [`Day: ${dayLabel(day.date!)}${time ? ` · ${time}` : ""}`];
     })(),
     ...(o.notes ? [`Note: ${clip(o.notes, 160)}`] : []),
     ...conflictFields(o).map((f) => `⚠️ Customer now says ${conflictText(f, o.field_conflicts[f]!, 50)}`),

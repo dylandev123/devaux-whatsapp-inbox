@@ -9,6 +9,7 @@
 // cancels or deletes an order: an old order stays listed under Overdue until a person completes or cancels it.
 
 import { type AddressProvenance, addressTag } from "./orderAddress.ts";
+import { classifyDeliveryRegion, southGroupOrder } from "./deliveryRegions.ts";
 import { effectiveDate, effectiveMethod } from "./orderDefaults.ts";
 import { addDays, resolveRequestedDay } from "./orderText.ts";
 import {
@@ -19,6 +20,7 @@ import {
   displayRef,
   formatPhone,
   isOpenStatus,
+  isUnderReview,
   localParts,
   MISSING_TEXT,
   type OrderNames,
@@ -37,7 +39,9 @@ export type OrdersView =
   | { type: "all" }
   | { type: "overdue" }
   | { type: "missing" }
-  | { type: "undated" };
+  | { type: "undated" }
+  /** Open orders that might not be orders at all (an invoice, a price talk…): waiting for a person to confirm or cancel them. */
+  | { type: "review" };
 
 /**
  * The argument after "!orders", or null when it is not one we understand (the caller shows the usage help).
@@ -53,6 +57,7 @@ export function parseOrdersView(arg: string, now: Date, timezone: string = DEFAU
   if (text === "overdue") return { type: "overdue" };
   if (text === "missing") return { type: "missing" };
   if (text === "undated") return { type: "undated" };
+  if (text === "review" || text === "possible") return { type: "review" };
   if (text.length > 40) return null;
   const day = resolveRequestedDay(text, now, timezone);
   return day ? { type: "day", date: day.date } : null;
@@ -60,7 +65,8 @@ export function parseOrdersView(arg: string, now: Date, timezone: string = DEFAU
 
 // ── Dates ────────────────────────────────────────────────────────────────────
 
-export type Bucket = "overdue" | "today" | "tomorrow" | "later" | "undated";
+/** "review": might not be an order; it is in no day's list until a person confirms it. */
+export type Bucket = "overdue" | "today" | "tomorrow" | "later" | "undated" | "review";
 
 export interface DayContext {
   timezone: string;
@@ -90,7 +96,8 @@ export const dayLabel = (dateKey: string): string => addDays(dateKey, 0).label;
  * Where an order belongs today. An undated order is "undated" only on the day it was first mentioned; after that it is
  * overdue, so an old enquiry is never silently carried into a new day as if it were fresh.
  */
-export function bucketOf(o: Pick<TrackedOrder, "requested_for" | "first_message_at">, ctx: DayContext): Bucket {
+export function bucketOf(o: Pick<TrackedOrder, "requested_for" | "first_message_at"> & Partial<Pick<TrackedOrder, "status" | "attention">>, ctx: DayContext): Bucket {
+  if (o.status !== undefined && o.attention !== undefined && isUnderReview({ status: o.status, attention: o.attention })) return "review";
   const date = orderDate(o, ctx.timezone);
   if (date === null) return localParts(new Date(o.first_message_at), ctx.timezone).dateKey < ctx.today ? "overdue" : "undated";
   if (date < ctx.today) return "overdue";
@@ -116,7 +123,7 @@ const gapText = (key: string) => (key === "requested_for" ? "day" : (MISSING_TEX
 /** Open, and something a person should look at: it is overdue, lacks essential information, or carries a warning. */
 export function needsAttention(o: TrackedOrder, ctx: DayContext): boolean {
   if (!isOpenStatus(o.status)) return false;
-  return bucketOf(o, ctx) === "overdue" || orderGaps(o, ctx.timezone).length > 0 || orderWarning(o) !== null;
+  return isUnderReview(o) || bucketOf(o, ctx) === "overdue" || orderGaps(o, ctx.timezone).length > 0 || orderWarning(o) !== null;
 }
 
 export interface OrderCounts {
@@ -129,16 +136,23 @@ export interface OrderCounts {
   undated: number;
   missing: number;
   attention: number;
+  /** Open orders waiting for a person to say whether they are orders. Counted in `open`, in no day. */
+  review: number;
 }
 
 /** The numbers shown beside the views (WhatsApp footer, website tabs): one definition for both. */
 export function countOrders(orders: TrackedOrder[], ctx: DayContext): OrderCounts {
-  const counts: OrderCounts = { open: 0, today: 0, tomorrow: 0, later: 0, overdue: 0, undated: 0, missing: 0, attention: 0 };
+  const counts: OrderCounts = { open: 0, today: 0, tomorrow: 0, later: 0, overdue: 0, undated: 0, missing: 0, attention: 0, review: 0 };
   for (const o of orders) {
     if (!isOpenStatus(o.status)) continue;
     counts.open += 1;
+    if (isUnderReview(o)) {
+      counts.review += 1;
+      counts.attention += 1;
+      continue;
+    }
     const bucket = bucketOf(o, ctx);
-    if (bucket !== "undated") counts[bucket] += 1;
+    if (bucket !== "undated" && bucket !== "review") counts[bucket] += 1;
     if (orderDate(o, ctx.timezone) === null) counts.undated += 1;
     if (orderGaps(o, ctx.timezone).length > 0) counts.missing += 1;
     if (needsAttention(o, ctx)) counts.attention += 1;
@@ -148,7 +162,9 @@ export function countOrders(orders: TrackedOrder[], ctx: DayContext): OrderCount
 
 /** Which orders a view lists, in the order they are shown (by day, then by when they were first mentioned). */
 export function selectOrders(view: OrdersView, orders: TrackedOrder[], ctx: DayContext): TrackedOrder[] {
-  const open = orders.filter((o) => isOpenStatus(o.status));
+  const everyOpen = orders.filter((o) => isOpenStatus(o.status));
+  // An order that might not be an order is in no day's list: it has its own view, and "all" ends with it.
+  const open = everyOpen.filter((o) => !isUnderReview(o));
   const byDate = (a: TrackedOrder, b: TrackedOrder) =>
     (orderDate(a, ctx.timezone) ?? "9999").localeCompare(orderDate(b, ctx.timezone) ?? "9999") || Date.parse(a.first_message_at) - Date.parse(b.first_message_at);
   const inBucket = (...wanted: Bucket[]) => open.filter((o) => wanted.includes(bucketOf(o, ctx)));
@@ -163,6 +179,8 @@ export function selectOrders(view: OrdersView, orders: TrackedOrder[], ctx: DayC
       return open.filter((o) => orderDate(o, ctx.timezone) === view.date).sort(byDate);
     case "all":
       return [...open].sort(byDate);
+    case "review":
+      return everyOpen.filter(isUnderReview).sort((a, b) => Date.parse(a.first_message_at) - Date.parse(b.first_message_at));
     case "overdue":
       return inBucket("overdue").sort(byDate);
     case "undated":
@@ -262,6 +280,20 @@ function pack(title: string, chunks: Chunk[]): { parts: string[]; omitted: numbe
   return { parts, omitted };
 }
 
+export const SOUTH_HEADING = "🧭 *South Deliveries*";
+
+/** The southern deliveries among `orders` (all of them deliveries), grouped by destination in the table's order. */
+export function southDeliveries(orders: TrackedOrder[]): { group: string; orders: TrackedOrder[] }[] {
+  const byGroup = new Map<string, TrackedOrder[]>();
+  for (const o of orders) {
+    if (effectiveMethod(o).method !== "delivery") continue;
+    const region = classifyDeliveryRegion(o.delivery_address);
+    if (region.region === "south") byGroup.set(region.group, [...(byGroup.get(region.group) ?? []), o]);
+  }
+  const order = southGroupOrder();
+  return [...byGroup.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0])).map(([group, list]) => ({ group, orders: list }));
+}
+
 const METHOD_HEADING: Record<string, string> = { delivery: "🚚 *Delivery*", collection: "🛍 *Collection*", none: "❓ *Delivery or collection not stated*" };
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -305,11 +337,30 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
     for (const method of ["delivery", "collection"] as const) {
       const group = dayOrders.filter((o) => effectiveMethod(o).method === method);
       if (group.length === 0) continue;
-      chunks.push({ text: METHOD_HEADING[method], heading: true });
-      for (const o of group) chunks.push({ text: numbered(o) });
+      if (method === "collection") {
+        chunks.push({ text: METHOD_HEADING[method], heading: true });
+        for (const o of group) chunks.push({ text: numbered(o) });
+        continue;
+      }
+      // Deliveries going to a reviewed southern destination are listed together under it (one run for the driver); each
+      // order appears once, in exactly one of the two lists. Anything not clearly southern stays in the ordinary Delivery list.
+      const south = southDeliveries(group);
+      const rest = group.filter((o) => !south.some((g) => g.orders.includes(o)));
+      if (rest.length > 0) {
+        chunks.push({ text: METHOD_HEADING.delivery, heading: true });
+        for (const o of rest) chunks.push({ text: numbered(o) });
+      }
+      if (south.length > 0) {
+        chunks.push({ text: SOUTH_HEADING, heading: true });
+        for (const g of south) {
+          chunks.push({ text: `📍 *${g.group}* (${g.orders.length})`, heading: true });
+          for (const o of g.orders) chunks.push({ text: numbered(o) });
+        }
+      }
     }
   };
-  const flat = (orders: TrackedOrder[]) => orders.forEach((o) => chunks.push({ text: numbered(o, { showDate: true }) }));
+  const flat = (orders: TrackedOrder[], showDate = true) => orders.forEach((o) => chunks.push({ text: numbered(o, { showDate }) }));
+  const reviewing = input.orders.filter(isUnderReview).sort((a, b) => Date.parse(a.first_message_at) - Date.parse(b.first_message_at));
 
   // Orders first mentioned today with no day yet are not lost, but they are not "today's" either.
   const fresh = input.orders.filter((o) => isOpenStatus(o.status) && bucketOf(o, ctx) === "undated");
@@ -351,6 +402,10 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
         chunks.push({ text: `❔ *DAY NOT CLEAR (${noDay.length})*`, heading: true });
         flat(noDay);
       }
+      if (reviewing.length > 0) {
+        chunks.push({ text: `🔎 *MIGHT NOT BE AN ORDER (${reviewing.length})*`, heading: true });
+        flat(reviewing, false);
+      }
       break;
     }
     case "overdue": {
@@ -370,6 +425,12 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       empty = "✅ Every outstanding order has the essentials (products, quantity, delivery address).";
       flat(picked);
       break;
+    case "review":
+      title = "📋 *POSSIBLE ORDERS TO REVIEW*";
+      empty = "✅ Nothing waiting for review.";
+      flat(picked, false);
+      if (picked.length > 0) chunks.push({ text: "These are not on any delivery list. Real order: !update #REF confirmed · not an order: !update #REF cancelled" });
+      break;
     case "undated":
       title = "📋 *ORDERS WITH AN UNCLEAR DAY*";
       empty = "✅ Every outstanding order has a clear day.";
@@ -382,6 +443,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
   // Pointers to what this answer does NOT show, so nothing waits unseen.
   const pointers: string[] = [];
   if (view.type !== "overdue" && counts.overdue > 0) pointers.push(`⏰ ${plural(counts.overdue, "overdue order")} — !orders overdue`);
+  if (view.type !== "review" && view.type !== "all" && counts.review > 0) pointers.push(`🔎 ${plural(counts.review, "possible order")} to review (not on any list) — !orders review`);
   if (view.type !== "missing" && counts.missing > 0) pointers.push(`⚠️ ${plural(counts.missing, "order")} missing information — !orders missing`);
   if (view.type === "default" && counts.later > 0) pointers.push(`🗓 ${plural(counts.later, "later order")} — !orders <date>`);
   if (view.type === "default") pointers.push("Details: !order #REF · Done: !order #REF completed");

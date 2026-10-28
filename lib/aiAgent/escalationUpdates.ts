@@ -343,25 +343,31 @@ export function quantityStated(quantity: string, customerTexts: string[]): boole
 export function groundOrderDraft(
   draft: OrderRequestDraft | null,
   prior: OrderRequestDraft | null,
-  customerTexts: string[]
+  customerTexts: string[],
+  /**
+   * Text printed on a photo the customer pointed at ("this one"), as read from the picture. It can ground a PRODUCT, variant or
+   * size, and nothing else: a number on a label ("25kg") never grounds a quantity, an address or a day.
+   */
+  pictureTexts: string[] = []
 ): OrderRequestDraft | null {
   if (!draft) return null;
   const corpusWords = customerTexts.flatMap(wordsOf);
   const corpus = new Set(corpusWords.map(stem));
+  const pictureCorpus = new Set([...corpusWords, ...pictureTexts.flatMap(wordsOf)].map(stem));
   const corpusDigits = new Set(corpusWords.map((w) => NUMBER_WORDS[w] ?? w).filter((w) => /^\d+(\.\d+)?$/.test(w)));
   const priorItems = new Map((prior?.items ?? []).map((i) => [productKey(i.product), i]));
 
   const items: OrderItem[] = [];
   for (const item of draft.items) {
     const known = priorItems.get(productKey(item.product));
-    if (!known && coverage(item.product, corpus) < 0.5) continue; // never said: not an order line
+    if (!known && coverage(item.product, pictureCorpus) < 0.5) continue; // never said (or shown, when they pointed at a photo): not an order line
     let quantity = item.quantity;
     if (quantity && !(known && sameText(known.quantity, quantity)) && !quantityGrounded(quantity, corpus, corpusDigits)) {
       quantity = known?.quantity ?? null;
     }
     // Variant and size (daily order tracking) are kept only when the customer wrote them.
     const detail = (value: string | null | undefined, was: string | null | undefined) =>
-      value && (sameText(value, was) || coverage(value, corpus) >= 0.5) ? value : (was ?? null);
+      value && (sameText(value, was) || coverage(value, pictureCorpus) >= 0.5) ? value : (was ?? null);
     const variant = detail(item.variant, known?.variant);
     const size = detail(item.size, known?.size);
     items.push({ product: item.product, quantity, ...(variant ? { variant } : {}), ...(size ? { size } : {}) });
