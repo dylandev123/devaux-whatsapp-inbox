@@ -5,6 +5,7 @@ import type { Coverage } from "@/lib/aiAgent/orders";
 import { aiAgentApi, BackfillRunView, OrderCountsView, OrderEventView, OrderRunView, OrderView, OrderViewName, RepairOutcomeView, RepairPreviewView } from "@/lib/aiAgent/client";
 import type { AgentSettings } from "@/lib/aiAgent/engine";
 import { ATTENTION_TEXT, CONFLICT_LABEL, conflictFields, conflictValueText, confirmationLabel, coverageLines, displayRef, formatLine, MISSING_TEXT, ORDER_STATUSES, type OrderLine, type OrderStatus } from "@/lib/aiAgent/orders";
+import { ADDRESS_ORIGIN_LABEL } from "@/lib/aiAgent/orderAddress";
 import { useDebounced } from "@/components/admin/aiAgent/useDebounced";
 import { Badge, Card, dangerButton, formatWhen, inputClass, Notice, primaryButton, secondaryButton } from "@/components/admin/aiAgent/ui";
 
@@ -112,7 +113,7 @@ function inferredText(value: unknown): string {
   const v = (value ?? {}) as { items?: string[]; delivery_address?: string; unresolved?: string[] };
   const parts = [
     ...(v.items?.length ? [`products from ${v.items.map(displayRef).join(", ")}`] : []),
-    ...(v.delivery_address ? [`address from ${displayRef(v.delivery_address)}`] : []),
+    ...(v.delivery_address ? [v.delivery_address === "saved location" ? "Saved address" : `Previous address from ${displayRef(v.delivery_address)}`] : []),
     ...(v.unresolved?.length ? [`not resolved: ${v.unresolved.join("; ")}`] : []),
   ];
   return parts.join("; ") || "—";
@@ -199,6 +200,15 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
         </span>
         {order.requested_for && <span className="text-zinc-500">“{order.requested_for}”</span>}
         {order.delivery_address && <span>— {order.delivery_address}</span>}
+        {order.delivery_address && order.address_origin && (
+          <span
+            className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${order.address_origin === "saved" || order.address_origin === "previous" ? "bg-amber-50 text-amber-800" : "bg-zinc-100 text-zinc-600"}`}
+            title={order.address_origin === "saved" || order.address_origin === "previous" ? "Not stated in this chat — filled in from the customer's records. Check it, or edit it to confirm." : undefined}
+          >
+            {ADDRESS_ORIGIN_LABEL[order.address_origin]}
+            {order.address_origin === "previous" && order.address_from_ref ? ` · ${displayRef(order.address_from_ref)}` : ""}
+          </span>
+        )}
       </p>
       {order.saved_location && order.fulfilment_method !== "collection" && (
         <p className="text-xs text-zinc-600">
