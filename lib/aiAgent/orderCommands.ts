@@ -17,6 +17,7 @@
 // active order; with two or more matches nothing is changed and the choices are listed. No model is involved.
 
 import { normalizeText } from "./escalationUpdates.ts";
+import { addressProvenance, addressSourceLine } from "./orderAddress.ts";
 import { type DateSource, effectiveDate, effectiveMethod, isDefaultedDay } from "./orderDefaults.ts";
 import { dayLabel, orderDate, parseOrdersView, type OrdersView } from "./orderViews.ts";
 import {
@@ -335,6 +336,7 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     ...(name?.name && name.source ? [`Name: ${NAME_SOURCE_TEXT[name.source]}`] : []),
     ...(o.items.length > 0 ? o.items.map((i) => `• ${orderItemText(i)}`) : ["• no products yet"]),
     `Method: ${effectiveMethod(o).method}${effectiveMethod(o).defaulted ? " (default)" : ""}${o.delivery_address ? ` · ${clip(o.delivery_address, 120)}` : ""}`,
+    ...(o.delivery_address ? [addressSourceLine(addressProvenance(o, events))].filter((l): l is string => Boolean(l)) : []),
     ...(() => {
       const day = effectiveDate(o, timezone);
       if (day.source === "unreadable") return [`When: ${clip(o.requested_for ?? "", 80)} — no date read`];
@@ -361,7 +363,6 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     .filter((i): i is NonNullable<typeof i> => Boolean(i));
   const filled = [
     ...(inferred.some((i) => i.items?.length) ? [`products from ${[...new Set(inferred.flatMap((i) => i.items ?? []))].map(from).join(", ")}`] : []),
-    ...(inferred.some((i) => i.delivery_address) ? [`address from ${[...new Set(inferred.flatMap((i) => (i.delivery_address ? [i.delivery_address] : [])))].map(from).join(", ")}`] : []),
   ];
   if (filled.length > 0) lines.push(`ℹ️ From earlier orders: ${filled.join("; ")} — not stated in this chat`);
   const unresolved = [...new Set(inferred.flatMap((i) => i.unresolved ?? []))];

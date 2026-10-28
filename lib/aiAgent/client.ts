@@ -446,6 +446,9 @@ export type OrderView = TrackedOrder & {
   gaps?: string[];
   /** The default delivery location staff saved for this customer, shown beside the order's own address. */
   saved_location?: { content: string; set_at: string } | null;
+  /** Where the address came from: given by the customer, set by staff, or filled from the saved default / a previous order. */
+  address_origin?: "customer" | "staff" | "saved" | "previous" | null;
+  address_from_ref?: string | null;
 };
 /** Preview of the "Review existing orders" repair (admin only). Mirrors lib/server/aiAgent/orderRepair.ts RepairPreview. */
 export interface RepairPreviewView {

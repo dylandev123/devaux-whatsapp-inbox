@@ -44,6 +44,7 @@ import {
   upgradeGenericLines,
 } from "@/lib/aiAgent/orderHistory";
 import { loadStaffLocationSafe } from "@/lib/server/aiAgent/customerStaffMemory";
+import { type AddressEvent, type AddressProvenance, addressProvenance, isInferredAddress, sameAddress } from "@/lib/aiAgent/orderAddress";
 import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote, keepDefaultedDay, nameStated, withCreationDefaults, withDeliveryContact } from "@/lib/aiAgent/orderDefaults";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
 import { buildOrdersView, buildUpdateSummary, countOrders, dayContext, type OrderEventRow, orderDate, type OrdersView, summarizeUpdates } from "@/lib/aiAgent/orderViews";
@@ -229,6 +230,36 @@ export async function listOrderEvents(businessSlug: string, orderId: string) {
     .limit(50);
   if (error) throw new Error(error.message);
   return data ?? [];
+}
+
+// ── Where each order's address came from ─────────────────────────────────────
+
+/**
+ * Address provenance for a list of orders, read from the order history that already exists (no new data): one query for
+ * the whole list, scoped to the business. The newest events are read first, so if a very long history is ever cut off it
+ * is the OLD "filled from history" event that is lost (the address then reads as the customer's own), never a newer
+ * change. Anything unreadable also reads as the customer's own address: a failure here can never invent an "inferred" label.
+ */
+export async function loadAddressProvenance(businessSlug: string, orders: TrackedOrder[]): Promise<Record<string, AddressProvenance>> {
+  const withAddress = orders.filter((o) => o.delivery_address);
+  const out: Record<string, AddressProvenance> = Object.fromEntries(withAddress.map((o) => [o.id, addressProvenance(o, [])]));
+  if (withAddress.length === 0) return out;
+  try {
+    const { data, error } = await agentDb()
+      .from("ai_agent_order_events")
+      .select("order_id, kind, actor_kind, changes, created_at")
+      .eq("business_slug", businessSlug)
+      .in("order_id", withAddress.map((o) => o.id).slice(0, 500))
+      .order("created_at", { ascending: false })
+      .limit(5000);
+    if (error) return out;
+    const byOrder = new Map<string, AddressEvent[]>();
+    for (const e of (data ?? []) as (AddressEvent & { order_id: string })[]) byOrder.set(e.order_id, [...(byOrder.get(e.order_id) ?? []), e]);
+    for (const o of withAddress) if (byOrder.has(o.id)) out[o.id] = addressProvenance(o, byOrder.get(o.id)!);
+  } catch {
+    /* read as the customer's own address */
+  }
+  return out;
 }
 
 // ── Saved delivery locations (website) ───────────────────────────────────────
@@ -733,6 +764,13 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       continue;
     }
 
+    // An address the AI filled from the customer's records stops being "inferred" the moment the customer writes it themselves,
+    // even when it is the very same place: that is a confirmation, and it is recorded below. Looked up only when it could matter.
+    const priorInferred =
+      existing?.delivery_address && refined.delivery_address && sameAddress(existing.delivery_address, refined.delivery_address)
+        ? isInferredAddress((await loadAddressProvenance(businessSlug, [existing]))[existing.id] ?? { origin: null })
+        : false;
+
     await write(`${args.dedupeBase}:${index}`, existing, (cur) => {
       // "Tomorrow" counts from when the customer WROTE it, in the business's timezone: a later retry or backfill cannot move it.
       const anchored = refined.requested_for ? anchorRequestedFor(refined.requested_for, cur?.requested_for, messageTimeFor(refined.requested_for, segments, args.segmentTimes, args.lastAt), tz) : null;
@@ -777,6 +815,8 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       const created = cur ? null : withCreationDefaults(merged.fields, ctx.firstAt, tz);
       const fields = created ? created.fields : merged.fields;
       const changed = cur ? merged.changes.length > 0 : true;
+      const confirmsAddress =
+        priorInferred && Boolean(cur?.delivery_address) && Boolean(adjusted.delivery_address) && sameAddress(cur!.delivery_address!, adjusted.delivery_address!) && statedThisTurn("delivery_address", adjusted.delivery_address, segments);
       // A customer contradicting a staff-locked field: the staff value stays, the proposal is recorded for a person.
       const conflicts: FieldConflicts = { ...(cur?.field_conflicts ?? {}) };
       for (const c of merged.conflicts) conflicts[c.field] = { proposed: c.after, current: c.before, at: args.lastAt };
@@ -786,7 +826,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       const unresolvedFlag = fill.unresolved.length > 0 && !plan.attention ? "history_unresolved" : null;
       const attention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : (unresolvedFlag ?? plan.attention);
       const flagged = Boolean(cur) && unresolvedFlag !== null;
-      if (cur && plan.event === "no_change" && !changed && !conflictsChanged && !flagged) return null;
+      if (cur && plan.event === "no_change" && !changed && !conflictsChanged && !flagged && !confirmsAddress) return null;
       const finalPlan = { ...plan, attention };
       const itemsChanged = merged.changes.some((c) => c.field === "items");
       const inferredItems = [...(fillItems.length > 0 && fill.sources.items ? [fill.sources.items] : []), ...nominatedRefs, ...upgradedRefs];
@@ -801,10 +841,19 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       }
       return {
         row: rowFrom(cur, fields, finalPlan, { ...ctx, conflicts }),
-        event: cur && !changed && conflictsChanged && finalPlan.event === "no_change" ? "locked_field_conflict" : cur && !changed && flagged && finalPlan.event === "no_change" ? "attention_flagged" : finalPlan.event,
+        event:
+          cur && !changed && conflictsChanged && finalPlan.event === "no_change"
+            ? "locked_field_conflict"
+            : cur && !changed && flagged && finalPlan.event === "no_change"
+              ? "attention_flagged"
+              : confirmsAddress && !changed && finalPlan.event === "no_change"
+                ? "address_confirmed"
+                : finalPlan.event,
         actorKind: finalPlan.event === "customer_cancelled" ? "customer" : "ai",
         changes: {
           ...diff(merged.changes),
+          // The customer wrote the address the AI had filled in: recorded (before = after) so it no longer reads as inferred.
+          ...(confirmsAddress && !merged.changes.some((c) => c.field === "delivery_address") ? { delivery_address: { before: cur!.delivery_address, after: cur!.delivery_address } } : {}),
           ...(conflictsChanged ? { field_conflicts: { before: cur?.field_conflicts ?? {}, after: conflicts } } : {}),
           ...(removal && removal.removed.length > 0 && merged.changes.some((c) => c.field === "items") ? { removed_items: { before: removal.removed.map((i) => i.product), after: null } } : {}),
           ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}),
@@ -1202,7 +1251,7 @@ export async function buildSummaryNow(settings: AgentSettings, trigger: "schedul
   const [orders, coverage] = await Promise.all([loadOutstandingOrders(settings.business_slug), loadCoverage(settings, now)]);
   const names = await loadOrderNames(settings.business_slug, orders);
   const warning = coverageWarning(coverage);
-  const built = buildOrdersView({ view, orders, names, now, timezone: tzOf(settings), warning });
+  const built = buildOrdersView({ view, orders, names, now, timezone: tzOf(settings), warning, addresses: await loadAddressProvenance(settings.business_slug, orders) });
   return { text: built.parts.join("\n\n"), parts: built.parts, shown: built.shown, attention: built.counts.attention, overdue: built.counts.overdue };
 }
 
@@ -1662,7 +1711,7 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
     const everyone = await loadOrderNames(slug, open);
     // Coverage (is anything being missed?) only matters on the default view; it is the most expensive read here.
     const warning = command.view.type === "default" ? coverageWarning(await loadCoverage(settings, now)) : null;
-    const view = buildOrdersView({ view: command.view, orders: open, names: everyone, now, timezone: tzOf(settings), warning });
+    const view = buildOrdersView({ view: command.view, orders: open, names: everyone, now, timezone: tzOf(settings), warning, addresses: await loadAddressProvenance(slug, open) });
     await audit(slug, "staff", senderAuth.senderId, "orders.lookup", { type: "chat", id: fromGroup }, { command: "orders", view: command.view.type, shown: view.shown });
     // One at a time, so the parts reach the group in order. The key is the WhatsApp message: a redelivery sends nothing twice.
     const queued: OutboxRow[] = [];

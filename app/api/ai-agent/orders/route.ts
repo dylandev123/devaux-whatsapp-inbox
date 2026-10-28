@@ -9,6 +9,7 @@ import {
   listOrders,
   listSummaryRuns,
   loadCoverage,
+  loadAddressProvenance,
   loadOrderNames,
   loadOutstandingOrders,
   loadSavedLocations,
@@ -58,7 +59,7 @@ export async function GET(request: Request) {
         : status === "open" && !searching
           ? outstanding
           : found;
-    const [names, saved] = await Promise.all([loadOrderNames(businessSlug, orders), loadSavedLocations(businessSlug, orders.filter((o) => isOpenStatus(o.status) && o.fulfilment_method !== "collection"))]);
+    const [names, saved, addresses] = await Promise.all([loadOrderNames(businessSlug, orders), loadSavedLocations(businessSlug, orders.filter((o) => isOpenStatus(o.status) && o.fulfilment_method !== "collection")), loadAddressProvenance(businessSlug, orders)]);
     return NextResponse.json({
       orders: orders.map((o) => {
         const day = effectiveDate(o, timezone);
@@ -75,6 +76,9 @@ export async function GET(request: Request) {
           bucket: isOpenStatus(o.status) ? bucketOf(o, ctx) : null,
           gaps: isOpenStatus(o.status) ? orderGaps(o, timezone) : [],
           saved_location: saved[o.id] ?? null,
+          // Whether the address was given by the customer, set by staff, or filled from the saved default / a previous order.
+          address_origin: addresses[o.id]?.origin ?? null,
+          address_from_ref: addresses[o.id]?.fromRef ?? null,
         };
       }),
       runs,

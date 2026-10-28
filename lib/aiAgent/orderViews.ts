@@ -8,6 +8,7 @@
 // order whose day has passed (or an undated one first mentioned on an earlier day) is "overdue". Nothing here completes,
 // cancels or deletes an order: an old order stays listed under Overdue until a person completes or cancels it.
 
+import { type AddressProvenance, addressTag } from "./orderAddress.ts";
 import { effectiveDate, effectiveMethod } from "./orderDefaults.ts";
 import { addDays, resolveRequestedDay } from "./orderText.ts";
 import {
@@ -185,6 +186,8 @@ const timeOfDay = (requestedFor: string | null): string | null => (requestedFor 
 const STATUS_BADGE: Record<string, string> = { confirmed: "✅ confirmed", awaiting_confirmation: "🕓 to confirm", possible: "❔ incomplete" };
 
 export interface LineOptions {
+  /** Where each order's address came from (orderAddress.ts), by order id. Only inferred addresses are marked. */
+  addresses?: Record<string, AddressProvenance>;
   /** Show the day the order is for (views not already grouped by day). */
   showDate?: boolean;
   timezone?: string;
@@ -202,7 +205,7 @@ export function orderViewBlock(o: TrackedOrder, index: number, names: OrderNames
   const date = day.date;
   const { method } = effectiveMethod(o);
   const where = [
-    method === "delivery" ? (o.delivery_address ? `📍 ${safeText(o.delivery_address, 80)}` : "📍 address needed") : "🛍 collection",
+    method === "delivery" ? (o.delivery_address ? `📍 ${safeText(o.delivery_address, 80)}${addressTag(opts.addresses?.[o.id] ?? { origin: "customer" })}` : "📍 address needed") : "🛍 collection",
     opts.showDate
       ? date
         ? `🗓 ${dayLabel(date)}${day.source === "default" ? " (default)" : ""}`
@@ -272,6 +275,8 @@ export interface OrdersViewInput {
   timezone?: string;
   /** Shown last: anything that makes the list incomplete (coverageWarning). */
   warning?: string | null;
+  /** Address provenance by order id (loadAddressProvenance). Missing entries read as the customer's own address. */
+  addresses?: Record<string, AddressProvenance>;
 }
 
 export interface OrdersViewResult {
@@ -289,7 +294,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
   const view = input.view;
   const chunks: Chunk[] = [];
   let number = 1;
-  const numbered = (o: TrackedOrder, opts: LineOptions = {}) => orderViewBlock(o, number++, input.names, { timezone: tz, ...opts });
+  const numbered = (o: TrackedOrder, opts: LineOptions = {}) => orderViewBlock(o, number++, input.names, { timezone: tz, addresses: input.addresses, ...opts });
 
   /** One day: its heading, then Delivery / Collection / not-stated groups. Numbering continues across days. */
   const dayBlock = (key: string) => {
@@ -407,7 +412,7 @@ const MATERIAL_FIELDS = ["items", "fulfilment_method", "delivery_address", "requ
  * orders (orderRepair.ts) is a data correction, not something the customer changed.
  */
 export function isNoiseEvent(e: Pick<OrderEventRow, "kind">): boolean {
-  return /^staff_whatsapp_/.test(e.kind) || e.kind === "order_repair" || /^manual_(fulfil|reopen|keep)$/.test(e.kind) || e.kind === "no_change";
+  return /^staff_whatsapp_/.test(e.kind) || e.kind === "order_repair" || e.kind === "address_confirmed" || /^manual_(fulfil|reopen|keep)$/.test(e.kind) || e.kind === "no_change";
 }
 
 export interface UpdateEntry {

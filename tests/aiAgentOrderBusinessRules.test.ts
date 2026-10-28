@@ -24,6 +24,8 @@ import {
   withCreationDefaults,
   withDeliveryContact,
 } from "../lib/aiAgent/orderDefaults.ts";
+import { addressProvenance, addressSourceLine, addressTag, type AddressEvent } from "../lib/aiAgent/orderAddress.ts";
+import { moreInfoReply } from "../lib/aiAgent/orderCommands.ts";
 import { orderContextWindow, ORDER_CONTEXT_MESSAGES } from "../lib/aiAgent/orderMonitor.ts";
 import { askForMissingFields, missingOrderFields } from "../lib/aiAgent/engine.ts";
 import { detectHistoryCue, resolveFromHistory, type FillContext, type HistoryCue, type HistoryOrder } from "../lib/aiAgent/orderHistory.ts";
@@ -338,6 +340,73 @@ describe("repairing existing open orders (planner)", () => {
       msg("staff", "Staff", "we can deliver tomorrow, or you collect", "2026-10-26T14:05:00Z"),
     ];
     assert.ok(!planRepair(o, ctx({ messages: m }))!.changes.some((c) => c.field === "fulfilment_method"));
+  });
+});
+
+describe("where an address came from (pure, from the order's own history)", () => {
+  const ev = (kind: string, actor: string, changes: AddressEvent["changes"], min: number): AddressEvent => ({ kind, actor_kind: actor, changes, created_at: `2026-10-28T12:${String(10 + min).padStart(2, "0")}:00Z` });
+  const filledFromSaved = (addr: string, min = 0) => ev("created", "ai", { delivery_address: { before: null, after: addr }, inferred: { before: null, after: { delivery_address: "saved location" } } }, min);
+  const filledFromOrder = (addr: string, ref: string, min = 0) => ev("created", "ai", { delivery_address: { before: null, after: addr }, inferred: { before: null, after: { delivery_address: ref } } }, min);
+  const o = (address: string, locked: string[] = []) => order({ delivery_address: address, manual_locked_fields: locked });
+
+  test("explicit, saved and previous addresses are told apart; the WhatsApp labels stay short", () => {
+    const stated = addressProvenance(o("Cap Estate"), [ev("created", "ai", { delivery_address: { before: null, after: "Cap Estate" } }, 0)]);
+    assert.deepEqual(stated, { origin: "customer" });
+    assert.equal(addressTag(stated), "");
+    const saved = addressProvenance(o("Marigot Bay"), [filledFromSaved("Marigot Bay")]);
+    assert.equal(saved.origin, "saved");
+    assert.equal(addressTag(saved), " (Saved address)");
+    const previous = addressProvenance(o("Gros Islet"), [filledFromOrder("Gros Islet", "O-K3PD7")]);
+    assert.deepEqual(previous, { origin: "previous", fromRef: "O-K3PD7" });
+    assert.equal(addressTag(previous), " (Previous address)");
+    assert.equal(addressSourceLine(previous), "Address: Previous address (from #K3PD7) — not stated in this chat");
+    assert.equal(addressSourceLine(saved), "Address: Saved address — not stated in this chat");
+    assert.equal(addressSourceLine(stated), "Address: given by the customer");
+  });
+  test("no evidence is never read as inferred: old orders, no history, and no address all stay plain", () => {
+    assert.equal(addressProvenance(o("Cap Estate"), []).origin, "customer");
+    assert.equal(addressProvenance(order({ delivery_address: null }), [filledFromSaved("Marigot Bay")]).origin, null);
+    assert.equal(addressProvenance(o("Cap Estate", ["delivery_address"]), []).origin, "staff");
+  });
+  test("overridden: a customer or staff change after the fill makes it an ordinary address, however the events are ordered", () => {
+    const customerChange = ev("ai_update", "ai", { delivery_address: { before: "Marigot Bay", after: "Rodney Bay" } }, 5);
+    for (const events of [[filledFromSaved("Marigot Bay"), customerChange], [customerChange, filledFromSaved("Marigot Bay")]]) {
+      assert.equal(addressProvenance(o("Rodney Bay"), events).origin, "customer");
+    }
+    const staffEdit = ev("manual_edit", "admin", { delivery_address: { before: "Marigot Bay", after: "Pigeon Island" } }, 5);
+    assert.equal(addressProvenance(o("Pigeon Island", ["delivery_address"]), [filledFromSaved("Marigot Bay"), staffEdit]).origin, "staff");
+    // Cleared ("somewhere else") and then given again by the customer.
+    const cleared = ev("ai_update", "ai", { delivery_address: { before: "Marigot Bay", after: null } }, 5);
+    const given = ev("ai_update", "ai", { delivery_address: { before: null, after: "Vigie" } }, 6);
+    assert.equal(addressProvenance(o("Vigie"), [filledFromSaved("Marigot Bay"), cleared, given]).origin, "customer");
+  });
+  test("confirmed: the customer replying yes, writing the same address, or staff confirming it ends 'inferred'", () => {
+    for (const confirm of [
+      ev("customer_replied_yes", "customer", { status: { before: "awaiting_confirmation", after: "awaiting_confirmation" } }, 5),
+      ev("address_confirmed", "customer", { delivery_address: { before: "Marigot Bay", after: "Marigot Bay" } }, 5),
+      ev("manual_confirm", "admin", { status: { before: "awaiting_confirmation", after: "confirmed" } }, 5),
+      ev("staff_whatsapp_confirm", "staff", { status: { before: "awaiting_confirmation", after: "confirmed" } }, 5),
+    ]) {
+      assert.equal(addressProvenance(o("Marigot Bay"), [filledFromSaved("Marigot Bay"), confirm]).origin, "customer", confirm.kind);
+    }
+  });
+  test("an unrelated later update (a quantity, a note) leaves a filled address inferred", () => {
+    const later = ev("ai_update", "ai", { items: { before: [], after: [] } }, 5);
+    assert.equal(addressProvenance(o("Marigot Bay"), [filledFromSaved("Marigot Bay"), later]).origin, "saved");
+  });
+  test("an address that is no longer the one that was filled is never labelled inferred (history cut short, direct edit)", () => {
+    assert.equal(addressProvenance(o("Somewhere New"), [filledFromSaved("Marigot Bay")]).origin, "customer");
+    assert.equal(addressProvenance(o("MARIGOT  bay"), [filledFromSaved("Marigot Bay")]).origin, "saved", "spelling and spacing do not matter");
+  });
+  test("!order #REF says where the address came from, and no longer lists a changed address as 'from earlier orders'", () => {
+    const text = (address: string, events: AddressEvent[]) =>
+      moreInfoReply({ order: o(address), name: undefined, events: events.map((e) => ({ ...e, changes: e.changes ?? {} })), timezone: TZ });
+    assert.match(text("Marigot Bay", [filledFromSaved("Marigot Bay")]), /Address: Saved address — not stated in this chat/);
+    assert.match(text("Gros Islet", [filledFromOrder("Gros Islet", "O-K3PD7")]), /Address: Previous address \(from #K3PD7\)/);
+    const changed = text("Rodney Bay", [filledFromSaved("Marigot Bay"), ev("ai_update", "ai", { delivery_address: { before: "Marigot Bay", after: "Rodney Bay" } }, 5)]);
+    assert.match(changed, /Address: given by the customer/);
+    assert.doesNotMatch(changed, /Saved address|Previous address|address from/);
+    assert.match(text("Pigeon Island", []).replace("Edited by staff", ""), /given by the customer/);
   });
 });
 
@@ -811,5 +880,126 @@ describe("Order business rules (real server code, real SQL)", { skip: !pgAvailab
     assert.equal(preview.summary.open, 0);
     const res = await repair.applyOrderRepair({ businessSlug: "by_sea", adminId: "admin-1", approved: [{ orderId: (await allOrders())[0].id, fingerprint: "x" }] });
     assert.deepEqual(res.map((r) => r.outcome), ["not_found"]);
+  });
+
+  // ── Where the address came from ────────────────────────────────────────────
+
+  const SAVED = async (c: Customer, place: string) =>
+    pg.run(`insert into public.ai_agent_customer_staff_memory (business_slug, customer_key, kind, status, content, fingerprint) values ('dog_food', ${lit(c.phone)}, 'delivery_location', 'active', ${lit(place)}, ${lit(`fp-${place}-${c.phone}`)});`);
+  const refOf = (o: Record<string, any>) => `#${String(o.ref_code).slice(2)}`;
+  const provenanceOf = async (o: Record<string, any>) => (await (await import("../lib/server/aiAgent/orders.ts")).loadAddressProvenance("dog_food", [asTracked(o)]))[o.id];
+  const orderList = async () => (await groupSays("!orders all")).outbox.map((x) => x.body).join("\n");
+  const orderInfo = async (o: Record<string, any>) => (await groupSays(`!order ${refOf(o)}`)).outbox.map((x) => x.body).join("\n");
+
+  test("saved address: marked in !orders, !order #REF and the website data; an explicit address is not", async () => {
+    await SAVED(JANE, "Marigot Bay");
+    await SAVED(MARCUS, "Marigot Bay");
+    modelOrders(draft());
+    await say(JANE, "a bag of Monello Chicken 25kg please");
+    modelOrders(draft({ delivery_address: "Cap Estate" }));
+    await say(MARCUS, "a bag of Monello Chicken 25kg to Cap Estate");
+    const jane = await orderOf(JANE);
+    const marcus = await orderOf(MARCUS);
+    assert.deepEqual(await provenanceOf(jane), { origin: "saved" });
+    assert.deepEqual(await provenanceOf(marcus), { origin: "customer" });
+    const list = await orderList();
+    assert.match(list, /Marigot Bay \(Saved address\)/);
+    assert.match(list, /Cap Estate(?! \()/);
+    assert.doesNotMatch(list, /Cap Estate \((Saved|Previous) address\)/);
+    assert.match(await orderInfo(jane), /Address: Saved address — not stated in this chat/);
+    assert.match(await orderInfo(marcus), /Address: given by the customer/);
+  });
+
+  test("previous address: a single verified earlier address is labelled with its order; two different ones fill nothing", async () => {
+    await seedPast("O-OLD1", JANE, "Cap Estate");
+    modelOrders(draft());
+    await say(JANE, "a bag of Monello Chicken 25kg please");
+    const jane = await orderOf(JANE);
+    assert.deepEqual(await provenanceOf(jane), { origin: "previous", fromRef: "O-OLD1" });
+    assert.match(await orderList(), /Cap Estate \(Previous address\)/);
+    assert.match(await orderInfo(jane), /Address: Previous address \(from #OLD1\) — not stated in this chat/);
+  });
+
+  test("overridden by the customer: the new address is theirs, and nothing is labelled inferred any more", async () => {
+    await SAVED(JANE, "Marigot Bay");
+    modelOrders(draft());
+    await say(JANE, "a bag of Monello Chicken 25kg please");
+    assert.equal((await provenanceOf(await orderOf(JANE))).origin, "saved");
+    modelOrders(draft({ delivery_address: "Rodney Bay", delivery_preference: "delivery" }));
+    await say(JANE, "actually deliver to Rodney Bay", { at: "2026-10-28T12:40:00.000Z" });
+    const jane = await orderOf(JANE);
+    assert.equal(jane.delivery_address, "Rodney Bay");
+    assert.equal((await provenanceOf(jane)).origin, "customer");
+    const list = await orderList();
+    assert.match(list, /Rodney Bay/);
+    assert.doesNotMatch(list, /Saved address|Previous address/);
+    const info = await orderInfo(jane);
+    assert.match(info, /Address: given by the customer/);
+    assert.doesNotMatch(info, /address from/);
+  });
+
+  test("the customer writing the same place the AI filled in confirms it; a turn that only changes the quantity does not", async () => {
+    await SAVED(JANE, "Marigot Bay");
+    modelOrders(draft());
+    await say(JANE, "a bag of Monello Chicken 25kg please");
+    modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "3", size: "25kg" }] }));
+    await say(JANE, "make that 3 bags", { at: "2026-10-28T12:35:00.000Z" });
+    assert.equal((await provenanceOf(await orderOf(JANE))).origin, "saved", "an unrelated change leaves it inferred");
+    modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "3", size: "25kg" }], delivery_address: "Marigot Bay", delivery_preference: "delivery" }));
+    await say(JANE, "yes deliver to Marigot Bay", { at: "2026-10-28T12:45:00.000Z" });
+    const jane = await orderOf(JANE);
+    assert.equal(jane.delivery_address, "Marigot Bay");
+    assert.equal((await provenanceOf(jane)).origin, "customer");
+    assert.doesNotMatch(await orderList(), /Saved address/);
+    // The model merely echoing the address back, when the customer wrote nothing of the sort, confirms nothing.
+    await SAVED(MARCUS, "Vigie");
+    modelOrders(draft());
+    await say(MARCUS, "a bag of Monello Chicken 25kg please");
+    modelOrders(draft({ delivery_address: "Vigie" }));
+    await say(MARCUS, "thanks", { at: "2026-10-28T12:50:00.000Z" });
+    assert.equal((await provenanceOf(await orderOf(MARCUS))).origin, "saved");
+  });
+
+  test("staff-corrected: an edit (even to the same address) or a staff confirmation ends 'inferred'; the correction survives later turns", async () => {
+    const srv = await import("../lib/server/aiAgent/orders.ts");
+    await SAVED(JANE, "Marigot Bay");
+    await SAVED(MARCUS, "Marigot Bay");
+    modelOrders(draft());
+    await say(JANE, "a bag of Monello Chicken 25kg please");
+    await say(MARCUS, "a bag of Monello Chicken 25kg please");
+    const jane = await orderOf(JANE);
+    const edited = await srv.updateOrderManually({ businessSlug: "dog_food", orderId: jane.id, adminId: "u", action: "edit", expectedVersion: jane.version, patch: { delivery_address: "Pigeon Island" } });
+    assert.ok(edited.ok);
+    assert.deepEqual(await provenanceOf(await orderOf(JANE)), { origin: "staff" });
+    assert.match(await orderInfo(await orderOf(JANE)), /Address: set by staff/);
+    // Staff retype the very same address: it is now staff-checked.
+    const marcus = await orderOf(MARCUS);
+    assert.equal((await provenanceOf(marcus)).origin, "saved");
+    assert.ok((await srv.updateOrderManually({ businessSlug: "dog_food", orderId: marcus.id, adminId: "u", action: "edit", expectedVersion: marcus.version, patch: { delivery_address: "Marigot Bay" } })).ok);
+    assert.equal((await provenanceOf(await orderOf(MARCUS))).origin, "staff");
+    const list = await orderList();
+    assert.doesNotMatch(list, /Saved address|Previous address/);
+    // A later customer turn does not bring the label back.
+    modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "3", size: "25kg" }] }));
+    await say(JANE, "make that 3 bags", { at: "2026-10-28T12:40:00.000Z" });
+    assert.equal((await provenanceOf(await orderOf(JANE))).origin, "staff");
+  });
+
+  test("staff confirming an order with a filled address ends 'inferred'; reading provenance writes and sends nothing", async () => {
+    const srv = await import("../lib/server/aiAgent/orders.ts");
+    await SAVED(JANE, "Marigot Bay");
+    modelOrders(draft());
+    await say(JANE, "a bag of Monello Chicken 25kg please");
+    const jane = await orderOf(JANE);
+    assert.equal((await provenanceOf(jane)).origin, "saved");
+    const before = JSON.stringify([await allOrders(), await events(jane.id)]);
+    await orderList();
+    await orderInfo(jane);
+    await provenanceOf(jane);
+    assert.equal(JSON.stringify([await allOrders(), await events(jane.id)]), before, "the reports are read-only");
+    const confirmed = await srv.updateOrderManually({ businessSlug: "dog_food", orderId: jane.id, adminId: "u", action: "confirm", expectedVersion: jane.version });
+    assert.ok(confirmed.ok);
+    assert.equal((await provenanceOf(await orderOf(JANE))).origin, "customer");
+    assert.equal(await customerBound(), 0);
   });
 });
