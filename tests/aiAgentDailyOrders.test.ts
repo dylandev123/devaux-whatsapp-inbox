@@ -682,7 +682,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     // The morning post is the by-day view: Jane's order is for Friday, so it is counted, not listed. Marcus named no day and wrote
     // at 06:30 (before 9 AM), so the business default puts him on today, marked as a default.
     assert.match(item.body, /^📋 \*ORDERS — Tue 27 Oct\*/);
-    assert.match(item.body, /📅 \*TODAY — Tue 27 Oct\* \(1\)[\s\S]*Marcus · #[A-Z2-9]{5}\*[\s\S]*🗓 default day/);
+    assert.match(item.body, /📅 \*TODAY — Tue 27 Oct\* \(1\)[\s\S]*Marcus · #[A-Z2-9]{5}\*/);
+    assert.doesNotMatch(item.body, /default day/, "the report never prints the default-day wording; the heading carries the date");
     assert.doesNotMatch(item.body, /Jane/, "an order for Friday is not carried into Tuesday's list");
     assert.match(item.body, /🗓 1 later order — !orders <date>/);
     assert.doesNotMatch(item.body, /Needs delivery address|Needs confirmation/);

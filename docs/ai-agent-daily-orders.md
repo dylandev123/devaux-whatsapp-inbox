@@ -417,7 +417,7 @@ apart, and no existing order needs migrating.
 |---|---|
 | Delivery | Every order is a delivery unless the customer explicitly asks to collect (`fulfilment_method = 'collection'` is kept). An empty method is shown as *Delivery (default)* on the website and in `!moreinfo`, is never "missing", and a default delivery needs an address. The AI never asks "delivery or collection?" and never offers pick-up (reply prompt, `missingOrderFields`, `askForMissingFields`). |
 | Day | A day the customer named wins. Otherwise: written **before 9:00 AM** America/St_Lucia → that day, **at or after 9:00** → the next day, counted from the order's `first_message_at` (the customer's message time, never the processing time). A time with no day ("morning", "around 3pm") keeps its wording and takes the default day. Words that name no single day ("next week") stay as the customer's words and **are** reported as a gap. Because the date is a pure function of the order's own timestamp, it does not move at midnight or when a later message arrives; an old order simply becomes *overdue*. |
-| Reports | `!orders`, `!orders missing/overdue/undated`, the 8 AM post, `!update` and the website all use `orderDate`/`orderGaps`/`effectiveMethod`. An assumed day is marked `🗓 default day` (WhatsApp) / `· default day` (website); "Missing:" lists only real gaps (products, quantity, address, an unreadable day). |
+| Reports | `!orders`, `!orders missing/overdue/undated`, the 8 AM post, `!update` and the website all use `orderDate`/`orderGaps`/`effectiveMethod`. A defaulted day is no longer labelled in WhatsApp lines (the TODAY/TOMORROW heading carries the date; views without a day heading show the actual date, e.g. `🗓 Wed 28 Oct`, and an explicit time still shows as `🕐 morning`); the `(default)` marker stays in the stored `requested_for` and in `!order #REF`. The website still marks it `· default day`; "Missing:" lists only real gaps (products, quantity, address, an unreadable day). |
 | Identity | Name: staff-entered → saved contact → WhatsApp profile name → a name the customer **wrote** (only when none of those exist; checked against their words) → the verified phone. Placeholders ("Unknown Contact", "customer"), numbers and JIDs are never stored as a name. `contact_number` is always the verified sender (`@lid` mappings untouched). |
 | Alternate contact | A number the customer writes for the delivery (`contact_phone`, or a note that is only a number) is checked against their own words, excluded if it is the sender's own number, and stored in the notes as `Delivery contact: 758-123-4567`. It survives later turns and never replaces `contact_number`. |
 | Location | Priority: the location the customer gives now → the staff-saved default (`!location`) → ONE unambiguous verified earlier delivery address (a confirmed/completed/staff-corrected order, or an address staff typed; if two different verified places exist none is used) → missing, flagged for a person. Applied automatically when the customer gives no location (not when collecting, not for "somewhere else", never over an address the order or staff already hold); "same place" works as before. The source is recorded in the order history (`inferred.delivery_address`: `saved location` or the order ref). Saved customer memory is read, never written. |
@@ -450,3 +450,35 @@ source messages and the customer's messages between its first and last message).
 
 No migration is required (the `fulfilment_method` and `requested_for` columns already exist; older orders are derived on read; alternate contacts live in `notes`; `order_repair` is just a new event kind). Order: deploy the app → Orders page → *Review existing orders* for each business → tick the orders you agree with → update. No bridge change, no environment variables, no settings. Roll back by deploying the previous version (repaired
 orders keep their audit trail).
+
+## Order corrections and bulk completion
+
+Migration: `supabase/migrations/20261109000000_ai_agent_order_corrections.sql` (two additive tables; run it before deploying).
+
+**`!order #REF teach <instruction>`** — one model call (the same provider and key as the rest of the agent, with the approved
+product/price/delivery knowledge and the last few approved corrections as context) turns staff's own words into proposed changes to
+ONE order: products and quantities, delivery address, day/time, delivery or collection, customer name, an alternate contact number and
+a note. The model only proposes. `lib/aiAgent/orderTeach.ts` checks every value against the instruction (a product, address, name, day
+or number staff did not write is refused), drops values equal to the current ones and treats anything doubtful as an ambiguity: the
+whole instruction is then refused with what was unclear, and nothing is stored. Otherwise a before/after preview is posted with a
+one-time code `C-XXXXX`.
+
+**`!orders complete all`** — previews today's outstanding orders of the current business (open orders whose day is today in the
+business's timezone; tomorrow's, overdue, later and undated orders are counted as "left alone", never included) with a code `B-XXXXX`.
+
+**Confirming** (`!confirm CODE` / `!discard CODE`): authorized staff in the same group, the same business. A proposal applies once
+(pending → applying → applied by conditional updates), expires (30 min / 10 min), is replaced by a newer proposal for the same order
+(or the newer bulk completion), and is refused as stale when the order's version changed since the preview (a bulk completion skips
+only the changed orders and reports them). A redelivered WhatsApp message finds its own proposal instead of making another.
+
+**What is applied**: the dashboard's own edit / fulfil mutation (`updateOrderManually` → `apply_ai_agent_order`), so each order gets a
+history event (`staff_whatsapp_edit` / `staff_whatsapp_fulfil`, with the correction's or batch's code), an audit entry, and corrected
+fields become staff-locked: a later customer message can only raise a conflict, never overwrite them. A bulk completion uses one
+idempotency key per order, reports completed / already completed / skipped / failed per order, and `!confirm` again retries only the
+failed ones. Completed means *fulfilled*, not hidden: history stays and `!order #REF reopen` undoes one. No customer is messaged and
+no delivery is triggered by either command.
+
+**Learning**: an applied correction is recorded in `ai_agent_order_feedback` (instruction, fields, before/after; one row per approved
+correction, erased with the order). It never changes a customer's saved location, notes, memory or the knowledge base. If staff's words
+generalise ("always", "every Friday"…), the reply offers the exact `!remember #REF …` / `!teach …` command to run, which keeps going
+through those commands' own review step.

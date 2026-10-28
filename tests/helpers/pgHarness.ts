@@ -32,6 +32,7 @@ const MIGRATIONS = [
   "20261106000000_ai_agent_customer_staff_memory.sql",
   "20261107000000_ai_agent_staff_memory_clear_expiry.sql",
   "20261108000000_ai_agent_order_update_posts.sql",
+  "20261109000000_ai_agent_order_corrections.sql",
 ];
 
 const BOOTSTRAP = `

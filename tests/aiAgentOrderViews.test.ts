@@ -235,7 +235,7 @@ describe("!orders output", () => {
     const text = body("", all);
     assert.match(text, /^📋 \*ORDERS — Wed 28 Oct\*/);
     assert.match(text, /📅 \*TODAY — Wed 28 Oct\* \(3\)\n\n🚚 \*Delivery\*\n\n\*1\. Dayless Dan · #[A-Z0-9]+\* 🕓 to confirm[\s\S]*\*2\. Jane Doe · #[A-Z0-9]+\* ✅ confirmed[\s\S]*🛍 \*Collection\*\n\n\*3\. Marcus/);
-    assert.match(text, /Dayless Dan[\s\S]*🗓 default day/, "an assumed day is marked, a stated one is not");
+    assert.doesNotMatch(text, /default day|🗓 \w{3} \d/, "under a TODAY/TOMORROW heading the day is not repeated and never labelled");
     assert.match(text, /📅 \*TOMORROW — Thu 29 Oct\* \(2\)/);
     assert.match(text, /Priya/);
     for (const hidden of ["Later Larry", "Old Olga", "Ancient Abe", "Hazy Hank", "Done Dora"]) assert.doesNotMatch(text, new RegExp(hidden), `${hidden} is not in today/tomorrow`);
@@ -371,10 +371,10 @@ describe("!update: what is new or changed", () => {
 describe("the command menu matches the parsers", () => {
   test("!rules documents !orders (every view), !update, !order and the completion commands", () => {
     const text = buildRulesMessages().join("\n");
-    for (const part of ["!orders [today|tomorrow|<date>|all|overdue|missing|undated]", "!update [#REF", "!order <name, phone or #REF> | #REF completed | #REF reopen"]) assert.ok(text.includes(part), part);
+    for (const part of ["!orders [today|tomorrow|<date>|all|overdue|missing|undated]", "!orders complete all", "!update [#REF", "!order <name, phone or #REF> | #REF completed | #REF reopen | #REF teach <instruction>"]) assert.ok(text.includes(part), part);
     const doc = STAFF_COMMANDS.find((c) => c.name === "orders")!;
-    assert.deepEqual([doc.section, doc.who, doc.readOnly], ["Orders", "authorized", true]);
-    for (const word of ["overdue", "missing", "undated", "all"]) assert.match(doc.summary, new RegExp(word));
+    assert.deepEqual([doc.section, doc.who, doc.readOnly], ["Orders", "authorized", false], "!orders complete all can change orders, so the entry is no longer read-only");
+    for (const word of ["overdue", "missing", "undated", "all", "complete all", "B-ABCDE"]) assert.match(doc.summary, new RegExp(word));
     // Everything the registry advertises for !orders really parses to the orders command.
     for (const arg of ["", "today", "tomorrow", "30 Oct", "all", "overdue", "missing", "undated"]) assert.equal(parseOrderCommand(`!orders ${arg}`.trim(), { now: NOW, timezone: TZ })?.kind, "orders", arg);
   });

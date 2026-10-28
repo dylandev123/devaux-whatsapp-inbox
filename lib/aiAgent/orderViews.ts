@@ -181,7 +181,7 @@ const safeText = (v: string | null | undefined, n: number) => clip((v ?? "").rep
 const TIME_OF_DAY = /\b(morning|afternoon|evening|noon|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i;
 
 /** The part of `requested_for` worth repeating beside the day: "morning", "3pm". The day itself is shown from the date. */
-const timeOfDay = (requestedFor: string | null): string | null => (requestedFor ?? "").match(TIME_OF_DAY)?.[1].toLowerCase() ?? null;
+export const timeOfDay = (requestedFor: string | null): string | null => (requestedFor ?? "").match(TIME_OF_DAY)?.[1].toLowerCase() ?? null;
 
 const STATUS_BADGE: Record<string, string> = { confirmed: "✅ confirmed", awaiting_confirmation: "🕓 to confirm", possible: "❔ incomplete" };
 
@@ -206,15 +206,15 @@ export function orderViewBlock(o: TrackedOrder, index: number, names: OrderNames
   const { method } = effectiveMethod(o);
   const where = [
     method === "delivery" ? (o.delivery_address ? `📍 ${safeText(o.delivery_address, 80)}${addressTag(opts.addresses?.[o.id] ?? { origin: "customer" })}` : "📍 address needed") : "🛍 collection",
+    // Grouped views already show the day in their heading. Where no heading does, the actual date is shown; whether the day
+    // was stated or defaulted stays in the stored value (orderDefaults.ts) and in !order #REF, not in the report line.
     opts.showDate
       ? date
-        ? `🗓 ${dayLabel(date)}${day.source === "default" ? " (default)" : ""}`
+        ? `🗓 ${dayLabel(date)}`
         : o.requested_for
           ? `🗓 “${safeText(o.requested_for, 40)}” (no date read)`
           : "🗓 no day"
-      : day.source === "default"
-        ? "🗓 default day"
-        : "",
+      : "",
     timeOfDay(o.requested_for) ? `🕐 ${timeOfDay(o.requested_for)}` : "",
     named && phone ? `📞 ${phone}` : "",
   ].filter(Boolean);
@@ -512,7 +512,7 @@ export function buildUpdateSummary(input: UpdateSummaryInput): string {
         const bits = [
           e.order.items.length ? e.order.items.map(orderItemText).join("; ") : "no products yet",
           effectiveMethod(e.order).method === "collection" ? "collection" : `delivery${e.order.delivery_address ? ` ${safeText(e.order.delivery_address, 40)}` : ""}`,
-          date ? `${dayLabel(date)}${effectiveDate(e.order, tz).source === "default" ? " (default)" : ""}` : "day unclear",
+          date ? dayLabel(date) : "day unclear",
         ].filter(Boolean);
         const gaps = orderGaps(e.order, tz).filter((g) => g !== "requested_for");
         lines.push(`🆕 ${who} — ${bits.join(" · ")}${gaps.length ? ` ⚠️ missing ${gaps.map(gapText).join(", ")}` : ""}`);

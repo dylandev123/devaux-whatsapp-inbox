@@ -12,6 +12,9 @@
 //   !order #QU6U9 / !moreinfo #QU6U9   full details of one order
 //   !order #QU6U9 completed         mark it done (status "fulfilled"): it leaves !orders, its history stays
 //   !order #QU6U9 reopen            undo an accidental completion
+//   !order #QU6U9 teach <words>     correct an order in plain language: previewed, applied only after !confirm C-CODE
+//   !orders complete all            complete today's outstanding orders: previewed, applied only after !confirm B-CODE
+//   !confirm C-CODE / !discard C-CODE   (also B-CODE) apply or drop a proposal made by one of the two commands above
 //
 // A selector is a reference (#QU6U9), a phone number, or a customer name. Whatever it is, it must identify exactly ONE
 // active order; with two or more matches nothing is changed and the choices are listed. No model is involved.
@@ -20,6 +23,7 @@ import { normalizeText } from "./escalationUpdates.ts";
 import { addressProvenance, addressSourceLine } from "./orderAddress.ts";
 import { type DateSource, effectiveDate, effectiveMethod, isDefaultedDay } from "./orderDefaults.ts";
 import { dayLabel, orderDate, parseOrdersView, type OrdersView } from "./orderViews.ts";
+import { BULK_HELP, MAX_INSTRUCTION, parseProposalCode, TEACH_HELP, type ProposalKind } from "./orderTeach.ts";
 import {
   DEFAULT_ORDERS_TIMEZONE,
   conflictFields,
@@ -55,7 +59,17 @@ export type OrderCommand =
   | { kind: "update"; selector: Selector; action: UpdateAction }
   | { kind: "search"; query: string }
   | { kind: "info"; selector: Selector }
-  | { kind: "help"; reason: "update" | "order" | "moreinfo" | "orders" };
+  /** `!order #REF teach <instruction>`: a natural-language correction, proposed and then confirmed with a code. */
+  | { kind: "teach"; selector: Selector; instruction: string }
+  /** `!orders complete all`: today's outstanding orders, proposed and then confirmed with a code. */
+  | { kind: "bulk_complete" }
+  /** `!confirm C-ABCDE` / `!discard B-ABCDE` */
+  | { kind: "proposal"; action: "confirm" | "discard"; code: string; proposalKind: ProposalKind }
+  | { kind: "help"; reason: "update" | "order" | "moreinfo" | "orders" | "teach" | "complete_all" };
+
+/** The commands that propose or settle a proposal (handled by lib/server/aiAgent/orderCorrections.ts). */
+export type CorrectionCommand = Extract<OrderCommand, { kind: "teach" | "bulk_complete" | "proposal" }>;
+export const isCorrectionCommand = (c: OrderCommand): c is CorrectionCommand => c.kind === "teach" || c.kind === "bulk_complete" || c.kind === "proposal";
 
 const MAX_SELECTOR = 60;
 
@@ -113,9 +127,17 @@ const REPORT = /^!update\s*[.!]?\s*$/i;
 export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: string | null } = {}): OrderCommand | null {
   const text = raw.replace(/\s+/g, " ").trim();
   if (REPORT.test(text)) return { kind: "report" };
-  // "!orders" is the viewing command ("!order" is one order). An argument we do not understand gets the usage, not silence.
-  let m = text.match(/^!orders\b\s*(.*)$/i);
+  // "!confirm C-ABCDE" / "!discard B-ABCDE": only OUR codes. K- (knowledge), M- (notes) and E- (requests) stay with their own
+  // commands, so "!confirm K-7QX2" never reaches an order and "!confirm C-ABCDE" never reaches the knowledge flow.
+  let m = text.match(/^!(confirm|discard)\s+(\S+)$/i);
   if (m) {
+    const code = parseProposalCode(m[2]);
+    return code ? { kind: "proposal", action: m[1].toLowerCase() as "confirm" | "discard", code: code.code, proposalKind: code.kind } : null;
+  }
+  // "!orders" is the viewing command ("!order" is one order). An argument we do not understand gets the usage, not silence.
+  m = text.match(/^!orders\b\s*(.*)$/i);
+  if (m) {
+    if (/^complete\b/i.test(m[1])) return /^complete\s+all\s*[.!]?$/i.test(m[1]) ? { kind: "bulk_complete" } : { kind: "help", reason: "complete_all" };
     const view = parseOrdersView(m[1], opts.now ?? new Date(), opts.timezone || DEFAULT_ORDERS_TIMEZONE);
     return view ? { kind: "orders", view } : { kind: "help", reason: "orders" };
   }
@@ -125,7 +147,13 @@ export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: st
   if (m) {
     const query = m[1].trim();
     if (!query) return { kind: "help", reason: "order" };
-    // Completing or reopening needs an order REFERENCE: a name or phone could match the wrong order.
+    // Teaching, completing or reopening needs an order REFERENCE: a name or phone could match the wrong order.
+    const teach = query.match(/^(\S+)\s+teach\b\s*(.*)$/i);
+    if (teach) {
+      const sel = parseSelector(teach[1]);
+      const instruction = teach[2].replace(/\s+/g, " ").trim();
+      return sel?.type === "ref" && instruction && instruction.length <= MAX_INSTRUCTION ? { kind: "teach", selector: sel, instruction } : { kind: "help", reason: "teach" };
+    }
     const done = query.match(/^(.*?)\s+(complete|completed|reopen|reopened)$/i);
     if (done) {
       const sel = parseSelector(done[1]);
@@ -215,6 +243,9 @@ export const ORDER_HELP = [
   "!order #REF — order details (also !moreinfo #REF)",
   "!order #REF completed — mark done (leaves !orders)",
   "!order #REF reopen — undo a completion",
+  "!order #REF teach <what is wrong> — fix an order in your own words (previewed first)",
+  "!orders complete all — complete today's outstanding orders (previewed first)",
+  "!confirm C-CODE / B-CODE — apply a proposal · !discard C-CODE / B-CODE — drop it",
   "#REF is the code shown in the lists, e.g. #QU6U9.",
 ].join("\n");
 
@@ -226,6 +257,7 @@ export const ORDERS_HELP = [
   "!orders overdue — older, still open",
   "!orders missing — lacking products, quantity, delivery/collection, address or day",
   "!orders undated — no day given",
+  "!orders complete all — complete today's outstanding orders (preview, then !confirm B-CODE)",
 ].join("\n");
 
 export const ORDER_REPLY = {
@@ -296,7 +328,7 @@ function valueText(field: string, v: unknown): string {
 
 function changeText(changes: OrderEventLine["changes"]): string {
   const parts = Object.entries(changes)
-    .filter(([field]) => !["staff_message", "removed_items", "inferred"].includes(field))
+    .filter(([field]) => !["staff_message", "removed_items", "inferred", "correction", "completion_batch"].includes(field))
     .slice(0, 3)
     .map(([field, c]) => `${field.replace(/_/g, " ")} ${valueText(field, c?.before)} → ${valueText(field, c?.after)}`);
   return parts.join("; ") || "noted";

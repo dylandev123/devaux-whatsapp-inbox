@@ -554,7 +554,8 @@ describe("Order business rules (real server code, real SQL)", { skip: !pgAvailab
     assert.equal(orderDate(asTracked(a), TZ), "2026-10-28");
     assert.equal(effectiveDate({ requested_for: a.requested_for, first_message_at: a.first_message_at }, TZ).source, "default");
     const report = (await groupSays("!orders all")).outbox.map((x) => x.body).join("\n");
-    assert.match(report, /Wed 28 Oct[\s\S]*🗓 default day/);
+    assert.match(report, /Wed 28 Oct/);
+    assert.doesNotMatch(report, /default day/, "provenance stays in the stored value, not in the WhatsApp line");
     assert.doesNotMatch(report, /Missing: [^\n]*(day|delivery or collection)/);
   });
 

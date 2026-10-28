@@ -120,7 +120,8 @@ import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
 import type { TrackedOrder } from "@/lib/aiAgent/orders";
 import { refineOrderDraft } from "@/lib/aiAgent/orderText";
 import { historyForModel, type HistoryOrder } from "@/lib/aiAgent/orderHistory";
-import { handleOrderCommand, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
+import { runOrderCommand } from "@/lib/server/aiAgent/orderCorrections";
+import { loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
 import { monitorCustomerTurn, monitorStaffMessage } from "@/lib/server/aiAgent/orderMonitor";
 import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
 import {
@@ -315,7 +316,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
 async function processOrdersGroupMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
   const command = parseOrderCommand(input.text, { timezone: settings.orders_timezone });
   if (!command) return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
-  const result = await handleOrderCommand({
+  const result = await runOrderCommand({
     settings,
     fromGroup: input.chatId,
     command,

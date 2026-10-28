@@ -894,7 +894,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.equal(res.outbox.length, 1);
     const text = res.outbox[0].body;
     // No day was given in either: the business default applies and is marked; "Missing" lists only real gaps.
-    assert.match(text, /^📋 \*ALL OUTSTANDING ORDERS\*\n\n📅 \*[A-Z ]*— ?\w{3} \d+ \w{3}\* \(2\)\n\n🚚 \*Delivery\*\n\n\*1\. Jane Doe · #[A-Z2-9]{5}\* 🕓 to confirm\n1 × Monello Chicken 25kg\n📍 Cap Estate · 🗓 default day · 📞 286-7466\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\* ❔ incomplete\n2 × Monello\n📍 address needed · 🗓 default day\n⚠️ Missing: delivery address\n/);
+    assert.match(text, /^📋 \*ALL OUTSTANDING ORDERS\*\n\n📅 \*[A-Z ]*— ?\w{3} \d+ \w{3}\* \(2\)\n\n🚚 \*Delivery\*\n\n\*1\. Jane Doe · #[A-Z2-9]{5}\* 🕓 to confirm\n1 × Monello Chicken 25kg\n📍 Cap Estate · 📞 286-7466\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\* ❔ incomplete\n2 × Monello\n📍 address needed\n⚠️ Missing: delivery address\n/);
     assert.doesNotMatch(text, /Missing: [^\n]*(day|delivery or collection)/);
     assert.equal(await customerBound(), 0);
   });

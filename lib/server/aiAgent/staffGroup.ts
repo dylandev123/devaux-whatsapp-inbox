@@ -44,7 +44,7 @@ import {
 import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
 import { parseCustomerCommand } from "@/lib/aiAgent/customerCommands";
 import { handleCustomerCommand } from "@/lib/server/aiAgent/customerCommands";
-import { handleOrderCommand } from "@/lib/server/aiAgent/orders";
+import { runOrderCommand } from "@/lib/server/aiAgent/orderCorrections";
 import { agentDb, audit, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
 import { customerGate, planCustomerSend, sha } from "@/lib/server/aiAgent/customerSend";
 import {
@@ -197,7 +197,7 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
   // Authorization and the group check live in handleOrderCommand.
   const orderCommand = parseOrderCommand(input.text, { timezone: settings.orders_timezone });
   if (orderCommand) {
-    const result = await handleOrderCommand({
+    const result = await runOrderCommand({
       settings,
       fromGroup: groupJid,
       command: orderCommand,

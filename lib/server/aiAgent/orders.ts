@@ -26,12 +26,14 @@ import {
   moreInfoReply,
   type OrderCommand,
   ORDER_HELP,
+  type CorrectionCommand,
   ORDERS_HELP,
   ORDER_REPLY,
   resolveSelector,
   searchOrders,
   searchReply,
 } from "@/lib/aiAgent/orderCommands";
+import { BULK_HELP, TEACH_HELP } from "@/lib/aiAgent/orderTeach";
 import {
   acceptModelHistoryLine,
   cueActive,
@@ -948,6 +950,8 @@ export interface ManualInput {
   patch?: Partial<Record<EditableOrderField, unknown>>;
   conflictFields?: string[];
   reason?: string | null;
+  /** Recorded in the order's history beside the change itself (a correction's code and words, a bulk completion's code). */
+  extraChanges?: Record<string, unknown>;
 }
 
 export type ManualFailure = "not_found" | "closed" | "conflict" | "stale" | "incomplete" | "invalid";
@@ -1111,6 +1115,7 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
     changes.fulfilled_at = { before: null, after: now };
   }
 
+  if (input.extraChanges) Object.assign(changes, input.extraChanges);
   const row: OrderRow = {
     ...rowFrom(order, fields, { status, attention, awaitingSince, missing: computeMissing(fields), event: "no_change", confirmedByCustomer: false, customerConfirmedAt }, {
       chatId: order.chat_id,
@@ -1169,7 +1174,7 @@ export interface SummaryRun {
 const RUN_COLUMNS =
   "id, business_slug, trigger, local_date, status, skip_reason, requested_by, outbox_id, group_jid, attempts, confirmed_count, attention_count, carried_count, created_at, updated_at";
 
-const tzOf = (s: AgentSettings) => s.orders_timezone || DEFAULT_ORDERS_TIMEZONE;
+export const tzOf = (s: AgentSettings) => s.orders_timezone || DEFAULT_ORDERS_TIMEZONE;
 const hourOf = (s: AgentSettings) => s.orders_summary_hour ?? DEFAULT_SUMMARY_HOUR;
 
 const COVERAGE_WINDOW_HOURS = 36;
@@ -1503,7 +1508,7 @@ export interface CommandContext {
 }
 
 /** A reply to the group the command came from. Always a group JID: order commands have no customer-bound output at all. */
-function groupReply(settings: AgentSettings, fromGroup: string, eventId: string, body: string, kind: "staff_notice" | "staff_feedback", outcome: string, dedupeKey = `${eventId}:orders_update_refusal`): UpdateCommandResult {
+export function groupReply(settings: AgentSettings, fromGroup: string, eventId: string, body: string, kind: "staff_notice" | "staff_feedback", outcome: string, dedupeKey = `${eventId}:orders_update_refusal`): UpdateCommandResult {
   return {
     outbox: [{ businessSlug: settings.business_slug, chatId: fromGroup, kind, toJid: fromGroup, body: body.slice(0, 3800), dedupeKey, eventId }],
     queued: [],
@@ -1516,7 +1521,7 @@ function groupReply(settings: AgentSettings, fromGroup: string, eventId: string,
  * on, the message is in the configured orders group, the sender is on the verified allow-list, and the agent may post
  * there in its current mode. Returns the refusal to post (or a silent no-op), or null when the command may proceed.
  */
-async function guardOrderCommand(ctx: CommandContext, mode: "update" | "command"): Promise<UpdateCommandResult | null> {
+export async function guardOrderCommand(ctx: CommandContext, mode: "update" | "command"): Promise<UpdateCommandResult | null> {
   const { settings, fromGroup, senderAuth } = ctx;
   const slug = settings.business_slug;
   const target = ordersGroupJid(settings);
@@ -1663,9 +1668,9 @@ async function loadOrdersCreatedSince(businessSlug: string, since: Date): Promis
 // ── Order commands (!update #REF …, !order, !moreinfo #REF) ──────────────────
 
 /** A command written longer ago than this (an offline catch-up) is not applied: send it again. */
-const MAX_COMMAND_AGE_MS = 2 * 3_600_000;
+export const MAX_COMMAND_AGE_MS = 2 * 3_600_000;
 
-async function loadOrderByRef(businessSlug: string, refCode: string): Promise<TrackedOrder | null> {
+export async function loadOrderByRef(businessSlug: string, refCode: string): Promise<TrackedOrder | null> {
   const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).eq("ref_code", refCode).maybeSingle();
   if (error) throw new Error(error.message);
   return (data as TrackedOrder | null) ?? null;
@@ -1674,7 +1679,8 @@ async function loadOrderByRef(businessSlug: string, refCode: string): Promise<Tr
 const selectorText = (s: Extract<OrderCommand, { kind: "update" }>["selector"]) => (s.type === "ref" ? `#${s.ref.replace(/^O-/, "")}` : s.type === "phone" ? s.digits : s.text);
 
 export interface OrderCommandArgs extends CommandContext {
-  command: OrderCommand;
+  /** Every order command except the ones that propose or settle a proposal (lib/server/aiAgent/orderCorrections.ts). */
+  command: Exclude<OrderCommand, CorrectionCommand>;
   whatsappMessageId: string;
   /** When the staff member wrote the command (WhatsApp's own timestamp). */
   timestamp: string | null;
@@ -1704,7 +1710,7 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
     await audit(slug, "staff", senderAuth.senderId, "orders.command_rejected", { type: "chat", id: fromGroup }, { reason, command: command.kind });
     return reply(body, `cmd_${reason}`);
   };
-  if (command.kind === "help") return reply(command.reason === "orders" ? ORDERS_HELP : ORDER_HELP, "cmd_help");
+  if (command.kind === "help") return reply(command.reason === "orders" ? ORDERS_HELP : command.reason === "teach" ? TEACH_HELP : command.reason === "complete_all" ? BULK_HELP : ORDER_HELP, "cmd_help");
 
   if (command.kind === "orders") {
     const open = await loadOutstandingOrders(slug);
