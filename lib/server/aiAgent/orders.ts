@@ -44,6 +44,7 @@ import {
   upgradeGenericLines,
 } from "@/lib/aiAgent/orderHistory";
 import { loadStaffLocationSafe } from "@/lib/server/aiAgent/customerStaffMemory";
+import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote, keepDefaultedDay, nameStated, withCreationDefaults, withDeliveryContact } from "@/lib/aiAgent/orderDefaults";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
 import { buildOrdersView, buildUpdateSummary, countOrders, dayContext, type OrderEventRow, orderDate, type OrdersView, summarizeUpdates } from "@/lib/aiAgent/orderViews";
 import {
@@ -60,6 +61,7 @@ import {
   groundDeliveryPreference,
   isComplete,
   isOpenStatus,
+  isReliableName,
   isWholeOrderCancellation,
   localParts,
   mergeDraft,
@@ -331,7 +333,7 @@ export async function loadOrderNames(businessSlug: string, orders: TrackedOrder[
 
 // ── Writing ──────────────────────────────────────────────────────────────────
 
-const fieldsOf = (o: TrackedOrder): OrderFields => ({
+export const fieldsOf = (o: TrackedOrder): OrderFields => ({
   customer_name: o.customer_name,
   items: o.items,
   fulfilment_method: o.fulfilment_method,
@@ -356,7 +358,7 @@ const asDraft = (o: TrackedOrder): OrderRequestDraft => ({
 
 type OrderRow = Omit<TrackedOrder, "id" | "business_slug" | "version" | "created_at" | "updated_at">;
 
-interface ApplyArgs {
+export interface ApplyArgs {
   businessSlug: string;
   key: string | null;
   existing: TrackedOrder | null;
@@ -370,7 +372,7 @@ interface ApplyArgs {
 
 type ApplyResult = { result: "applied" | "duplicate" | "conflict" | "not_found"; orderId: string | null };
 
-async function applyOrder(a: ApplyArgs): Promise<ApplyResult> {
+export async function applyOrder(a: ApplyArgs): Promise<ApplyResult> {
   const { data, error } = await agentDb().rpc("apply_ai_agent_order", {
     p_key: a.key,
     p_business_slug: a.businessSlug,
@@ -415,7 +417,7 @@ async function createOrder(a: Omit<ApplyArgs, "existing">): Promise<ApplyResult>
 
 const unique = (list: string[]) => [...new Set(list)];
 
-function rowFrom(
+export function rowFrom(
   existing: TrackedOrder | null,
   fields: OrderFields,
   plan: ReturnType<typeof planOrderUpdate>,
@@ -532,9 +534,10 @@ export interface TrackResult {
   reasons: string[];
 }
 
+/** A name worth storing: not a number, a JID, a chat id or a placeholder ("Unknown Contact", "customer"). The phone is the fallback, never an invented name. */
 const cleanName = (name: string | null, chatId: string) => {
   const n = (name ?? "").trim();
-  return n && n !== chatId && !/^\+?[\d\s@.:a-z-]*@(s\.whatsapp\.net|lid|c\.us)$/i.test(n) && !/^\+?[\d\s()-]{7,}$/.test(n) ? n.slice(0, 120) : null;
+  return n && n !== chatId && isReliableName(n) ? n.slice(0, 120) : null;
 };
 
 /**
@@ -582,7 +585,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       result.reasons.push("order_confirmation_not_accepted");
       return result;
     }
-    const target = open.length === 1 && open[0].status === "awaiting_confirmation" && isComplete(open[0].missing_fields) ? open[0] : null;
+    const target = open.length === 1 && open[0].status === "awaiting_confirmation" && isComplete(computeMissing(fieldsOf(open[0]))) ? open[0] : null;
     if (!target) {
       result.reasons.push(open.length > 1 ? "order_confirmation_ambiguous" : "order_confirmation_not_accepted");
       return result;
@@ -617,13 +620,17 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   const intentOk = args.intent === "order" || (args.intent == null && !asks);
   const cue = args.useHistory === false || !intentOk ? detectHistoryCue([]) : detectHistoryCue(segments);
   const pointsBack = cueActive(cue);
+  // A customer who gave no location gets their saved default, else one unambiguous verified earlier address. It is only
+  // looked up when some order in this turn could use it (no address yet, not collecting, not "somewhere else").
+  const mayFillLocation =
+    args.useHistory !== false && intentOk && !cue.elsewhere && (drafts.some((d) => !d.draft.delivery_address) || open.some((o) => !o.delivery_address && o.fulfilment_method !== "collection"));
   let history: HistoryOrder[] = args.useHistory === false ? [] : (args.history ?? []);
-  if (args.useHistory !== false && args.history === undefined && pointsBack) {
+  if (args.useHistory !== false && args.history === undefined && (pointsBack || mayFillLocation)) {
     history = await loadCustomerHistory(businessSlug, args.chatIds ?? [chatId], args.phone).catch(() => []);
   }
   // The staff-saved default delivery location answers "same place" / "usual location" before any earlier order does.
   // Read-only here: nothing in the order flow can change it (only the staff !location command does).
-  const savedLocation = cue.sameLocation ? await loadStaffLocationSafe(businessSlug, [...(args.phone ? [args.phone] : []), ...(args.chatIds ?? [chatId]).map((id) => `chat:${id}`)]) : null;
+  const savedLocation = cue.sameLocation || mayFillLocation ? await loadStaffLocationSafe(businessSlug, [...(args.phone ? [args.phone] : []), ...(args.chatIds ?? [chatId]).map((id) => `chat:${id}`)]) : null;
 
   // A turn that only points back ("same as last time") or only adjusts a quantity ("another bag") has no draft of its own:
   // it still updates the order, from the customer's records and words.
@@ -698,14 +705,23 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     ];
     // Plainly stated quantities and delivery/collection are recorded even when the model left them out.
     const refined = refineOrderDraft(grounded, segments, args.customerWords);
+    // Identity and contact details the customer GAVE (checked against their own words, never invented):
+    //  * a name only when no reliable profile/contact name exists, so the verified identity is never overwritten;
+    //  * a different delivery number goes into the notes, never into contact_number (the verified sender stays the customer);
+    //  * a note that is only a phone number is that contact, not a "note".
+    const statedName = !name && draft.customer_name && isReliableName(draft.customer_name) && nameStated(draft.customer_name, args.customerWords) ? draft.customer_name.slice(0, 120) : null;
+    const contactDigits = groundedContactPhone({ contact_phone: draft.contact_phone, notes: refined.notes ?? draft.notes }, args.customerWords, args.phone);
+    if (isPhoneOnlyNote(refined.notes)) refined.notes = null;
 
     const fillFor = (cur: TrackedOrder | null): HistoryFill =>
-      pointsBack
+      pointsBack || mayFillLocation
         ? resolveFromHistory(history, cue, segments, {
             current: cur ? { id: cur.id, items: cur.items, delivery_address: cur.delivery_address, fulfilment_method: cur.fulfilment_method } : null,
             draftItems: refined.items.map(toLine),
             draftAddress: refined.delivery_address,
             defaultLocation: savedLocation?.content ?? null,
+            implicitLocation: mayFillLocation,
+            collecting: fulfilmentMethod(refined.delivery_preference) === "collection" || cur?.fulfilment_method === "collection",
           })
         : { items: [], address: null, setDelivery: false, clearAddress: false, sources: {}, unresolved: [] };
     const planned = fillFor(existing);
@@ -719,7 +735,9 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
 
     await write(`${args.dedupeBase}:${index}`, existing, (cur) => {
       // "Tomorrow" counts from when the customer WROTE it, in the business's timezone: a later retry or backfill cannot move it.
-      const when = refined.requested_for ? anchorRequestedFor(refined.requested_for, cur?.requested_for, messageTimeFor(refined.requested_for, segments, args.segmentTimes, args.lastAt), tz) : null;
+      const anchored = refined.requested_for ? anchorRequestedFor(refined.requested_for, cur?.requested_for, messageTimeFor(refined.requested_for, segments, args.segmentTimes, args.lastAt), tz) : null;
+      // A repeated time of day ("morning") never erases the stored default day; a day the customer names replaces it.
+      const when = keepDefaultedDay(cur?.requested_for, anchored);
       // A turn without lines of its own starts from what the order already says.
       const baseDraft: OrderRequestDraft = refined.items.length === 0 && cur ? { ...refined, items: asDraft(cur).items } : refined;
       // "Another bag", "2 more", "make that 3": numbers the words give but the model's draft could not be grounded on.
@@ -742,7 +760,10 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
         ...(historyAddress && fill.setDelivery && noMethod ? { delivery_preference: "delivery" } : {}),
         ...(noteOnly && !cur ? { notes: segments.join(" ").replace(/\s+/g, " ").trim().slice(0, 160) } : {}),
       };
-      const merged = mergeDraft(cur ? fieldsOf(cur) : null, forMerge, cur?.manual_locked_fields ?? [], name, (field, proposed) => statedThisTurn(field, proposed, segments, cur?.items ?? []));
+      // The alternate delivery contact survives later turns whose cumulative note no longer repeats it.
+      const keptContact = contactDigits ?? deliveryContactIn(cur?.notes);
+      if (keptContact && (forMerge.notes || contactDigits)) forMerge.notes = withDeliveryContact(forMerge.notes ?? cur?.notes ?? null, keptContact);
+      const merged = mergeDraft(cur ? fieldsOf(cur) : null, forMerge, cur?.manual_locked_fields ?? [], name ?? statedName, (field, proposed) => statedThisTurn(field, proposed, segments, cur?.items ?? []));
       // "Deliver somewhere else": the address on the order is no longer right; the customer will give the new one.
       if (cur && fill.clearAddress && merged.fields.delivery_address) {
         if (cur.manual_locked_fields.includes("delivery_address")) merged.conflicts.push({ field: "delivery_address", before: cur.delivery_address, after: null });
@@ -751,7 +772,10 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
           merged.fields.delivery_address = null;
         }
       }
-      const fields = merged.fields;
+      // A NEW order is stored with the business defaults (delivery; today before 9 AM else tomorrow, from the customer's
+      // message time), so every later read shows the same day. Explicit values and staff edits are never touched.
+      const created = cur ? null : withCreationDefaults(merged.fields, ctx.firstAt, tz);
+      const fields = created ? created.fields : merged.fields;
       const changed = cur ? merged.changes.length > 0 : true;
       // A customer contradicting a staff-locked field: the staff value stays, the proposal is recorded for a person.
       const conflicts: FieldConflicts = { ...(cur?.field_conflicts ?? {}) };
@@ -785,6 +809,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
           ...(removal && removal.removed.length > 0 && merged.changes.some((c) => c.field === "items") ? { removed_items: { before: removal.removed.map((i) => i.product), after: null } } : {}),
           ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}),
           ...(Object.keys(inferred).length > 0 ? { inferred: { before: null, after: inferred } } : {}),
+          ...(created && created.defaulted.length > 0 ? { defaulted: { before: null, after: { fields: created.defaulted, basis: ctx.firstAt, timezone: tz } } } : {}),
         },
       };
     });
@@ -827,7 +852,7 @@ export async function flagOrderFromStaff(args: StaffFlagArgs): Promise<{ applied
       status: order.status,
       attention: flag,
       awaitingSince: order.awaiting_since,
-      missing: order.missing_fields,
+      missing: computeMissing(fieldsOf(order)),
       event: "attention_flagged" as const,
       confirmedByCustomer: false,
       customerConfirmedAt: order.customer_confirmed_at,
@@ -1735,7 +1760,10 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
       if (when === order.requested_for) return reject("no_change", ORDER_REPLY.sameDelivery(order));
       run = updateOrderManually({ ...base, action: "edit", patch: { requested_for: when } });
       // The correction is recorded either way (who, when, before → after); the reply says if it left the order without a readable day.
-      success = (o) => ORDER_REPLY.delivery(o, when, names, orderDate({ requested_for: when, first_message_at: o.first_message_at }, tz) !== null);
+      success = (o) => {
+        const day = effectiveDate({ requested_for: when, first_message_at: o.first_message_at }, tz);
+        return ORDER_REPLY.delivery(o, when, names, day.source, day.date);
+      };
       break;
     }
   }

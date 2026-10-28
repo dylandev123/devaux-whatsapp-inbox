@@ -92,6 +92,22 @@ export function monitorPrefilter(input: PrefilterInput): MonitorPlan {
 // ── Budgets ──────────────────────────────────────────────────────────────────
 
 /** Monitoring-only model calls allowed per chat and per business per hour. Beyond that the message is recorded as not analysed. */
+// How much of the conversation the order reader sees. An order is often built over several messages (the product in one, the
+// address in another, a correction later), so the window is wider than the last few lines, but bounded by age so an old,
+// finished order is not mixed into a new one. Only the newest ORDER_CONTEXT_MESSAGES go to the model (tokens); grounding
+// (checking the model's values against the customer's own words) may look at the whole fetched window (no tokens).
+export const ORDER_CONTEXT_FETCH = 30;
+export const ORDER_CONTEXT_MESSAGES = 16;
+export const ORDER_CONTEXT_MAX_AGE_HOURS = 72;
+
+/** The messages of a chat that are plausibly part of the order being written at `at` (oldest first). */
+export function orderContextWindow<T extends { at: string }>(messages: T[], at: string): { forModel: T[]; forGrounding: T[] } {
+  const anchor = Date.parse(at);
+  const oldest = Number.isNaN(anchor) ? -Infinity : anchor - ORDER_CONTEXT_MAX_AGE_HOURS * 3_600_000;
+  const recent = messages.filter((m) => !(Date.parse(m.at) < oldest));
+  return { forModel: recent.slice(-ORDER_CONTEXT_MESSAGES), forGrounding: recent };
+}
+
 export const MONITOR_CALLS_PER_CHAT_PER_HOUR = 20;
 export const MONITOR_CALLS_PER_BUSINESS_PER_HOUR = 300;
 

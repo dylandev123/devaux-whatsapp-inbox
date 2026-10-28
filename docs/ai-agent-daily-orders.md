@@ -26,8 +26,8 @@ are untouched. The new table is the single source of truth for reports.
 ### Statuses and confirmation
 
 `possible` (details incomplete) → `awaiting_confirmation` (all required details present) → `confirmed` →
-`fulfilled`; `cancelled` from any open state. Required: product, quantity, delivery **or** collection, and an
-address for delivery. A missing day/time is reported but does not block.
+`fulfilled`; `cancelled` from any open state. Required: product, quantity and, unless the customer will collect, a delivery address. Delivery is the default, so a missing
+delivery/collection choice and a missing day are **not** gaps (see "Business defaults" below).
 
 There are two kinds of confirmed order, and the report and dashboard say which:
 
@@ -91,8 +91,8 @@ At local midnight everything moves one day on: yesterday's "today" order is Over
 ever completed, cancelled or deleted by the passage of time or by looking at a list; an old order stays under Overdue
 until a person completes or cancels it. (This replaces the old "7 days without activity drops out of the report" rule.)
 
-**Essentials.** An order lacks information when it has no products, a product without a quantity, no
-delivery/collection choice, no address (delivery), or no readable day. `!orders missing` and the website's *Missing
+**Essentials.** An order lacks information when it has no products, a product without a quantity, no address (delivery), or a day written
+in words nobody can read. Delivery and the day are defaulted, not missing. `!orders missing` and the website's *Missing
 information* view list exactly those, and **Needs attention** = overdue + missing information + warnings.
 
 **`!orders`** (read-only, authorized staff, the orders group): `!orders` = today and tomorrow, each day split into
@@ -407,3 +407,46 @@ as badges, missing fields as chips, **Complete / Reopen** (existing admin author
 delivery orders, the customer's saved default delivery location (set by staff with `!location`) beside the order's own
 address, flagged when they differ. It is only shown, never copied into the order. There is no second order table: the
 page reads `ai_agent_orders`.
+
+## Business defaults, identity and repair (Cool & Pool / dog food)
+
+`lib/aiAgent/orderDefaults.ts` (pure, tested in `tests/aiAgentOrderBusinessRules.test.ts`) holds the rules. **A new order is stored with both defaults when it is created** (`withCreationDefaults`, using the order's `first_message_at` and the business timezone): `fulfilment_method = 'delivery'` and `requested_for = 'Thu 29 Oct (default)'` (or `(default, morning)` when the customer gave a time of day). The `(default…)` marker, and a `defaulted` entry in the order's creation event, tell an assumed day from a stated one; the stored day is read back as-is, so it never moves. A later message that only repeats a time of day keeps the day; a day the customer names replaces it; staff edits lock the field as always. **Orders created before this change keep empty columns and are still derived when read** (`effectiveDate` / `effectiveMethod`, same answer, same inputs), so no migration is needed.
+apart, and no existing order needs migrating.
+
+| Rule | Behaviour |
+|---|---|
+| Delivery | Every order is a delivery unless the customer explicitly asks to collect (`fulfilment_method = 'collection'` is kept). An empty method is shown as *Delivery (default)* on the website and in `!moreinfo`, is never "missing", and a default delivery needs an address. The AI never asks "delivery or collection?" and never offers pick-up (reply prompt, `missingOrderFields`, `askForMissingFields`). |
+| Day | A day the customer named wins. Otherwise: written **before 9:00 AM** America/St_Lucia → that day, **at or after 9:00** → the next day, counted from the order's `first_message_at` (the customer's message time, never the processing time). A time with no day ("morning", "around 3pm") keeps its wording and takes the default day. Words that name no single day ("next week") stay as the customer's words and **are** reported as a gap. Because the date is a pure function of the order's own timestamp, it does not move at midnight or when a later message arrives; an old order simply becomes *overdue*. |
+| Reports | `!orders`, `!orders missing/overdue/undated`, the 8 AM post, `!update` and the website all use `orderDate`/`orderGaps`/`effectiveMethod`. An assumed day is marked `🗓 default day` (WhatsApp) / `· default day` (website); "Missing:" lists only real gaps (products, quantity, address, an unreadable day). |
+| Identity | Name: staff-entered → saved contact → WhatsApp profile name → a name the customer **wrote** (only when none of those exist; checked against their words) → the verified phone. Placeholders ("Unknown Contact", "customer"), numbers and JIDs are never stored as a name. `contact_number` is always the verified sender (`@lid` mappings untouched). |
+| Alternate contact | A number the customer writes for the delivery (`contact_phone`, or a note that is only a number) is checked against their own words, excluded if it is the sender's own number, and stored in the notes as `Delivery contact: 758-123-4567`. It survives later turns and never replaces `contact_number`. |
+| Location | Priority: the location the customer gives now → the staff-saved default (`!location`) → ONE unambiguous verified earlier delivery address (a confirmed/completed/staff-corrected order, or an address staff typed; if two different verified places exist none is used) → missing, flagged for a person. Applied automatically when the customer gives no location (not when collecting, not for "somewhere else", never over an address the order or staff already hold); "same place" works as before. The source is recorded in the order history (`inferred.delivery_address`: `saved location` or the order ref). Saved customer memory is read, never written. |
+| Context | The order reader sees up to 16 messages from the last 72 h (was 8) and grounds against up to 30 of the customer's own recent messages (database read, no tokens). Reply path: the same wider grounding. Later explicit corrections win; older/other orders' chat is excluded by age. No extra model call. |
+
+### Why orders were incomplete (root causes, from the code)
+
+1. `computeMissing` treated *delivery/collection* as required, so every order where the customer simply said what they wanted stayed `possible` and was reported "Missing: delivery or collection".
+2. A missing day was a "soft" gap that still showed as "Missing: day" and put the order under *No day given*; nothing assigned a day.
+3. The customer-facing prompt and `askForMissingFields` asked "delivery or collection, and your preferred day and time", advertising pick-up.
+4. The monitor path showed the model only the last 8 messages and grounded its output against those: an address or product given a few messages earlier failed grounding and was dropped, so multi-message orders looked incomplete.
+5. Stored placeholder names (`Unknown Contact`, `customer`) passed the old name filter, and a name or alternate phone the customer gave had nowhere to go (no draft field), so numbers ended up as free-text notes.
+6. "Same place" phrasings other than a few literal forms were not recognised, so the saved location was not consulted.
+
+**Not verified:** orders `#SENYB`, `#ZWL67`, `#C7PX4`, `#6SNVT`, `#GQ4DQ`, `#T5KEJ` could not be inspected: this checkout has no database credentials. Run the repair preview (below) against production, which prints each order's changes, the customer's evidence and what still needs a person.
+
+### Repairing existing open orders
+
+The website's Orders page has an admin-only **Review existing orders** card: *Review* runs the preview (read-only), each order shows Now → Proposed values with the reason and the customer's words, nothing is ticked by default, there is no "apply all", and *Update N selected orders* asks for confirmation and applies only the ticked orders' previewed changes. Outcomes are shown per order (updated / skipped because it changed since the preview).
+
+`GET /api/ai-agent/orders/repair?businessSlug=…` (admin only) **previews** what would change; `POST` with `{ businessSlug, approved: [{ orderId, fingerprint }] }`
+applies exactly those. The planner (`lib/aiAgent/orderRepair.ts`) uses no model: it applies the rules to each order's stored conversation (the order's
+source messages and the customer's messages between its first and last message).
+
+* Proposes: collection when the customer asked to collect; a written day; a bare phone number in the notes → `Delivery contact:`; a placeholder name → a reliable profile name or cleared; "same place" → the staff-saved/verified address; `possible` → `awaiting_confirmation` when the only gaps were the old defaults.
+* Never: touches completed/cancelled orders, overwrites staff-locked fields (listed as *skipped*), changes a confirmed order beyond name/phone-note cosmetics (surfaced as *review*), invents products/quantities/addresses (the customer's own messages are quoted for a person), or messages anyone.
+* Safe to repeat: each order's fingerprint covers its version and every proposed value; a stale preview applies nothing for that order (`changed_since_preview`); the write is version-checked through `apply_ai_agent_order` with key `repair:<fingerprint>`; a second apply is a no-op. Each applied order gets an `order_repair` event (before/after, reasons, evidence) and an `order.repair` audit entry; `!update` does not announce repairs.
+
+### Deployment
+
+No migration is required (the `fulfilment_method` and `requested_for` columns already exist; older orders are derived on read; alternate contacts live in `notes`; `order_repair` is just a new event kind). Order: deploy the app → Orders page → *Review existing orders* for each business → tick the orders you agree with → update. No bridge change, no environment variables, no settings. Roll back by deploying the previous version (repaired
+orders keep their audit trail).

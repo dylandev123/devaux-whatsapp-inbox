@@ -11,7 +11,7 @@
 import { createHash } from "crypto";
 import { canSendApproved, customerMessageSegments, missingOrderFields, outboxAllowed } from "@/lib/aiAgent/engine";
 import type { AgentSettings, OrderRequestDraft } from "@/lib/aiAgent/engine";
-import { ATTENTION_TEXT, MISSING_TEXT } from "@/lib/aiAgent/orders";
+import { ATTENTION_TEXT, computeMissing, MISSING_TEXT } from "@/lib/aiAgent/orders";
 import {
   assessDraftReadiness,
   buildMoreInfo,
@@ -831,7 +831,8 @@ export async function loadMoreInfo(args: {
       address: o.delivery_address,
       requestedFor: o.requested_for,
       notes: o.notes,
-      missing: o.missing_fields.filter((m) => m in MISSING_TEXT).map((m) => MISSING_TEXT[m]),
+      // Recomputed, not the stored list: delivery is the default, so an old row never reports "delivery or collection" as missing.
+      missing: computeMissing(o).filter((m) => m !== "requested_for" && m in MISSING_TEXT).map((m) => MISSING_TEXT[m]),
       attention: o.attention ? (ATTENTION_TEXT[o.attention] ?? ATTENTION_TEXT.other_customer_note) : null,
       cancelledReason: o.status === "cancelled" ? (o.cancel_reason ?? "cancelled") : null,
     })),

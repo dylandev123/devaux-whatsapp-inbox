@@ -124,9 +124,18 @@ describe("where an order belongs today", () => {
     assert.deepEqual(selectOrders({ type: "default" }, [o], after), [], "and it is not in today/tomorrow");
     assert.deepEqual(selectOrders({ type: "overdue" }, [o], after), [o], "but it is still reachable");
   });
-  test("an order with no day is 'no day yet' on the day it was written and overdue afterwards", () => {
-    const fresh = order({ requested_for: null, first_message_at: "2026-10-28T13:00:00Z" });
+  test("an order with no day gets the business default from when it was written, and goes overdue afterwards", () => {
+    const early = order({ requested_for: null, first_message_at: "2026-10-28T12:59:00Z" }); // 08:59 local
+    const late = order({ requested_for: null, first_message_at: "2026-10-28T13:00:00Z" }); // 09:00 local
     const stale = order({ requested_for: null, first_message_at: "2026-10-26T13:00:00Z" });
+    assert.equal(bucketOf(early, ctx), "today");
+    assert.equal(bucketOf(late, ctx), "tomorrow");
+    assert.equal(bucketOf(stale, ctx), "overdue");
+    assert.equal(selectOrders({ type: "undated" }, [early, late, stale], ctx).length, 0, "a defaulted day is a day, not a gap");
+  });
+  test("a day in words nobody can read is 'day not clear' on the day it was written and overdue afterwards", () => {
+    const fresh = order({ requested_for: "sometime next week", first_message_at: "2026-10-28T13:00:00Z" });
+    const stale = order({ requested_for: "sometime next week", first_message_at: "2026-10-26T13:00:00Z" });
     assert.equal(bucketOf(fresh, ctx), "undated");
     assert.equal(bucketOf(stale, ctx), "overdue");
     assert.equal(selectOrders({ type: "undated" }, [fresh, stale], ctx).length, 2, "both stay reachable");
@@ -147,14 +156,16 @@ describe("where an order belongs today", () => {
 });
 
 describe("missing information and attention", () => {
-  test("products, quantity, delivery or collection, address and day are the essentials", () => {
+  test("products, quantity and a delivery address are the essentials; delivery and the day are defaults, never gaps", () => {
     assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)"), TZ), []);
     assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { items: [] }), TZ), ["items"]);
     assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { items: [{ product: "Monello", quantity: null, variant: null, size: null }] }), TZ), ["quantity"]);
-    assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { fulfilment_method: null }), TZ), ["fulfilment_method"]);
+    assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { fulfilment_method: null }), TZ), [], "no stated method is a delivery, not a gap");
+    assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { fulfilment_method: null, delivery_address: null }), TZ), ["delivery_address"], "the default is delivery, so it needs an address");
     assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { delivery_address: null }), TZ), ["delivery_address"]);
     assert.deepEqual(orderGaps(forDay("Thu 29 Oct (tomorrow)", { fulfilment_method: "collection", delivery_address: null }), TZ), [], "a collection needs no address");
-    assert.deepEqual(orderGaps(order({ requested_for: null }), TZ), ["requested_for"]);
+    assert.deepEqual(orderGaps(order({ requested_for: null }), TZ), [], "no day is the business default, not a gap");
+    assert.deepEqual(orderGaps(order({ requested_for: "sometime next week" }), TZ), ["requested_for"], "words nobody can read are a gap");
   });
   test("the attention count is overdue + missing information + warnings, once each", () => {
     const fine = forDay("Thu 29 Oct (tomorrow)");
@@ -213,21 +224,23 @@ describe("!orders output", () => {
   const tomorrow = forDay("Thu 29 Oct (tomorrow)", { customer_name: "Priya", delivery_address: "Rodney Bay" });
   const later = forDay("Sat 31 Oct (Saturday)", { customer_name: "Later Larry" });
   const overdue = forDay("Mon 26 Oct (Monday)", { customer_name: "Old Olga", first_message_at: "2026-10-24T13:00:00Z" });
-  const noDay = order({ customer_name: "Dayless Dan", requested_for: null, first_message_at: "2026-10-28T12:00:00Z" });
-  const oldNoDay = order({ customer_name: "Ancient Abe", requested_for: null, first_message_at: "2026-10-20T12:00:00Z" });
+  const noDay = order({ customer_name: "Dayless Dan", requested_for: null, first_message_at: "2026-10-28T12:00:00Z" }); // 08:00 local: default today
+  const oldNoDay = order({ customer_name: "Ancient Abe", requested_for: null, first_message_at: "2026-10-20T12:00:00Z" }); // default 20 Oct: overdue
+  const vague = order({ customer_name: "Vague Vic", requested_for: "sometime next week", first_message_at: "2026-10-28T13:00:00Z" });
+  const oldVague = order({ customer_name: "Hazy Hank", requested_for: "sometime next week", first_message_at: "2026-10-20T12:00:00Z" });
   const noInfo = forDay("Thu 29 Oct (tomorrow)", { customer_name: "Hollow Hal", items: [], delivery_address: null });
-  const all = [today, todayCollect, tomorrow, later, overdue, noDay, oldNoDay, noInfo, forDay("Wed 28 Oct (today)", { customer_name: "Done Dora", status: "fulfilled" })];
+  const all = [today, todayCollect, tomorrow, later, overdue, noDay, oldNoDay, vague, oldVague, noInfo, forDay("Wed 28 Oct (today)", { customer_name: "Done Dora", status: "fulfilled" })];
 
   test("the default view is today and tomorrow, each split into delivery and collection; the rest is counted, not listed", () => {
     const text = body("", all);
     assert.match(text, /^📋 \*ORDERS — Wed 28 Oct\*/);
-    assert.match(text, /📅 \*TODAY — Wed 28 Oct\* \(2\)\n\n🚚 \*Delivery\*\n\n\*1\. Jane Doe · #[A-Z0-9]+\* ✅ confirmed[\s\S]*🛍 \*Collection\*\n\n\*2\. Marcus/);
+    assert.match(text, /📅 \*TODAY — Wed 28 Oct\* \(3\)\n\n🚚 \*Delivery\*\n\n\*1\. Dayless Dan · #[A-Z0-9]+\* 🕓 to confirm[\s\S]*\*2\. Jane Doe · #[A-Z0-9]+\* ✅ confirmed[\s\S]*🛍 \*Collection\*\n\n\*3\. Marcus/);
+    assert.match(text, /Dayless Dan[\s\S]*🗓 default day/, "an assumed day is marked, a stated one is not");
     assert.match(text, /📅 \*TOMORROW — Thu 29 Oct\* \(2\)/);
     assert.match(text, /Priya/);
-    for (const hidden of ["Later Larry", "Old Olga", "Ancient Abe", "Done Dora"]) assert.doesNotMatch(text, new RegExp(hidden), `${hidden} is not in today/tomorrow`);
-    assert.match(text, /Dayless Dan/, "an order written today with no day yet is shown under its own heading");
-    assert.match(text, /❔ \*NO DAY GIVEN YET \(1\)\*/);
-    assert.match(text, /⏰ 2 overdue orders — !orders overdue/);
+    for (const hidden of ["Later Larry", "Old Olga", "Ancient Abe", "Hazy Hank", "Done Dora"]) assert.doesNotMatch(text, new RegExp(hidden), `${hidden} is not in today/tomorrow`);
+    assert.match(text, /❔ \*DAY NOT CLEAR \(1\)\*[\s\S]*Vague Vic/, "unreadable words are shown under their own heading");
+    assert.match(text, /⏰ 3 overdue orders — !orders overdue/);
     assert.match(text, /⚠️ \d+ orders? missing information — !orders missing/);
     assert.match(text, /🗓 1 later order — !orders <date>/);
   });
@@ -240,16 +253,18 @@ describe("!orders output", () => {
     const text = body("overdue", all);
     assert.match(text, /^📋 \*OVERDUE ORDERS\*/);
     assert.match(text, /WAS DUE — Mon 26 Oct[\s\S]*Old Olga/);
-    assert.match(text, /NO DAY GIVEN — first mentioned before today \(1\)\*[\s\S]*Ancient Abe/);
+    assert.match(text, /WAS DUE — Tue 20 Oct[\s\S]*Ancient Abe/, "an old order that named no day is due the day its default gave it");
+    assert.match(text, /DAY NOT CLEAR — first mentioned before today \(1\)\*[\s\S]*Hazy Hank/);
     assert.doesNotMatch(text, /Dayless Dan|Jane/);
     assert.match(text, /!order #REF completed/);
   });
   test("missing lists what each order lacks; undated lists orders with no day", () => {
     const text = body("missing", all);
     assert.match(text, /Hollow Hal[\s\S]*⚠️ Missing: products, delivery address/);
-    assert.match(text, /Dayless Dan[\s\S]*Missing: day/);
-    assert.doesNotMatch(text, /Jane Doe/, "a complete order is not listed");
-    assert.match(body("undated", all), /Ancient Abe[\s\S]*Dayless Dan|Dayless Dan[\s\S]*Ancient Abe/);
+    assert.match(text, /Vague Vic[\s\S]*Missing: day/);
+    assert.doesNotMatch(text, /Jane Doe|Dayless Dan|Ancient Abe/, "a complete order, defaults included, is not listed");
+    assert.match(body("undated", all), /Hazy Hank[\s\S]*Vague Vic|Vague Vic[\s\S]*Hazy Hank/);
+    assert.doesNotMatch(body("undated", all), /Dayless Dan|Ancient Abe/);
   });
   test("an empty view says so plainly", () => {
     assert.match(body("", []), /✅ Nothing outstanding for today or tomorrow\./);
@@ -271,7 +286,7 @@ describe("!orders output", () => {
       assert.ok(p.length <= 3800);
       assert.match(p, new RegExp(`^📋 \\*ORDERS — TODAY\\* \\(${i + 1}/${result.parts.length}\\)`));
     });
-    const refs = result.parts.flatMap((p) => p.match(/#O?[A-Z0-9]{5}\b/g) ?? []);
+    const refs = result.parts.flatMap((p) => p.match(/#O?[A-Z0-9]{5,6}\b/g) ?? []);
     assert.equal(new Set(refs).size, 60);
     assert.ok(!result.parts.some((p, i) => i < result.parts.length - 1 && /(🚚|🛍|📅|❓) \*[^\n]*\*$/.test(p.trim())), "a heading never ends a message");
   });

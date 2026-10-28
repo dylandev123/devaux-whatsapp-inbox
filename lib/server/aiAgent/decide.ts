@@ -36,7 +36,7 @@ import {
   staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
 import { assessDraftReadiness, buildPilotNotice, buildPilotUpdateNotice, pilotNoReplyNeeded } from "@/lib/aiAgent/pilot";
-import { gateAllowsMonitoring } from "@/lib/aiAgent/orderMonitor";
+import { gateAllowsMonitoring, ORDER_CONTEXT_FETCH, orderContextWindow } from "@/lib/aiAgent/orderMonitor";
 import { type CustomerMode, customerModeAllowsKind, effectiveCustomerMode, modeAdjustedDecision } from "@/lib/aiAgent/customerMode";
 import {
   buildShadowRecord,
@@ -72,6 +72,7 @@ import { historyLinesForStaff, MemoryBrief, validateMemoryFacts } from "@/lib/ai
 import {
   loadCustomerContext,
   loadOpenOrderRequest,
+  loadRecentMessages,
   OpenOrderRequest,
 } from "@/lib/server/aiAgent/context";
 import {
@@ -607,7 +608,7 @@ async function runPipeline(args: {
   if (!args.text.trim()) return empty;
 
   const tracking = Boolean(settings?.orders_tracking_enabled) && Boolean(chatId) && !args.asOf;
-  const [knowledge, context, openOrder, openEscalation, recentReplies, trackedOpen, orderHistory] = await Promise.all([
+  const [knowledge, context, openOrder, openEscalation, recentReplies, trackedOpen, orderHistory, wideMessages] = await Promise.all([
     loadActiveKnowledge(businessSlug),
     chatId && identity
       ? loadCustomerContext(businessSlug, chatId, args.contactNumber, args.excludeMessageIds, identity, args.text, { before: args.asOf })
@@ -619,6 +620,9 @@ async function runPipeline(args: {
     tracking ? loadOpenOrders(businessSlug, chatId!).catch(() => "failed" as const) : Promise.resolve(null),
     // The customer's earlier orders (same business, stable identity). A failure only means "no history".
     tracking && identity ? loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => [] as HistoryOrder[]) : Promise.resolve([] as HistoryOrder[]),
+    // A wider look at the customer's own recent words (a database read, no model tokens): an order built over several
+    // messages must still be checked against everything the customer wrote for it, not only the last dozen lines.
+    tracking ? loadRecentMessages(businessSlug, chatId!, args.excludeMessageIds, ORDER_CONTEXT_FETCH).catch(() => []) : Promise.resolve([]),
   ]);
 
   const safeguards = detectSafeguards(args.text);
@@ -665,7 +669,11 @@ async function runPipeline(args: {
   // The model may only restate what the customer actually wrote: ungrounded products, quantities,
   // addresses and times are dropped before anything is merged, stored or shown to staff.
   let proposal = modelResult.proposal;
-  const customerWords = [args.text, ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? [])];
+  const customerWords = [
+    args.text,
+    ...(context?.transcript.filter((t) => t.who === "Customer").map((t) => t.text) ?? []),
+    ...orderContextWindow(wideMessages, new Date().toISOString()).forGrounding.filter((m) => m.who === "Customer").map((m) => m.text),
+  ];
   // The raw drafts are kept for order tracking, which grounds them against the order they target (not the legacy request).
   let rawProposal = proposal ? { order_request: proposal.order_request, order_target: proposal.order_target, other_orders: proposal.other_orders } : null;
   // "Same as usual, plus 4 pool salt" can make the reply path hand the turn to staff without asking the model anything. The order book

@@ -155,6 +155,10 @@ export interface OrderRequestDraft {
   notes: string | null;
   /** Daily order tracking only: the day/time the customer asked for, in their words. Present only when stated. */
   requested_for?: string | null;
+  /** Daily order tracking only: a name the customer GAVE for the order or themselves ("it's for Marcus"). Never a guess. */
+  customer_name?: string | null;
+  /** Daily order tracking only: a different number to reach for the delivery ("call my driver on 758…"). Never the sender's own. */
+  contact_phone?: string | null;
 }
 
 /** A further, distinct order the same customer turn started (daily order tracking). */
@@ -516,12 +520,12 @@ export function isCollection(preference: string | null | undefined): boolean {
 }
 
 export function missingOrderFields(request: OrderRequestDraft | null): OrderField[] {
-  if (!request) return ["items", "quantity", "delivery_address", "delivery_preference"];
+  if (!request) return ["items", "quantity", "delivery_address"];
   const missing: OrderField[] = [];
   if (request.items.length === 0) missing.push("items");
   else if (request.items.some((i) => !i.quantity)) missing.push("quantity");
   if (!request.delivery_address && !isCollection(request.delivery_preference)) missing.push("delivery_address");
-  if (!request.delivery_preference) missing.push("delivery_preference");
+  // Delivery is the business default: whether the customer wants delivery or collection is never asked and never "missing".
   return missing;
 }
 
@@ -529,7 +533,7 @@ const FIELD_QUESTIONS: Record<OrderField, string> = {
   items: "which product(s) you'd like",
   quantity: "how many of each",
   delivery_address: "your delivery address",
-  delivery_preference: "whether you'd like delivery or to collect, and your preferred day and time",
+  delivery_preference: "your preferred day and time",
 };
 
 /** Deterministic fallback question when the model's ASK text is missing or unsafe. */
@@ -705,12 +709,16 @@ function parseItems(value: unknown): OrderItem[] {
 
 function parseOrderDraft(order: Record<string, unknown>): OrderRequestDraft {
   const requestedFor = cleanText(order.requested_for, 200);
+  const customerName = cleanText(order.customer_name, 80);
+  const contactPhone = cleanText(order.contact_phone, 30);
   return {
     items: parseItems(order.items),
     delivery_address: cleanText(order.delivery_address),
     delivery_preference: cleanText(order.delivery_preference),
     notes: cleanText(order.notes),
     ...(requestedFor ? { requested_for: requestedFor } : {}),
+    ...(customerName ? { customer_name: customerName } : {}),
+    ...(contactPhone ? { contact_phone: contactPhone } : {}),
   };
 }
 

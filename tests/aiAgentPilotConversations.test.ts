@@ -31,7 +31,7 @@ describe("order slots (pure rules)", () => {
     assert.equal(isCollection(null), false);
     assert.deepEqual(missingOrderFields(order([["Monello Chicken 15kg", "2"]], { delivery_preference: "Collection Friday" })), []);
     assert.deepEqual(missingOrderFields(order([["Monello Chicken 15kg", "2"]], { delivery_preference: "Delivery Friday" })), ["delivery_address"]);
-    assert.deepEqual(missingOrderFields(order([["Monello", null]])), ["quantity", "delivery_address", "delivery_preference"]);
+    assert.deepEqual(missingOrderFields(order([["Monello", null]])), ["quantity", "delivery_address"]);
   });
 
   test("a draft that only asks for the next order detail is customer-ready; the missing details are listed for staff instead", () => {

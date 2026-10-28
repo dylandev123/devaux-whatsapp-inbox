@@ -175,7 +175,9 @@ describe("merging corrections and respecting manual edits", () => {
   test("collection needs no address; delivery does", () => {
     assert.deepEqual(computeMissing({ items: order().items, fulfilment_method: "collection", delivery_address: null, requested_for: "Fri" }), []);
     assert.deepEqual(computeMissing({ items: order().items, fulfilment_method: "delivery", delivery_address: null, requested_for: "Fri" }), ["delivery_address"]);
-    assert.deepEqual(computeMissing({ items: [{ product: "x", quantity: null, variant: null, size: null }], fulfilment_method: null, delivery_address: null, requested_for: null }), ["quantity", "fulfilment_method", "requested_for"]);
+    assert.deepEqual(computeMissing({ items: [{ product: "x", quantity: null, variant: null, size: null }], fulfilment_method: null, delivery_address: null, requested_for: null }), ["quantity", "delivery_address", "requested_for"]);
+    // Delivery is the default: no stated method is never a gap, and an order with an address and quantity is complete.
+    assert.deepEqual(computeMissing({ items: order().items, fulfilment_method: null, delivery_address: "12 Main St", requested_for: null }), ["requested_for"]);
   });
 });
 

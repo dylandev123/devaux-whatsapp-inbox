@@ -13,6 +13,8 @@ import {
   monitorBudgetExceeded,
   monitorEligibleChat,
   monitorPrefilter,
+  ORDER_CONTEXT_FETCH,
+  orderContextWindow,
   type StaffAction,
 } from "@/lib/aiAgent/orderMonitor";
 import { loadCustomerDisplayName, loadRecentMessages } from "@/lib/server/aiAgent/context";
@@ -88,7 +90,8 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
     const customerName = await loadCustomerDisplayName(identity, a.contactNumber, chatId);
     let proposal: Parameters<typeof trackOrders>[0]["proposal"] = null;
     let intent: string | null = null;
-    const recent = await loadRecentMessages(businessSlug, chatId, a.messageIds);
+    const window = orderContextWindow(await loadRecentMessages(businessSlug, chatId, a.messageIds, ORDER_CONTEXT_FETCH), a.firstAt);
+    const recent = window.forModel;
     // The customer's earlier orders: shown to the model in compact form and used by the server to resolve "same as last time".
     const history: HistoryOrder[] = plan.action === "analyse" ? await loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => []) : [];
     if (plan.action === "analyse") {
@@ -124,7 +127,7 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
       proposal,
       segments: a.segments,
       // Grounding: the customer's own words only (this turn, and their earlier messages in the stored history).
-      customerWords: [...a.segments, ...recent.filter((m) => m.who === "Customer").map((m) => m.text)],
+      customerWords: [...a.segments, ...window.forGrounding.filter((m) => m.who === "Customer").map((m) => m.text)],
       chatIds: identity.chatIds,
       history,
       messageIds: a.messageIds,

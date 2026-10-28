@@ -253,9 +253,9 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await customerSays(JANE, "I want 2 Monello Chicken please, delivery");
     const [o] = await allOrders();
     assert.deepEqual(o.items, [{ product: "Monello Chicken", quantity: "2", variant: null, size: null }]);
-    assert.equal(o.requested_for, null);
+    assert.equal(o.requested_for, "Thu 29 Oct (default)", "the time the model invented is dropped; the business default day is stored, marked as a default");
     assert.equal(o.status, "possible");
-    assert.deepEqual(o.missing_fields, ["delivery_address", "requested_for"]);
+    assert.deepEqual(o.missing_fields, ["delivery_address"], "the day is stored (as a default), so it is no longer missing");
   });
 
   // ── Merging, corrections, duplicates ───────────────────────────────────────
@@ -664,7 +664,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await pg.run(`update public.ai_agent_orders set customer_name = 'Jane' where chat_id = ${lit(JANE.chat)}; update public.ai_agent_orders set customer_name = 'Marcus' where chat_id = ${lit(MARCUS.chat)};`);
     // Yesterday's order, still outstanding.
     await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-25T15:00:00Z', last_message_at = '2026-10-26T15:00:00Z' where chat_id = ${lit(JANE.chat)};
-                  update public.ai_agent_orders set first_message_at = '2026-10-27T10:30:00Z', last_message_at = '2026-10-27T10:30:00Z' where chat_id = ${lit(MARCUS.chat)};`);
+                  update public.ai_agent_orders set first_message_at = '2026-10-27T10:30:00Z', last_message_at = '2026-10-27T10:30:00Z', requested_for = 'Tue 27 Oct (default)' where chat_id = ${lit(MARCUS.chat)};`);
   }
 
   test("nothing is posted before 8:00 St Lucia time; at 8:00 exactly one report is queued for the staff group", async () => {
@@ -679,9 +679,10 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(item.to_jid, GROUP);
     assert.equal(item.status, "pending");
     assert.equal(item.dedupe_key, "ordersummary:dog_food:2026-10-27:1");
-    // The morning post is the by-day view: Jane's order is for Friday, so it is counted, not listed; Marcus has no day yet.
+    // The morning post is the by-day view: Jane's order is for Friday, so it is counted, not listed. Marcus named no day and wrote
+    // at 06:30 (before 9 AM), so the business default puts him on today, marked as a default.
     assert.match(item.body, /^📋 \*ORDERS — Tue 27 Oct\*/);
-    assert.match(item.body, /❔ \*NO DAY GIVEN YET \(1\)\*[\s\S]*Marcus · #[A-Z2-9]{5}\*/);
+    assert.match(item.body, /📅 \*TODAY — Tue 27 Oct\* \(1\)[\s\S]*Marcus · #[A-Z2-9]{5}\*[\s\S]*🗓 default day/);
     assert.doesNotMatch(item.body, /Jane/, "an order for Friday is not carried into Tuesday's list");
     assert.match(item.body, /🗓 1 later order — !orders <date>/);
     assert.doesNotMatch(item.body, /Needs delivery address|Needs confirmation/);

@@ -400,7 +400,7 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     await customerSays(JANE, "2 Monello Chicken please");
     const [o] = await allOrders();
     assert.deepEqual(o.items.map((i: any) => i.product), ["Monello Chicken"]);
-    assert.equal(o.requested_for, null);
+    assert.match(o.requested_for, /\(default\)$/, "the invented time is dropped; only the business default day is stored");
     assert.equal(o.delivery_address, null);
   });
 

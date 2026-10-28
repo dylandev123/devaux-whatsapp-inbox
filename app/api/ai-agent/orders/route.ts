@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { DEFAULT_ORDERS_TIMEZONE, isOpenStatus, ORDER_STATUSES, type EditableOrderField, type OrderStatus } from "@/lib/aiAgent/orders";
+import { effectiveDate, effectiveMethod } from "@/lib/aiAgent/orderDefaults";
 import { bucketOf, countOrders, dayContext, dayLabel, orderDate, orderGaps, selectOrders, type OrdersView } from "@/lib/aiAgent/orderViews";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
 import { ensureSettings, resolveBusinessSlug } from "@/lib/server/aiAgent/db";
@@ -60,9 +61,13 @@ export async function GET(request: Request) {
     const [names, saved] = await Promise.all([loadOrderNames(businessSlug, orders), loadSavedLocations(businessSlug, orders.filter((o) => isOpenStatus(o.status) && o.fulfilment_method !== "collection"))]);
     return NextResponse.json({
       orders: orders.map((o) => {
-        const date = orderDate(o, timezone);
+        const day = effectiveDate(o, timezone);
+        const date = day.date;
         return {
           ...o,
+          // What the business defaults filled in (delivery; today before 9 AM, else tomorrow) versus what was actually said.
+          method_defaulted: effectiveMethod(o).defaulted,
+          date_source: day.source,
           display_name: names[o.id]?.name ?? null,
           name_source: names[o.id]?.source ?? null,
           fulfilment_date: date,

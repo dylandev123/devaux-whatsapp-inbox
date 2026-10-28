@@ -8,7 +8,8 @@
 // order whose day has passed (or an undated one first mentioned on an earlier day) is "overdue". Nothing here completes,
 // cancels or deletes an order: an old order stays listed under Overdue until a person completes or cancels it.
 
-import { addDays, requestedDate, resolveRequestedDay } from "./orderText.ts";
+import { effectiveDate, effectiveMethod } from "./orderDefaults.ts";
+import { addDays, resolveRequestedDay } from "./orderText.ts";
 import {
   computeMissing,
   conflictFields,
@@ -72,9 +73,13 @@ export function dayContext(now: Date, timezone: string = DEFAULT_ORDERS_TIMEZONE
   return { timezone, today, tomorrow: addDays(today, 1).key };
 }
 
-/** The day an order is for (YYYY-MM-DD in the business's timezone), or null when it has none that can be read. */
+/**
+ * The day an order is for (YYYY-MM-DD in the business's timezone): the day the customer named or, when they named none,
+ * the business default (today before 9:00 AM Saint Lucia time, otherwise tomorrow, counted from when the request was
+ * written; see orderDefaults.ts). null only when they gave words that cannot be read as one day ("next week").
+ */
 export function orderDate(o: Pick<TrackedOrder, "requested_for" | "first_message_at">, timezone: string = DEFAULT_ORDERS_TIMEZONE): string | null {
-  return requestedDate(o.requested_for, o.first_message_at, timezone);
+  return effectiveDate(o, timezone).date;
 }
 
 /** "Wed 28 Oct". */
@@ -93,11 +98,15 @@ export function bucketOf(o: Pick<TrackedOrder, "requested_for" | "first_message_
   return "later";
 }
 
-/** What an order still lacks that a person needs to act on it: products, quantity, delivery/collection, address, a day. */
+/**
+ * What an order genuinely lacks: products, a quantity, a delivery address (unless it is a collection), or a day the customer
+ * gave in words that cannot be read. A missing delivery/collection choice and a missing day are NOT gaps: the business
+ * defaults (delivery; today before 9 AM, else tomorrow) apply.
+ */
 export function orderGaps(o: Pick<TrackedOrder, "items" | "fulfilment_method" | "delivery_address" | "requested_for" | "first_message_at">, timezone: string = DEFAULT_ORDERS_TIMEZONE): string[] {
   const missing = computeMissing(o).filter((m) => m !== "requested_for");
-  // A day written in words that cannot be read ("sometime next week") counts as no day.
-  if (orderDate(o, timezone) === null) missing.push("requested_for");
+  // A day written in words that cannot be read ("sometime next week") is a real gap; no day at all is not.
+  if (effectiveDate(o, timezone).source === "unreadable") missing.push("requested_for");
   return missing;
 }
 
@@ -189,10 +198,20 @@ export function orderViewBlock(o: TrackedOrder, index: number, names: OrderNames
   const name = named ?? phone ?? "Unknown customer";
   const lines = [`*${index}. ${safeText(name, 40)} · ${displayRef(o.ref_code)}* ${STATUS_BADGE[o.status] ?? ""}`.trim()];
   if (o.items.length > 0) lines.push(o.items.map(reportItemText).join("; "));
-  const date = orderDate(o, tz);
+  const day = effectiveDate(o, tz);
+  const date = day.date;
+  const { method } = effectiveMethod(o);
   const where = [
-    o.fulfilment_method === "delivery" ? (o.delivery_address ? `📍 ${safeText(o.delivery_address, 80)}` : "📍 address needed") : o.fulfilment_method === "collection" ? "🛍 collection" : "",
-    opts.showDate ? (date ? `🗓 ${dayLabel(date)}` : o.requested_for ? `🗓 “${safeText(o.requested_for, 40)}” (no date read)` : "🗓 no day") : "",
+    method === "delivery" ? (o.delivery_address ? `📍 ${safeText(o.delivery_address, 80)}` : "📍 address needed") : "🛍 collection",
+    opts.showDate
+      ? date
+        ? `🗓 ${dayLabel(date)}${day.source === "default" ? " (default)" : ""}`
+        : o.requested_for
+          ? `🗓 “${safeText(o.requested_for, 40)}” (no date read)`
+          : "🗓 no day"
+      : day.source === "default"
+        ? "🗓 default day"
+        : "",
     timeOfDay(o.requested_for) ? `🕐 ${timeOfDay(o.requested_for)}` : "",
     named && phone ? `📞 ${phone}` : "",
   ].filter(Boolean);
@@ -278,8 +297,8 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
     const dayOrders = picked.filter((o) => orderDate(o, tz) === key);
     chunks.push({ text: `📅 *${word}${dayLabel(key)}* (${dayOrders.length})`, heading: true });
     if (dayOrders.length === 0) chunks.push({ text: "Nothing outstanding." });
-    for (const method of ["delivery", "collection", "none"] as const) {
-      const group = dayOrders.filter((o) => (o.fulfilment_method ?? "none") === method);
+    for (const method of ["delivery", "collection"] as const) {
+      const group = dayOrders.filter((o) => effectiveMethod(o).method === method);
       if (group.length === 0) continue;
       chunks.push({ text: METHOD_HEADING[method], heading: true });
       for (const o of group) chunks.push({ text: numbered(o) });
@@ -301,7 +320,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
         dayBlock(ctx.tomorrow);
       }
       if (fresh.length > 0) {
-        chunks.push({ text: `❔ *NO DAY GIVEN YET (${fresh.length})*`, heading: true });
+        chunks.push({ text: `❔ *DAY NOT CLEAR (${fresh.length})*`, heading: true });
         flat(fresh);
       }
       break;
@@ -324,7 +343,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       for (const key of [...new Set(picked.map((o) => orderDate(o, tz)).filter((d): d is string => d !== null))].sort()) dayBlock(key);
       const noDay = picked.filter((o) => orderDate(o, tz) === null);
       if (noDay.length > 0) {
-        chunks.push({ text: `❔ *NO DAY GIVEN (${noDay.length})*`, heading: true });
+        chunks.push({ text: `❔ *DAY NOT CLEAR (${noDay.length})*`, heading: true });
         flat(noDay);
       }
       break;
@@ -335,7 +354,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       for (const key of [...new Set(picked.map((o) => orderDate(o, tz)).filter((d): d is string => d !== null))].sort()) dayBlock(key);
       const noDay = picked.filter((o) => orderDate(o, tz) === null);
       if (noDay.length > 0) {
-        chunks.push({ text: `❔ *NO DAY GIVEN — first mentioned before today (${noDay.length})*`, heading: true });
+        chunks.push({ text: `❔ *DAY NOT CLEAR — first mentioned before today (${noDay.length})*`, heading: true });
         flat(noDay);
       }
       if (picked.length > 0) chunks.push({ text: "Done? !order #REF completed · new day: !update #REF delivery <date> · cancel: !update #REF cancelled" });
@@ -343,12 +362,12 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
     }
     case "missing":
       title = "📋 *ORDERS MISSING INFORMATION*";
-      empty = "✅ Every outstanding order has the essentials (products, quantity, delivery or collection, address, day).";
+      empty = "✅ Every outstanding order has the essentials (products, quantity, delivery address).";
       flat(picked);
       break;
     case "undated":
-      title = "📋 *ORDERS WITH NO DAY*";
-      empty = "✅ Every outstanding order has a day.";
+      title = "📋 *ORDERS WITH AN UNCLEAR DAY*";
+      empty = "✅ Every outstanding order has a clear day.";
       flat(picked);
       if (picked.length > 0) chunks.push({ text: "Set the day: !update #REF delivery <date>" });
       break;
@@ -384,10 +403,11 @@ const MATERIAL_FIELDS = ["items", "fulfilment_method", "delivery_address", "requ
 
 /**
  * Events that never make an order "changed": a staff WhatsApp command was already acknowledged in the group, and a
- * completion or reopening is bookkeeping (the order simply leaves or returns to !orders).
+ * completion or reopening is bookkeeping (the order simply leaves or returns to !orders). An admin-approved repair of old
+ * orders (orderRepair.ts) is a data correction, not something the customer changed.
  */
 export function isNoiseEvent(e: Pick<OrderEventRow, "kind">): boolean {
-  return /^staff_whatsapp_/.test(e.kind) || /^manual_(fulfil|reopen|keep)$/.test(e.kind) || e.kind === "no_change";
+  return /^staff_whatsapp_/.test(e.kind) || e.kind === "order_repair" || /^manual_(fulfil|reopen|keep)$/.test(e.kind) || e.kind === "no_change";
 }
 
 export interface UpdateEntry {
@@ -486,8 +506,8 @@ export function buildUpdateSummary(input: UpdateSummaryInput): string {
         const date = orderDate(e.order, tz);
         const bits = [
           e.order.items.length ? e.order.items.map(orderItemText).join("; ") : "no products yet",
-          e.order.fulfilment_method === "collection" ? "collection" : e.order.fulfilment_method === "delivery" ? `delivery${e.order.delivery_address ? ` ${safeText(e.order.delivery_address, 40)}` : ""}` : "",
-          date ? dayLabel(date) : "no day yet",
+          effectiveMethod(e.order).method === "collection" ? "collection" : `delivery${e.order.delivery_address ? ` ${safeText(e.order.delivery_address, 40)}` : ""}`,
+          date ? `${dayLabel(date)}${effectiveDate(e.order, tz).source === "default" ? " (default)" : ""}` : "day unclear",
         ].filter(Boolean);
         const gaps = orderGaps(e.order, tz).filter((g) => g !== "requested_for");
         lines.push(`🆕 ${who} — ${bits.join(" · ")}${gaps.length ? ` ⚠️ missing ${gaps.map(gapText).join(", ")}` : ""}`);

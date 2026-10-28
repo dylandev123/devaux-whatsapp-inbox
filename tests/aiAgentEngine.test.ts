@@ -273,7 +273,7 @@ test("order helpers: merge keeps earlier details and reports missing fields", ()
   assert.equal(merged?.items[0].product, "Puppy 3kg");
   assert.equal(merged?.delivery_preference, "Friday pm");
   assert.deepEqual(missingOrderFields(merged), ["quantity"]);
-  assert.deepEqual(missingOrderFields(null), ["items", "quantity", "delivery_address", "delivery_preference"]);
+  assert.deepEqual(missingOrderFields(null), ["items", "quantity", "delivery_address"]);
 });
 
 // ── Model output parsing ─────────────────────────────────────────────────────

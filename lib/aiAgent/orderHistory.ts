@@ -66,7 +66,8 @@ export interface HistoryCue {
 
 const USUAL = /\b(?:the |my )?usual\b|\bas (?:usual|always)\b|\bsame as always\b|\bregular order\b/i;
 const SAME_PRODUCT = /\bsame\s+(?!as\b|again\b|order\b|thing\b|stuff\b|one\b|location\b|place\b|address\b|spot\b)([a-z0-9][a-z0-9 ]{1,30}?)\s+(?:as|like)\s+(?:last time|before|usual|previously)\b/i;
-const SAME_LOCATION = /\bsame\s+(?:location|place|address|spot|delivery (?:address|location|spot))\b|\b(?:deliver|bring|send|drop)\w*\s+(?:it\s+|them\s+)?(?:to\s+|at\s+)?the same (?:place|location|address|spot)\b/i;
+const SAME_LOCATION =
+  /\bsame\s+(?:location|place|address|spot|delivery (?:address|location|spot))\b|\b(?:deliver|bring|send|drop)\w*\s+(?:it\s+|them\s+)?(?:to\s+|at\s+)?the same (?:place|location|address|spot)\b|\b(?:delivery|address|location|place)\s+(?:is\s+|are\s+)?(?:the\s+)?same\b(?!\s+(?:day|time|bag|product|order|thing|one)\b)|\bsame\s+(?:as|like)\s+(?:last time|before|usual|always)\s+(?:for\s+)?(?:the\s+)?(?:delivery|address|location|place)\b/i;
 // "My usual location" points at the PLACE, not at the usual order: it must not also trigger an items repeat.
 const USUAL_PLACE = /\b(?:the |my )?(?:usual|regular|normal|default|saved)\s+(?:delivery\s+)?(?:location|place|address|spot)\b/i;
 const ELSEWHERE = /\b(?:some|any)(?:where|place) else\b|\b(?:a |an )?(?:different|another|new|other) (?:location|place|address|spot)\b/i;
@@ -180,6 +181,26 @@ export interface FillContext {
   draftAddress: string | null;
   /** The customer's staff-saved default delivery location, if any. "Same place" / "usual location" resolve to it first. */
   defaultLocation?: string | null;
+  /**
+   * No cue needed: when the customer gave no location (and is not collecting or going "somewhere else"), fill the
+   * saved default, else the one verified earlier address. Only ever fills a gap; never overwrites a stated location.
+   */
+  implicitLocation?: boolean;
+  /** The customer (or the order) is collecting, so there is no delivery location to fill. */
+  collecting?: boolean;
+}
+
+const sameAddress = (a: string, b: string) => normalizeText(a) === normalizeText(b);
+
+/**
+ * The delivery address from the customer's earlier orders when it is UNAMBIGUOUS: every verified address (a reliable
+ * order's, or one staff typed) is the same place. Two different verified places mean we cannot tell which one the
+ * customer means today, so none is used.
+ */
+export function unambiguousVerifiedAddress(history: HistoryOrder[], excludeId?: string | null): HistoryOrder | null {
+  const verified = history.filter((o) => o.id !== excludeId && hasVerifiedAddress(o)).sort(newest);
+  if (verified.length === 0) return null;
+  return verified.every((o) => sameAddress(o.delivery_address!, verified[0].delivery_address!)) ? verified[0] : null;
 }
 
 const emptyFill = (): HistoryFill => ({ items: [], address: null, setDelivery: false, clearAddress: false, sources: {}, unresolved: [] });
@@ -227,6 +248,21 @@ export function resolveFromHistory(history: HistoryOrder[], cue: HistoryCue, tur
       fill.address = place.delivery_address;
       fill.setDelivery = ctx.current?.fulfilment_method !== "collection";
       fill.sources.delivery_address = place.ref_code;
+    }
+  } else if (ctx.implicitLocation && !cue.sameLocation && !ctx.collecting && !ctx.draftAddress && !ctx.current?.delivery_address) {
+    // Priority: the location the customer states now (draftAddress, handled by the guards above) > the location staff
+    // saved > one unambiguous verified earlier address > nothing (the order stays "address missing" for a person).
+    if (ctx.defaultLocation) {
+      fill.address = ctx.defaultLocation;
+      fill.setDelivery = true;
+      fill.sources.delivery_address = SAVED_LOCATION_SOURCE;
+    } else {
+      const place = unambiguousVerifiedAddress(history, ctx.current?.id);
+      if (place) {
+        fill.address = place.delivery_address;
+        fill.setDelivery = true;
+        fill.sources.delivery_address = place.ref_code;
+      }
     }
   }
   return fill;

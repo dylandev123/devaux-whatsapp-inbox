@@ -436,6 +436,10 @@ export type OrderView = TrackedOrder & {
   /** The day the order is for (YYYY-MM-DD, business timezone) and how it reads; null when none could be read. */
   fulfilment_date?: string | null;
   fulfilment_date_label?: string | null;
+  /** The business default (delivery) filled in a missing delivery/collection choice. */
+  method_defaulted?: boolean;
+  /** "stated": a readable day was given; "default": the 9 AM business default; "unreadable": words nobody can read. */
+  date_source?: "stated" | "default" | "unreadable";
   /** Where the order belongs today (open orders only). */
   bucket?: "overdue" | "today" | "tomorrow" | "later" | "undated" | null;
   /** Missing essentials, as field keys ("items", "quantity", "fulfilment_method", "delivery_address", "requested_for"). */
@@ -443,6 +447,15 @@ export type OrderView = TrackedOrder & {
   /** The default delivery location staff saved for this customer, shown beside the order's own address. */
   saved_location?: { content: string; set_at: string } | null;
 };
+/** Preview of the "Review existing orders" repair (admin only). Mirrors lib/server/aiAgent/orderRepair.ts RepairPreview. */
+export interface RepairPreviewView {
+  generatedAt: string;
+  timezone: string;
+  summary: import("@/lib/aiAgent/orderRepair").RepairSummary;
+  items: (import("@/lib/aiAgent/orderRepair").RepairItem & { customer: string | null; phone: string | null })[];
+  truncated: number;
+}
+export type RepairOutcomeView = "applied" | "already_applied" | "changed_since_preview" | "nothing_to_apply" | "not_found" | "conflict";
 export type OrderViewName = "all" | "today" | "tomorrow" | "overdue" | "missing" | "undated";
 export interface OrderCountsView {
   open: number;
@@ -504,6 +517,11 @@ export const aiAgentApi = {
     action: "edit" | "confirm" | "cancel" | "fulfil" | "keep" | "reopen",
     extra: { version: number; patch?: Partial<Record<EditableOrderField, unknown>>; conflictFields?: string[]; reason?: string }
   ) => api<{ order: OrderView }>("/api/ai-agent/orders", send("PATCH", { businessSlug: b, orderId, action, ...extra })),
+  /** Read-only: what a repair of the open orders would change. */
+  previewOrderRepair: (b: string) => api<RepairPreviewView>(`/api/ai-agent/orders/repair${q(b)}`),
+  /** Applies exactly the previewed changes of the listed orders; a stale fingerprint applies nothing for that order. */
+  applyOrderRepair: (b: string, approved: { orderId: string; fingerprint: string }[]) =>
+    api<{ results: { orderId: string; ref: string | null; outcome: RepairOutcomeView }[] }>("/api/ai-agent/orders/repair", send("POST", { businessSlug: b, approved })),
   sendOrderSummary: (b: string) => api<{ ok: true }>("/api/ai-agent/orders", send("POST", { businessSlug: b })),
   listApprovals: (b: string) => api<{ mode: string; items: ApprovalItemView[] }>(`/api/ai-agent/approvals${q(b)}`),
   /** One request at a time: there is no bulk approval. `draftId` is the draft the admin was looking at. */

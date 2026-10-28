@@ -242,4 +242,10 @@ describe("replies", () => {
     assert.match(info, /Recent changes:\n• 26 Oct, 10:05 ai: ai update — items 1 × Monello → 2 × Monello/);
     assert.ok(info.length < 1200);
   });
+  test("a stored default day is never presented as the customer's words", () => {
+    const show = (requested_for: string | null) => moreInfoReply({ order: order({ requested_for }), name: undefined, events: [], timezone: "America/St_Lucia" });
+    assert.match(show("Thu 29 Oct (default)"), /Day: Thu 29 Oct \(default — no day given\)/);
+    assert.match(show("Thu 29 Oct (default, morning)"), /Day: Thu 29 Oct \(default; they said “morning”\)/);
+    assert.doesNotMatch(show("Thu 29 Oct (default)"), /they said/);
+  });
 });

@@ -184,7 +184,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
   test("confirming an incomplete order is refused with what is missing; an already confirmed one is a no-op", async () => {
     const o = await makeOrder(JANE, "a bag of Monello please", draft({ items: [{ product: "Monello", quantity: "1" }], delivery_address: null, delivery_preference: null }));
     const refused = await groupSays(`!update ${ref(o)} confirmed`);
-    assert.match(reply(refused), /can't be confirmed yet — missing: delivery or collection\. Nothing changed\./);
+    assert.match(reply(refused), /can't be confirmed yet — missing: delivery address\. Nothing changed\./);
     assert.equal((await allOrders())[0].status, "possible");
 
     const complete = await makeOrder(MARCUS, ORDER_TEXT);
@@ -279,7 +279,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     await makeOrder(MARCUS, ORDER_TEXT);
     const search = reply(await groupSays("!order jane"));
     assert.match(search, /1 active order for "jane"/);
-    assert.match(search, /\*Jane Doe · #[A-Z2-9]{5}\*\nOpen\n286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate$/m);
+    assert.match(search, /\*Jane Doe · #[A-Z2-9]{5}\*\nOpen\n286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate · \w{3} \d{1,2} \w{3} \(default\)$/m);
     assert.doesNotMatch(search, /5550102/);
     assert.match(reply(await groupSays("!order 555-0102")), /1 active order/);
     assert.match(reply(await groupSays("!order nobody")), /No active order matches "nobody"/);
@@ -705,17 +705,18 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     const old = await datedOrder(JANE, "Monday");
     await pg.run(`update public.ai_agent_orders set requested_for = 'Mon 26 Oct (Monday)', first_message_at = '2026-10-26T14:00:00Z' where id = ${lit(old.id)};`);
     const dateless = await makeOrder(MARCUS, ORDER_TEXT);
-    await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-20T14:00:00Z' where id = ${lit(dateless.id)};`);
+    await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-20T14:00:00Z', requested_for = 'Wed 21 Oct (default)' where id = ${lit(dateless.id)};`);
     const hollow = await makeOrder(PRIYA, "some Monello please", draft({ items: [{ product: "Monello", quantity: null }], delivery_address: null, delivery_preference: null }));
     const overdue = await nextReport("!orders overdue");
     assert.match(overdue, /OVERDUE ORDERS/);
     assert.match(overdue, new RegExp(`WAS DUE — Mon 26 Oct[\\s\\S]*${ref(old)}`));
-    assert.match(overdue, new RegExp(`first mentioned before today[\\s\\S]*${ref(dateless)}`));
+    // Written on 20 Oct at 10:00 with no day: the business default (before 9 AM today, else tomorrow) made it due on the 21st.
+    assert.match(overdue, new RegExp(`WAS DUE — Wed 21 Oct[\\s\\S]*${ref(dateless)}`));
     assert.match(await nextReport("!orders today"), /✅ Nothing outstanding for today\./, "old orders are not carried into today");
     const missing = await nextReport("!orders missing");
-    assert.match(missing, new RegExp(`${ref(hollow)}[\\s\\S]*Missing: quantity, delivery or collection`));
+    assert.match(missing, new RegExp(`${ref(hollow)}[\\s\\S]*Missing: quantity, delivery address`));
     assert.doesNotMatch(missing, new RegExp(ref(old)), "a complete, dated order is not 'missing'");
-    assert.match(await nextReport("!orders undated"), new RegExp(ref(dateless)));
+    assert.match(await nextReport("!orders undated"), /✅ Every outstanding order has a clear day\./, "a defaulted day is a day");
     assert.match(await nextReport("!orders 30 Oct"), /✅ Nothing outstanding for Fri 30 Oct\./);
     // Nothing was completed, cancelled or deleted by any of that.
     assert.deepEqual((await allOrders()).map((o) => o.status).sort(), ["awaiting_confirmation", "awaiting_confirmation", "possible"]);
@@ -809,11 +810,14 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.deepEqual(last.changes.requested_for, { before, after: "Fri 30 Oct (30 Oct)" });
     assert.match(await nextReport("!orders 30 Oct"), new RegExp(ref(o)));
     assert.doesNotMatch(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
-    // Words that are not a day are recorded too, but the order is then honestly "no day".
-    const vague = await groupSays(`!update ${ref(o)} delivery whenever you can`);
-    assert.match(reply(vague), /not a date I can read, so the order has no day yet/);
+    // "Whenever" names no day: recorded, and the business default applies (said so, not silently).
+    const loose = await groupSays(`!update ${ref(o)} delivery whenever you can`);
+    assert.match(reply(loose), /No specific day in that, so the order uses the default day/);
+    // Words that are not a day are recorded too, but the order is then honestly "day unclear".
+    const vague = await groupSays(`!update ${ref(o)} delivery sometime next week`);
+    assert.match(reply(vague), /not a date I can read, so the order's day is unclear/);
     assert.match(await nextReport("!orders undated"), new RegExp(ref(o)));
-    assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "staff_whatsapp_edit").length, 2, "both corrections stay in the history");
+    assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "staff_whatsapp_edit").length, 3, "every correction stays in the history");
   });
 
   test("a customer who later gives a different day does not overwrite the staff correction; the disagreement is flagged", async () => {
@@ -889,7 +893,9 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     const res = await groupSays("!orders all");
     assert.equal(res.outbox.length, 1);
     const text = res.outbox[0].body;
-    assert.match(text, /^📋 \*ALL OUTSTANDING ORDERS\*\n\n❔ \*NO DAY GIVEN \(2\)\*\n\n\*1\. Jane Doe · #[A-Z2-9]{5}\* 🕓 to confirm\n1 × Monello Chicken 25kg\n📍 Cap Estate · 🗓 no day · 📞 286-7466\n⚠️ Missing: day\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\* ❔ incomplete\n2 × Monello\n📍 address needed · 🗓 no day\n⚠️ Missing: delivery address, day/);
+    // No day was given in either: the business default applies and is marked; "Missing" lists only real gaps.
+    assert.match(text, /^📋 \*ALL OUTSTANDING ORDERS\*\n\n📅 \*[A-Z ]*— ?\w{3} \d+ \w{3}\* \(2\)\n\n🚚 \*Delivery\*\n\n\*1\. Jane Doe · #[A-Z2-9]{5}\* 🕓 to confirm\n1 × Monello Chicken 25kg\n📍 Cap Estate · 🗓 default day · 📞 286-7466\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\* ❔ incomplete\n2 × Monello\n📍 address needed · 🗓 default day\n⚠️ Missing: delivery address\n/);
+    assert.doesNotMatch(text, /Missing: [^\n]*(day|delivery or collection)/);
     assert.equal(await customerBound(), 0);
   });
 
@@ -919,9 +925,9 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
 
   test("the scheduled 8 AM report is split the same way and still posts once", async () => {
     for (let i = 0; i < 40; i += 1) {
-      await pg.run(`insert into public.ai_agent_orders (ref_code, business_slug, chat_id, contact_number, customer_name, status, items, fulfilment_method, delivery_address, notes, missing_fields, first_message_at, last_message_at)
+      await pg.run(`insert into public.ai_agent_orders (ref_code, business_slug, chat_id, contact_number, customer_name, status, items, fulfilment_method, delivery_address, requested_for, notes, missing_fields, first_message_at, last_message_at)
         values (${lit(refOf("YY2", i))}, 'dog_food', ${lit(`1758555${String(2000 + i)}@s.whatsapp.net`)}, ${lit(`1758555${String(2000 + i)}`)}, ${lit(`Customer ${i}`)}, 'awaiting_confirmation',
-          '[{"product":"Monello","quantity":"2","variant":null,"size":"25kg"}]'::jsonb, 'delivery', '12 Main Street, Gros Islet, Saint Lucia', ${lit("n".repeat(100))}, '{}', now(), now());`);
+          '[{"product":"Monello","quantity":"2","variant":null,"size":"25kg"}]'::jsonb, 'delivery', '12 Main Street, Gros Islet, Saint Lucia', 'Tue 27 Oct (today)', ${lit("n".repeat(100))}, '{}', now(), now());`);
     }
     const settings = await settingsOf();
     const eight = new Date("2026-10-27T12:00:00Z");
@@ -990,7 +996,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.equal(o.items[0].quantity, "1");
     assert.equal(o.fulfilment_method, "delivery");
     assert.equal(o.delivery_address, "Cap");
-    assert.deepEqual(o.missing_fields, ["requested_for"], "nothing about delivery or collection is asked again");
+    assert.deepEqual(o.missing_fields, [], "delivery and the day are stored as defaults, so nothing is asked again");
     assert.equal(o.status, "awaiting_confirmation");
   });
 

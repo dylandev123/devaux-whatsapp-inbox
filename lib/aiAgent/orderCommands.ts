@@ -17,6 +17,7 @@
 // active order; with two or more matches nothing is changed and the choices are listed. No model is involved.
 
 import { normalizeText } from "./escalationUpdates.ts";
+import { type DateSource, effectiveDate, effectiveMethod, isDefaultedDay } from "./orderDefaults.ts";
 import { dayLabel, orderDate, parseOrdersView, type OrdersView } from "./orderViews.ts";
 import {
   DEFAULT_ORDERS_TIMEZONE,
@@ -252,8 +253,14 @@ export const ORDER_REPLY = {
     `✅ ${label(o, names)}: quantity ${before ?? "not set"} → ${after} (${clip(orderProductText(o.items[0]), 60)}).`,
   sameQuantity: (o: TrackedOrder, q: number) => `ℹ️ ${displayRef(o.ref_code)} already has quantity ${q} — no change.`,
   severalProducts: (o: TrackedOrder) => `⚠️ ${displayRef(o.ref_code)} has ${o.items.length === 0 ? "no products" : `${o.items.length} products`} — change quantities in the Orders dashboard. Nothing changed.`,
-  delivery: (o: TrackedOrder, when: string, names?: OrderNames, dated = true) =>
-    `✅ ${label(o, names)}: ${o.fulfilment_method === "collection" ? "collection" : "delivery"} date → ${clip(when, 60)}.${dated ? "" : " ⚠️ That is not a date I can read, so the order has no day yet. Use e.g. “delivery 30 Oct” or “delivery tomorrow”."}`,
+  delivery: (o: TrackedOrder, when: string, names?: OrderNames, source: DateSource = "stated", defaultDay?: string | null) =>
+    `✅ ${label(o, names)}: ${effectiveMethod(o).method} date → ${clip(when, 60)}.${
+      source === "stated"
+        ? ""
+        : source === "default"
+          ? ` ℹ️ No specific day in that, so the order uses the default day${defaultDay ? ` (${dayLabel(defaultDay)})` : ""}.`
+          : " ⚠️ That is not a date I can read, so the order's day is unclear. Use e.g. “delivery 30 Oct” or “delivery tomorrow”."
+    }`,
   sameDelivery: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} already has that date — no change.`,
   stale: (o: TrackedOrder) => `⚠️ ${displayRef(o.ref_code)} changed after your message was sent — nothing applied. Check !moreinfo ${displayRef(o.ref_code)} and send it again.`,
   conflict: (o: TrackedOrder) => `⚠️ ${displayRef(o.ref_code)} was just changed by someone else — nothing applied. Check !moreinfo ${displayRef(o.ref_code)} and try again.`,
@@ -327,10 +334,18 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     ...(phone ? [`Phone: ${phone}`] : []),
     ...(name?.name && name.source ? [`Name: ${NAME_SOURCE_TEXT[name.source]}`] : []),
     ...(o.items.length > 0 ? o.items.map((i) => `• ${orderItemText(i)}`) : ["• no products yet"]),
-    `Method: ${o.fulfilment_method ?? "not stated"}${o.delivery_address ? ` · ${clip(o.delivery_address, 120)}` : ""}`,
-    ...(o.requested_for
-      ? [orderDate(o, timezone) ? `Day: ${dayLabel(orderDate(o, timezone)!)} (${clip(o.requested_for, 60)})` : `When: ${clip(o.requested_for, 80)} — no date read`]
-      : ["Day: not given"]),
+    `Method: ${effectiveMethod(o).method}${effectiveMethod(o).defaulted ? " (default)" : ""}${o.delivery_address ? ` · ${clip(o.delivery_address, 120)}` : ""}`,
+    ...(() => {
+      const day = effectiveDate(o, timezone);
+      if (day.source === "unreadable") return [`When: ${clip(o.requested_for ?? "", 80)} — no date read`];
+      const shown = dayLabel(day.date!);
+      if (day.source === "default") {
+        // A stored "Thu 29 Oct (default)" is the business rule's own value, not the customer's words; only a time of day they gave is theirs.
+        const said = isDefaultedDay(o.requested_for) ? ((o.requested_for ?? "").match(/\(default, (.+)\)$/)?.[1] ?? null) : o.requested_for;
+        return [`Day: ${shown} (default${said ? `; they said “${clip(said, 40)}”` : " — no day given"})`];
+      }
+      return [`Day: ${shown} (${clip(o.requested_for ?? "", 60)})`];
+    })(),
     ...(o.notes ? [`Note: ${clip(o.notes, 160)}`] : []),
     ...conflictFields(o).map((f) => `⚠️ Customer now says ${conflictText(f, o.field_conflicts[f]!, 50)}`),
     ...(o.attention ? [`⚠️ ${clip(o.attention.replace(/_/g, " "), 60)}`] : []),

@@ -158,13 +158,16 @@ export function sameLineProduct(a: OrderLine, b: OrderLine): boolean {
 
 const SOFT_FIELDS = new Set(["requested_for"]);
 
-/** Everything still unknown. `requested_for` is reported but never blocks awaiting_confirmation. */
+/**
+ * Everything still genuinely unknown. Delivery is the business default, so a missing delivery/collection choice is never
+ * reported: an order with no stated method is a delivery and, as one, needs an address. `requested_for` is reported only as
+ * a soft gap here; the day itself is defaulted (lib/aiAgent/orderDefaults.ts), and views report only a day that cannot be read.
+ */
 export function computeMissing(f: Pick<OrderFields, "items" | "fulfilment_method" | "delivery_address" | "requested_for">): string[] {
   const missing: string[] = [];
   if (f.items.length === 0) missing.push("items");
   else if (f.items.some((i) => !i.quantity)) missing.push("quantity");
-  if (!f.fulfilment_method) missing.push("fulfilment_method");
-  else if (f.fulfilment_method === "delivery" && !f.delivery_address) missing.push("delivery_address");
+  if (f.fulfilment_method !== "collection" && !f.delivery_address) missing.push("delivery_address");
   if (!f.requested_for) missing.push("requested_for");
   return missing;
 }
@@ -241,7 +244,8 @@ export function mergeDraft(
   const method = fulfilmentMethod(draft.delivery_preference);
   if (method) set("fulfilment_method", method, method === base.fulfilment_method);
   if (draft.delivery_preference && !isLocked("fulfilment_method")) fields.delivery_preference = draft.delivery_preference;
-  if (!base.customer_name && customerName) fields.customer_name = customerName;
+  // A name that was never reliable ("Unknown Contact", a number) is replaced once a reliable one is known; staff edits stay.
+  if ((!base.customer_name || !isReliableName(base.customer_name)) && customerName && !isLocked("customer_name")) fields.customer_name = customerName;
   return { fields, changes, conflicts };
 }
 
