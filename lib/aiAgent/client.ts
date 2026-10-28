@@ -430,7 +430,30 @@ export interface BackfillRunView {
 }
 
 /** An order plus the best name the Inbox knows (staff-entered, saved contact, then WhatsApp profile name). */
-export type OrderView = TrackedOrder & { display_name?: string | null; name_source?: "staff" | "saved" | "profile" | null };
+export type OrderView = TrackedOrder & {
+  display_name?: string | null;
+  name_source?: "staff" | "saved" | "profile" | null;
+  /** The day the order is for (YYYY-MM-DD, business timezone) and how it reads; null when none could be read. */
+  fulfilment_date?: string | null;
+  fulfilment_date_label?: string | null;
+  /** Where the order belongs today (open orders only). */
+  bucket?: "overdue" | "today" | "tomorrow" | "later" | "undated" | null;
+  /** Missing essentials, as field keys ("items", "quantity", "fulfilment_method", "delivery_address", "requested_for"). */
+  gaps?: string[];
+  /** The default delivery location staff saved for this customer, shown beside the order's own address. */
+  saved_location?: { content: string; set_at: string } | null;
+};
+export type OrderViewName = "all" | "today" | "tomorrow" | "overdue" | "missing" | "undated";
+export interface OrderCountsView {
+  open: number;
+  today: number;
+  tomorrow: number;
+  later: number;
+  overdue: number;
+  undated: number;
+  missing: number;
+  attention: number;
+}
 export interface OrderRunView {
   id: string;
   trigger: "scheduled" | "manual";
@@ -470,13 +493,15 @@ const q = (businessSlug: string, extra = "") => `?businessSlug=${encodeURICompon
 const send = (method: string, body: unknown): RequestInit => ({ method, body: JSON.stringify(body) });
 
 export const aiAgentApi = {
-  listOrders: (b: string, status: "open" | "all" | OrderStatus, query: string) =>
-    api<{ orders: OrderView[]; runs: OrderRunView[]; coverage: import("@/lib/aiAgent/orders").Coverage }>(`/api/ai-agent/orders${q(b, `&status=${status}&q=${encodeURIComponent(query)}`)}`),
+  listOrders: (b: string, status: "open" | "all" | OrderStatus, query: string, view: OrderViewName = "all") =>
+    api<{ orders: OrderView[]; runs: OrderRunView[]; coverage: import("@/lib/aiAgent/orders").Coverage; counts: OrderCountsView; timezone: string; today: string }>(
+      `/api/ai-agent/orders${q(b, `&status=${status}&view=${view}&q=${encodeURIComponent(query)}`)}`
+    ),
   orderEvents: (b: string, orderId: string) => api<{ events: OrderEventView[] }>(`/api/ai-agent/orders${q(b, `&orderId=${encodeURIComponent(orderId)}`)}`),
   updateOrder: (
     b: string,
     orderId: string,
-    action: "edit" | "confirm" | "cancel" | "fulfil" | "keep",
+    action: "edit" | "confirm" | "cancel" | "fulfil" | "keep" | "reopen",
     extra: { version: number; patch?: Partial<Record<EditableOrderField, unknown>>; conflictFields?: string[]; reason?: string }
   ) => api<{ order: OrderView }>("/api/ai-agent/orders", send("PATCH", { businessSlug: b, orderId, action, ...extra })),
   sendOrderSummary: (b: string) => api<{ ok: true }>("/api/ai-agent/orders", send("POST", { businessSlug: b })),

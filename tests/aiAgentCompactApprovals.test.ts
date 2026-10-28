@@ -144,7 +144,7 @@ describe("Compact approvals, !moreinfo and the dashboard queue (real server code
 
   beforeEach(async () => {
     await pg.run(`
-      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_escalations, public.ai_agent_outbox,
+      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_order_update_posts, public.ai_agent_escalations, public.ai_agent_outbox,
         public.ai_agent_staff_answers, public.ai_agent_events, public.ai_agent_learning_candidates, public.ai_agent_knowledge,
         public.ai_agent_customer_memory, public.ai_agent_audit_log, public.ai_agent_conversations, public.ai_agent_contact_rules,
         public.ai_agent_order_requests, public.ai_agent_batches, public.ai_agent_batch_messages, public.ai_agent_pilot_drafts,

@@ -26,6 +26,7 @@ import {
   moreInfoReply,
   type OrderCommand,
   ORDER_HELP,
+  ORDERS_HELP,
   ORDER_REPLY,
   resolveSelector,
   searchOrders,
@@ -44,8 +45,9 @@ import {
 } from "@/lib/aiAgent/orderHistory";
 import { loadStaffLocationSafe } from "@/lib/server/aiAgent/customerStaffMemory";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
+import { buildOrdersView, buildUpdateSummary, countOrders, dayContext, type OrderEventRow, orderDate, type OrdersView, summarizeUpdates } from "@/lib/aiAgent/orderViews";
 import {
-  buildOrderSummary,
+  coverageWarning,
   type Coverage,
   computeMissing,
   DEFAULT_ORDERS_TIMEZONE,
@@ -225,6 +227,43 @@ export async function listOrderEvents(businessSlug: string, orderId: string) {
     .limit(50);
   if (error) throw new Error(error.message);
   return data ?? [];
+}
+
+// ── Saved delivery locations (website) ───────────────────────────────────────
+
+export interface SavedLocationView {
+  content: string;
+  set_at: string;
+}
+
+/**
+ * The default delivery location STAFF saved for each order's customer (!location / the staff card), keyed exactly as the
+ * order tracker reads it: the order's verified phone, or its own chat. One query for the whole list, scoped to the
+ * business. A name never matches. The table missing (migration not yet run) reads as "nothing saved".
+ */
+export async function loadSavedLocations(businessSlug: string, orders: TrackedOrder[]): Promise<Record<string, SavedLocationView>> {
+  const keysOf = (o: TrackedOrder) => [...(o.contact_number ? [o.contact_number] : []), `chat:${o.chat_id}`];
+  const allKeys = [...new Set(orders.flatMap(keysOf))];
+  if (allKeys.length === 0) return {};
+  const { data, error } = await agentDb()
+    .from("ai_agent_customer_staff_memory")
+    .select("customer_key, content, created_at")
+    .eq("business_slug", businessSlug)
+    .eq("kind", "delivery_location")
+    .eq("status", "active")
+    .in("customer_key", allKeys.slice(0, 400))
+    .order("created_at", { ascending: false });
+  if (error) return {};
+  const newest = new Map<string, SavedLocationView>();
+  for (const r of (data ?? []) as { customer_key: string; content: string; created_at: string }[]) {
+    if (!newest.has(r.customer_key)) newest.set(r.customer_key, { content: r.content, set_at: r.created_at });
+  }
+  const out: Record<string, SavedLocationView> = {};
+  for (const o of orders) {
+    const found = keysOf(o).map((k) => newest.get(k)).filter((v): v is SavedLocationView => Boolean(v)).sort((a, b) => b.set_at.localeCompare(a.set_at))[0];
+    if (found) out[o.id] = found;
+  }
+  return out;
 }
 
 // ── Customer names ───────────────────────────────────────────────────────────
@@ -815,9 +854,9 @@ export async function flagOrderFromStaff(args: StaffFlagArgs): Promise<{ applied
 // ── Manual corrections (dashboard) ───────────────────────────────────────────
 
 /** "keep" = staff keep their value for the fields the customer contradicted (`conflictFields`, default all). */
-export type ManualAction = "edit" | "confirm" | "cancel" | "fulfil" | "keep";
-/** "reopen" (undo a completion) is only reachable from the WhatsApp order command, not the dashboard route. */
-type ManualActionInternal = ManualAction | "reopen";
+/** "reopen" undoes a completion; the dashboard and the WhatsApp command both use it, under the same rules. */
+export type ManualAction = "edit" | "confirm" | "cancel" | "fulfil" | "keep" | "reopen";
+type ManualActionInternal = ManualAction;
 
 export interface ManualInput {
   businessSlug: string;
@@ -1130,11 +1169,16 @@ export async function loadCoverage(settings: AgentSettings, now: Date): Promise<
   };
 }
 
-/** The report as of right now, from the database (orders and coverage are both read fresh). */
-export async function buildSummaryNow(settings: AgentSettings, trigger: "scheduled" | "manual", now: Date) {
+/**
+ * The morning list as of right now, from the database: the same "today and tomorrow, by delivery or collection" answer
+ * as `!orders`, with overdue / missing / undated orders counted in its footer instead of carried into the list.
+ */
+export async function buildSummaryNow(settings: AgentSettings, trigger: "scheduled" | "manual", now: Date, view: OrdersView = { type: "default" }) {
   const [orders, coverage] = await Promise.all([loadOutstandingOrders(settings.business_slug), loadCoverage(settings, now)]);
   const names = await loadOrderNames(settings.business_slug, orders);
-  return buildOrderSummary({ businessLabel: businessLabel(settings.business_slug), timezone: tzOf(settings), now, orders, names, trigger, coverage });
+  const warning = coverageWarning(coverage);
+  const built = buildOrdersView({ view, orders, names, now, timezone: tzOf(settings), warning });
+  return { text: built.parts.join("\n\n"), parts: built.parts, shown: built.shown, attention: built.counts.attention, overdue: built.counts.overdue };
 }
 
 function summaryItem(settings: AgentSettings, body: string, dedupeKey: string, eventId: string | null): OutboxInsert {
@@ -1176,9 +1220,10 @@ async function queueSummary(
       status: "queued",
       outbox_id: outboxRow?.id ?? null,
       group_jid: items[0].toJid,
-      confirmed_count: summary.confirmed,
+      // Column names predate the new list: listed = orders shown, attention = need a look, carried = overdue.
+      confirmed_count: summary.shown,
       attention_count: summary.attention,
-      carried_count: summary.carriedForward,
+      carried_count: summary.overdue,
     })
     .eq("id", run.id);
   return created;
@@ -1422,6 +1467,36 @@ async function guardOrderCommand(ctx: CommandContext, mode: "update" | "command"
   return null;
 }
 
+// ── "!update": what is new or changed since the group was last shown ─────────
+
+/** The newest "!update" posts of one business, with the delivery state of the message that carried each. */
+async function recentUpdatePosts(businessSlug: string, groupJid: string, now: Date) {
+  const { data, error } = await agentDb()
+    .from("ai_agent_order_update_posts")
+    .select("id, event_id, window_start, window_end, outbox_id, created_at")
+    .eq("business_slug", businessSlug)
+    .eq("group_jid", groupJid)
+    .order("created_at", { ascending: false })
+    .limit(10);
+  if (error) throw new Error(error.message);
+  const posts = (data ?? []) as { id: string; event_id: string | null; window_start: string; window_end: string; outbox_id: string | null; created_at: string }[];
+  const ids = posts.map((p) => p.outbox_id).filter((id): id is string => Boolean(id));
+  const outbox = ids.length ? ((await agentDb().from("ai_agent_outbox").select("id, status, error, dispatched_at, created_at").in("id", ids)).data ?? []) : [];
+  return posts.map((p) => {
+    const o = outbox.find((x) => x.id === p.outbox_id);
+    return { ...p, delivery: o ? outboxState({ status: o.status, error: o.error, dispatched_at: o.dispatched_at, created_at: o.created_at }, now) : null };
+  });
+}
+
+/** How far back the first "!update" looks when nothing has ever been delivered to the group. */
+const FIRST_UPDATE_HOURS = 24;
+
+/**
+ * "!update": a short list of orders that are new or materially changed since the last "!update" that PROVABLY reached the
+ * group (a failed, blocked or unconfirmed one does not move the point, so nothing is lost; the cost is that a
+ * possibly-delivered one is shown again). The point is shared by the group and is not a review: nothing here marks an order
+ * seen, confirmed or completed, and the message says so. Read-only for orders; the only write is the post record.
+ */
 export async function handleUpdateCommand(args: {
   settings: AgentSettings;
   fromGroup: string;
@@ -1433,22 +1508,82 @@ export async function handleUpdateCommand(args: {
   const { settings, fromGroup, senderAuth } = args;
   const slug = settings.business_slug;
   const now = args.now ?? new Date();
-  const target = ordersGroupJid(settings);
+  const target = ordersGroupJid(settings)!;
   const refused = await guardOrderCommand(args, "update");
   if (refused) return refused;
-  if (await recentManualRun(slug, now)) return groupReply(settings, fromGroup, args.eventId, UPDATE_REFUSAL.cooldown, fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", "orders:update_cooldown");
 
-  const { dateKey } = localParts(now, tzOf(settings));
-  const { data, error } = await agentDb()
-    .from("ai_agent_order_summary_runs")
-    .insert({ business_slug: slug, trigger: "manual", local_date: dateKey, status: "claimed", requested_by: senderAuth.senderId, event_id: args.eventId, group_jid: target })
-    .select("id")
-    .single();
-  if (error) throw new Error(error.message);
+  const posts = await recentUpdatePosts(slug, target, now);
+  // The same WhatsApp message delivered again keeps its window; the outbox dedupe key then makes the send itself a no-op.
+  const redelivered = posts.find((p) => p.event_id === args.eventId) ?? null;
+  const others = posts.filter((p) => p.id !== redelivered?.id);
+  const latest = others[0];
+  // A previous update still on its way would be repeated in full: wait for it instead.
+  if (!redelivered && latest && (Date.parse(latest.created_at) > now.getTime() - MANUAL_COOLDOWN_MS || latest.delivery === "pending" || latest.delivery === "dispatched")) {
+    return groupReply(settings, fromGroup, args.eventId, UPDATE_REFUSAL.cooldown, fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", "orders:update_cooldown");
+  }
+  const confirmed = others.find((p) => p.delivery === "sent");
+  const since = redelivered ? new Date(redelivered.window_start) : confirmed ? new Date(confirmed.window_end) : new Date(now.getTime() - FIRST_UPDATE_HOURS * 3_600_000);
+  const firstUpdate = redelivered ? false : !confirmed;
+
+  let post = redelivered;
+  if (!post) {
+    const { data, error } = await agentDb()
+      .from("ai_agent_order_update_posts")
+      .insert({ business_slug: slug, group_jid: target, requested_by: senderAuth.senderId, event_id: args.eventId, window_start: since.toISOString() })
+      .select("id, event_id, window_start, window_end, outbox_id, created_at")
+      .single();
+    if (error) throw new Error(error.message);
+    post = { ...(data as NonNullable<typeof redelivered>), delivery: null };
+  }
+
+  const events = await loadOrderEventsSince(slug, since);
+  const touched = await loadOrdersByIds(slug, [...new Set(events.map((e) => e.order_id))]);
+  // An order created in the window but with no event row yet (never expected) is still new.
+  const created = await loadOrdersCreatedSince(slug, since);
+  const byId = new Map([...touched, ...created].map((o) => [o.id, o]));
+  const entries = summarizeUpdates({ since, orders: [...byId.values()], events });
+  const open = await loadOutstandingOrders(slug);
+  const names = await loadOrderNames(slug, [...byId.values(), ...open]);
+  const tz = tzOf(settings);
+  const warning = coverageWarning(await loadCoverage(settings, now));
+  const body = buildUpdateSummary({ entries, since, names, timezone: tz, counts: countOrders(open, dayContext(now, tz)), firstUpdate, warning });
+
+  const item: OutboxInsert = { businessSlug: slug, chatId: target, kind: "staff_notice", toJid: target, body: body.slice(0, 3800), dedupeKey: `orderupdate:${slug}:${args.eventId}`, eventId: args.eventId };
+  if (!outboxAllowed(settings, item)) return groupReply(settings, fromGroup, args.eventId, UPDATE_REFUSAL.blocked, fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", "orders:update_blocked");
   // Dispatched in this very response: the person who typed !update is waiting for it.
-  const rows = await queueSummary(settings, { id: data.id, trigger: "manual", dedupeKey: `ordersummary:manual:${args.eventId}`, eventId: args.eventId }, now, true);
-  await audit(slug, "staff", senderAuth.senderId, "orders.update_requested", { type: "order_summary_run", id: data.id });
-  return { outbox: [], queued: rows ?? [], outcome: rows && rows.length > 0 ? "orders:update_sent" : "orders:update_blocked" };
+  const rows = await enqueue([item], true);
+  const outboxId = rows[0]?.id ?? post.outbox_id ?? ((await agentDb().from("ai_agent_outbox").select("id").eq("dedupe_key", item.dedupeKey).maybeSingle()).data?.id as string | undefined) ?? null;
+  await agentDb()
+    .from("ai_agent_order_update_posts")
+    .update({ outbox_id: outboxId, new_count: entries.filter((e) => e.kind === "new").length, changed_count: entries.filter((e) => e.kind === "changed" || e.kind === "attention").length, cancelled_count: entries.filter((e) => e.kind === "cancelled").length })
+    .eq("id", post.id);
+  await audit(slug, "staff", senderAuth.senderId, "orders.update_requested", { type: "order_update_post", id: post.id }, { entries: entries.length });
+  return { outbox: [], queued: rows, outcome: "orders:update_sent" };
+}
+
+async function loadOrderEventsSince(businessSlug: string, since: Date): Promise<OrderEventRow[]> {
+  const { data, error } = await agentDb()
+    .from("ai_agent_order_events")
+    .select("order_id, kind, actor_kind, changes, created_at")
+    .eq("business_slug", businessSlug)
+    .gt("created_at", since.toISOString())
+    .order("created_at")
+    .limit(2000);
+  if (error) throw new Error(error.message);
+  return (data ?? []) as OrderEventRow[];
+}
+
+async function loadOrdersByIds(businessSlug: string, ids: string[]): Promise<TrackedOrder[]> {
+  if (ids.length === 0) return [];
+  const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).in("id", ids.slice(0, 500));
+  if (error) throw new Error(error.message);
+  return (data ?? []) as TrackedOrder[];
+}
+
+async function loadOrdersCreatedSince(businessSlug: string, since: Date): Promise<TrackedOrder[]> {
+  const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).gt("created_at", since.toISOString()).limit(500);
+  if (error) throw new Error(error.message);
+  return (data ?? []) as TrackedOrder[];
 }
 
 // ── Order commands (!update #REF …, !order, !moreinfo #REF) ──────────────────
@@ -1495,7 +1630,22 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
     await audit(slug, "staff", senderAuth.senderId, "orders.command_rejected", { type: "chat", id: fromGroup }, { reason, command: command.kind });
     return reply(body, `cmd_${reason}`);
   };
-  if (command.kind === "help") return reply(ORDER_HELP, "cmd_help");
+  if (command.kind === "help") return reply(command.reason === "orders" ? ORDERS_HELP : ORDER_HELP, "cmd_help");
+
+  if (command.kind === "orders") {
+    const open = await loadOutstandingOrders(slug);
+    const everyone = await loadOrderNames(slug, open);
+    // Coverage (is anything being missed?) only matters on the default view; it is the most expensive read here.
+    const warning = command.view.type === "default" ? coverageWarning(await loadCoverage(settings, now)) : null;
+    const view = buildOrdersView({ view: command.view, orders: open, names: everyone, now, timezone: tzOf(settings), warning });
+    await audit(slug, "staff", senderAuth.senderId, "orders.lookup", { type: "chat", id: fromGroup }, { command: "orders", view: command.view.type, shown: view.shown });
+    // One at a time, so the parts reach the group in order. The key is the WhatsApp message: a redelivery sends nothing twice.
+    const queued: OutboxRow[] = [];
+    for (const [i, part] of view.parts.entries()) {
+      queued.push(...(await enqueue([{ businessSlug: slug, chatId: fromGroup, kind: "staff_notice", toJid: fromGroup, body: part.slice(0, 3800), dedupeKey: `ordersview:${slug}:${args.whatsappMessageId}:p${i + 1}`, eventId: args.eventId }], true)));
+    }
+    return { outbox: [], queued, outcome: "orders:cmd_orders" };
+  }
 
   const tz = tzOf(settings);
   const active = await loadOutstandingOrders(slug);
@@ -1584,7 +1734,8 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
       const when = anchorRequestedFor(action.when, order.requested_for, at, tz) ?? action.when;
       if (when === order.requested_for) return reject("no_change", ORDER_REPLY.sameDelivery(order));
       run = updateOrderManually({ ...base, action: "edit", patch: { requested_for: when } });
-      success = (o) => ORDER_REPLY.delivery(o, when, names);
+      // The correction is recorded either way (who, when, before → after); the reply says if it left the order without a readable day.
+      success = (o) => ORDER_REPLY.delivery(o, when, names, orderDate({ requested_for: when, first_message_at: o.first_message_at }, tz) !== null);
       break;
     }
   }

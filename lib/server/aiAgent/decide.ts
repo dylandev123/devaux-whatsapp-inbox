@@ -312,7 +312,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
 
 /** A message in the separate Orders group: only the order commands do anything; it never reaches the escalation logic. */
 async function processOrdersGroupMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
-  const command = parseOrderCommand(input.text);
+  const command = parseOrderCommand(input.text, { timezone: settings.orders_timezone });
   if (!command) return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
   const result = await handleOrderCommand({
     settings,

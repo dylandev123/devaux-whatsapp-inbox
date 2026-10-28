@@ -106,8 +106,8 @@ const refOf = (prefix: string, i: number) => `O-${prefix.slice(0, 3)}${ALPHABET[
 const ORDER_TEXT = "a bag of Monello Chicken 25kg, bring it to Cap Estate";
 /** "!update" has a cooldown between manual reports; tests that read it several times clear it first. */
 const freshReport = async () => {
-  await pg.run("truncate public.ai_agent_order_summary_runs;");
-  return reply(await groupSays("!update"));
+  await pg.run("truncate public.ai_agent_order_summary_runs; truncate public.ai_agent_order_update_posts;");
+  return reply(await groupSays("!orders all"));
 };
 const reply = (res: { outbox: { body: string; to: string }[] }) => res.outbox.map((o) => o.body).join("\n---\n");
 
@@ -140,7 +140,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
 
   beforeEach(async () => {
     await pg.run(`
-      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_escalations, public.ai_agent_outbox,
+      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_order_update_posts, public.ai_agent_escalations, public.ai_agent_outbox,
         public.ai_agent_staff_answers, public.ai_agent_events, public.ai_agent_learning_candidates, public.ai_agent_knowledge,
         public.ai_agent_customer_memory, public.ai_agent_audit_log, public.ai_agent_conversations, public.ai_agent_contact_rules,
         public.ai_agent_order_requests, public.ai_agent_batches, public.ai_agent_batch_messages, public.ai_agent_pilot_drafts,
@@ -481,7 +481,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.equal(after.field_conflicts.items.proposed[0].quantity, "5");
     assert.equal(after.field_conflicts.items.current[0].quantity, "3");
     assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "locked_field_conflict").length, 1);
-    const report = reply(await groupSays("!update"));
+    const report = reply(await groupSays("!orders all"));
     assert.match(report, /⚠️ Customer asked for a change — check before fulfilling/);
     assert.doesNotMatch(report, /staff set|5 × Monello/, "the report carries no technical conflict explanation");
     assert.match(reply(await groupSays(`!moreinfo ${ref(o)}`)), /⚠️ Customer now says products: 5 × Monello Chicken 25kg \(staff set 3 ×/);
@@ -505,7 +505,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "5", size: "25kg" }] }), { order_target: o.ref_code });
     await customerSays(JANE, "make it 5 bags of Monello Chicken 25kg");
     await groupSays(`!update ${ref(o)} confirmed`);
-    assert.match(reply(await groupSays("!update")), /✅ \*CONFIRMED\*[\s\S]*Customer asked for a change/, "a confirmed order with an open discrepancy still shows the warning");
+    assert.match(reply(await groupSays("!orders all")), /✅ confirmed[\s\S]*Customer asked for a change/, "a confirmed order with an open discrepancy still shows the warning");
     // Staff keep their value.
     let [cur] = await allOrders();
     const kept = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "keep", expectedVersion: cur.version });
@@ -513,7 +513,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     [cur] = await allOrders();
     assert.deepEqual(cur.field_conflicts, {});
     assert.equal(cur.items[0].quantity, "3");
-    assert.doesNotMatch(reply(await groupSays("!update")), /Customer asked for a change/);
+    assert.doesNotMatch(reply(await groupSays("!orders all")), /Customer asked for a change/);
     // A second "keep" has nothing to settle.
     const again = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "keep", expectedVersion: cur.version });
     assert.equal(again.ok, false);
@@ -554,7 +554,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
   test("an unknown quantity stays null in the database and reads as 'quantity needed', never '? ×'", async () => {
     const o = await makeOrder(MARCUS, "some Monello please, deliver", draft({ items: [{ product: "Monello", quantity: null }], delivery_address: "Rodney Bay" }));
     assert.equal(o.items[0].quantity, null);
-    const text = reply(await groupSays("!update"));
+    const text = reply(await groupSays("!orders all"));
     assert.match(text, /\nMonello\n/, "an unknown quantity is just the product name");
     assert.doesNotMatch(text, /\?|quantity needed|Needs quantity/);
     assert.match(reply(await groupSays(`!moreinfo ${ref(o)}`)), /• Monello — quantity needed/);
@@ -616,7 +616,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     await groupSays(`!order ${ref(o)} completed`);
     assert.doesNotMatch(await freshReport(), new RegExp(ref(o)));
     const res = await groupSays(`!order ${ref(o)} reopen`, { id: "REOPEN-1" });
-    assert.match(reply(res), new RegExp(`↩️ ${ref(o)} .*: reopened \\(confirmed\\)\\. It shows in !update again\\.`));
+    assert.match(reply(res), new RegExp(`↩️ ${ref(o)} .*: reopened \\(confirmed\\)\\. It shows in !orders again\\.`));
     const [after] = await allOrders();
     assert.equal(after.status, "confirmed");
     assert.equal(after.fulfilled_at, null);
@@ -670,16 +670,226 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.equal((await allOrders())[0].items[0].quantity, "1");
   });
 
+  // ── !orders: outstanding orders by the day they are for ─────────────────────
+
+  /** An order for a given day, written just now (so "tomorrow" is the real tomorrow), as the AI path records it. */
+  async function datedOrder(c: Customer, when: string, over: Partial<Draft> = {}) {
+    return makeOrder(c, `a bag of Monello Chicken 25kg, bring it to Cap Estate ${when}`, draft({ requested_for: when, ...over }), new Date().toISOString());
+  }
+  const nextReport = async (text: string, opts: Parameters<typeof groupSays>[1] = {}) => {
+    await pg.run("truncate public.ai_agent_order_update_posts;");
+    return reply(await groupSays(text, opts));
+  };
+
+  test("!orders groups by the day each order is FOR (not the day it arrived), split into delivery and collection", async () => {
+    // (The day has to be in the customer's own words: the tracker never invents one.)
+    const a = await datedOrder(JANE, "today");
+    const b = await datedOrder(MARCUS, "tomorrow");
+    const c = await makeOrder(PRIYA, "2 Monello for collection tomorrow", draft({ items: [{ product: "Monello", quantity: "2" }], delivery_preference: "collection", delivery_address: null, requested_for: "tomorrow" }), new Date().toISOString());
+    // Jane's order was first written a week ago.
+    await pg.run(`update public.ai_agent_orders set first_message_at = now() - interval '7 days' where id = ${lit(a.id)};`);
+    const calls = modelCalls;
+    const res = await groupSays("!orders");
+    const text = reply(res);
+    assert.equal(res.outbox[0].to, GROUP);
+    assert.match(text, /^📋 \*ORDERS — /);
+    assert.match(text, /TODAY — [\s\S]*\*1\. 286-7466 · /, "Jane's order, written a week ago, is today's");
+    assert.match(text, /TOMORROW — [\s\S]*🚚 \*Delivery\*[\s\S]*555-0102[\s\S]*🛍 \*Collection\*[\s\S]*555-0103/);
+    assert.ok([a, b, c].every((o) => text.includes(ref(o))));
+    assert.equal(modelCalls, calls, "no model call");
+    assert.equal(await customerBound(), 0);
+    assert.equal(await notToAGroup(), 0);
+  });
+
+  test("!orders today / tomorrow / <date> / overdue / missing / undated each answer, and an old order is overdue, not today", async () => {
+    const old = await datedOrder(JANE, "Monday");
+    await pg.run(`update public.ai_agent_orders set requested_for = 'Mon 26 Oct (Monday)', first_message_at = '2026-10-26T14:00:00Z' where id = ${lit(old.id)};`);
+    const dateless = await makeOrder(MARCUS, ORDER_TEXT);
+    await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-20T14:00:00Z' where id = ${lit(dateless.id)};`);
+    const hollow = await makeOrder(PRIYA, "some Monello please", draft({ items: [{ product: "Monello", quantity: null }], delivery_address: null, delivery_preference: null }));
+    const overdue = await nextReport("!orders overdue");
+    assert.match(overdue, /OVERDUE ORDERS/);
+    assert.match(overdue, new RegExp(`WAS DUE — Mon 26 Oct[\\s\\S]*${ref(old)}`));
+    assert.match(overdue, new RegExp(`first mentioned before today[\\s\\S]*${ref(dateless)}`));
+    assert.match(await nextReport("!orders today"), /✅ Nothing outstanding for today\./, "old orders are not carried into today");
+    const missing = await nextReport("!orders missing");
+    assert.match(missing, new RegExp(`${ref(hollow)}[\\s\\S]*Missing: quantity, delivery or collection`));
+    assert.doesNotMatch(missing, new RegExp(ref(old)), "a complete, dated order is not 'missing'");
+    assert.match(await nextReport("!orders undated"), new RegExp(ref(dateless)));
+    assert.match(await nextReport("!orders 30 Oct"), /✅ Nothing outstanding for Fri 30 Oct\./);
+    // Nothing was completed, cancelled or deleted by any of that.
+    assert.deepEqual((await allOrders()).map((o) => o.status).sort(), ["awaiting_confirmation", "awaiting_confirmation", "possible"]);
+    assert.match(await nextReport("!orders banana"), /!orders shows what is outstanding/);
+  });
+
+  test("!orders is for authorized staff in the orders group only; strangers, other groups and switched-off businesses get nothing", async () => {
+    await datedOrder(JANE, "tomorrow");
+    const stranger = await groupSays("!orders", { sender: STRANGER });
+    assert.match(reply(stranger), /Only authorized staff/);
+    assert.doesNotMatch(reply(stranger), /Monello|286-7466/);
+    assert.match(reply(await groupSays("!orders", { sender: null })), /Only authorized staff/);
+    const elsewhere = await groupSays("!orders", { group: OTHER_GROUP });
+    assert.equal(elsewhere.status, "ignored");
+    assert.deepEqual(elsewhere.outbox, []);
+    assert.equal(await count(`select 1 from public.ai_agent_outbox where to_jid = ${lit(OTHER_GROUP)}`), 0);
+    await configure({ orders_summary_enabled: false });
+    assert.match(reply(await groupSays("!orders")), /not switched on/);
+    // With a separate Orders group configured, only that group answers.
+    await configure({ orders_group_jid: ORDERS_GROUP });
+    assert.match(reply(await groupSays("!orders")), /Order commands are used in the Orders group/);
+    const inOrders = await groupSays("!orders tomorrow", { group: ORDERS_GROUP });
+    assert.equal(inOrders.outbox[0].to, ORDERS_GROUP);
+    assert.match(reply(inOrders), /Monello/);
+  });
+
+  test("a redelivered !orders message answers once; two businesses never see each other's orders", async () => {
+    await datedOrder(JANE, "tomorrow");
+    const first = await groupSays("!orders tomorrow", { id: "VIEW-1" });
+    assert.equal(first.outbox.length, 1);
+    const again = await groupSays("!orders tomorrow", { id: "VIEW-1" });
+    assert.equal(again.status, "duplicate");
+    assert.equal(await count(`select 1 from public.ai_agent_outbox where dedupe_key like 'ordersview:%'`), 1);
+    const sea = await groupSays("!orders all", { group: SEA_GROUP, biz: "by_sea" });
+    assert.match(reply(sea), /✅ No outstanding orders\./);
+    assert.doesNotMatch(reply(sea), /Monello|286-7466/);
+    const crossed = await groupSays("!orders", { group: SEA_GROUP, biz: "dog_food" });
+    assert.equal(crossed.status, "ignored");
+  });
+
+  test("completing and reopening move an order out of and back into !orders, keep its history, and message nobody", async () => {
+    const o = await datedOrder(JANE, "tomorrow");
+    assert.match(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
+    const done = await groupSays(`!order ${ref(o)} completed`, { id: "DONE-1" });
+    assert.match(reply(done), /completed\. It no longer shows in !orders\./);
+    assert.doesNotMatch(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
+    assert.doesNotMatch(await nextReport("!orders overdue"), new RegExp(ref(o)));
+    assert.equal((await allOrders())[0].status, "fulfilled");
+    // A retry of the same message changes and sends nothing more.
+    const retried = await groupSays(`!order ${ref(o)} completed`, { id: "DONE-1" });
+    assert.equal(retried.status, "duplicate");
+    assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "staff_whatsapp_fulfil").length, 1);
+    const reopened = await groupSays(`!order ${ref(o)} reopen`);
+    assert.match(reply(reopened), /reopened \(.*\)\. It shows in !orders again\./);
+    assert.match(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
+    assert.deepEqual((await orderEvents(o.id)).map((e) => e.kind).filter((k) => k.startsWith("staff_whatsapp")), ["staff_whatsapp_fulfil", "staff_whatsapp_reopen"]);
+    assert.equal(await customerBound(), 0);
+    assert.equal(await notToAGroup(), 0);
+  });
+
+  test("the website can complete and reopen too: same rules, same history, and a stranger's business is untouched", async () => {
+    const o = await datedOrder(JANE, "tomorrow");
+    const done = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "fulfil", expectedVersion: o.version });
+    assert.ok(done.ok);
+    const again = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "fulfil" });
+    assert.equal(again.ok, false, "already completed");
+    const wrongBusiness = await orders.updateOrderManually({ businessSlug: "by_sea", orderId: o.id, adminId: "admin-1", action: "reopen" });
+    assert.equal(wrongBusiness.ok, false);
+    assert.equal((await allOrders())[0].status, "fulfilled");
+    const [cur] = await allOrders();
+    const reopened = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "reopen", expectedVersion: cur.version - 1 });
+    assert.equal(reopened.ok, false, "a stale page cannot reopen");
+    const ok = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "admin-1", action: "reopen", expectedVersion: cur.version });
+    assert.ok(ok.ok);
+    assert.equal((await allOrders())[0].status, "awaiting_confirmation");
+    assert.deepEqual((await orderEvents(o.id)).map((e) => e.kind).filter((k) => k.startsWith("manual")), ["manual_fulfil", "manual_reopen"]);
+    assert.equal(await auditCount("order.reopen"), 1);
+  });
+
+  test("an order-date correction is recorded (who, when, before → after), moves the order between days, and the reply says if no day was read", async () => {
+    const o = await datedOrder(JANE, "tomorrow");
+    const before = (await allOrders())[0].requested_for;
+    const moved = await groupSays(`!update ${ref(o)} delivery 30 Oct`);
+    assert.match(reply(moved), /delivery date → Fri 30 Oct \(30 Oct\)\./);
+    assert.doesNotMatch(reply(moved), /not a date I can read/);
+    const [after] = await allOrders();
+    assert.equal(after.requested_for, "Fri 30 Oct (30 Oct)");
+    assert.ok(after.manual_locked_fields.includes("requested_for"), "the AI will not overwrite it");
+    const last = (await orderEvents(o.id)).at(-1)!;
+    assert.deepEqual([last.kind, last.actor_kind, last.actor_id], ["staff_whatsapp_edit", "staff", "17585550001"]);
+    assert.deepEqual(last.changes.requested_for, { before, after: "Fri 30 Oct (30 Oct)" });
+    assert.match(await nextReport("!orders 30 Oct"), new RegExp(ref(o)));
+    assert.doesNotMatch(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
+    // Words that are not a day are recorded too, but the order is then honestly "no day".
+    const vague = await groupSays(`!update ${ref(o)} delivery whenever you can`);
+    assert.match(reply(vague), /not a date I can read, so the order has no day yet/);
+    assert.match(await nextReport("!orders undated"), new RegExp(ref(o)));
+    assert.equal((await orderEvents(o.id)).filter((e) => e.kind === "staff_whatsapp_edit").length, 2, "both corrections stay in the history");
+  });
+
+  test("a customer who later gives a different day does not overwrite the staff correction; the disagreement is flagged", async () => {
+    const o = await datedOrder(JANE, "tomorrow");
+    await groupSays(`!update ${ref(o)} delivery 30 Oct`);
+    modelOrders(draft({ requested_for: "Saturday" }), { order_target: o.ref_code });
+    await customerSays(JANE, "actually can you do Saturday instead", { at: MONDAY });
+    const [after] = await allOrders();
+    assert.equal(after.requested_for, "Fri 30 Oct (30 Oct)");
+    assert.equal(after.field_conflicts.requested_for.proposed, "Sat 31 Oct (Saturday)");
+    assert.match(await nextReport("!orders 30 Oct"), new RegExp(`${ref(o)}[\\s\\S]*Customer asked for a change`));
+  });
+
+  // ── !update: a summary of what is new or changed ───────────────────────────
+
+  test("the update point moves only when the update PROVABLY reached the group (shared by the group, never per-order 'reviewed')", async () => {
+    const a = await datedOrder(JANE, "tomorrow");
+    const first = await groupSays("!update", { id: "UPD-A" });
+    assert.match(reply(first), /1 new[\s\S]*🆕 .*#/);
+    const [post] = await rows(`select * from public.ai_agent_order_update_posts`);
+    // Delivered: the next update starts from there.
+    await pg.run(`update public.ai_agent_outbox set status = 'sent', sent_at = now() where id = ${lit(post.outbox_id)}; update public.ai_agent_order_update_posts set created_at = now() - interval '5 minutes';`);
+    await datedOrder(MARCUS, "tomorrow");
+    const second = reply(await groupSays("!update", { id: "UPD-B" }));
+    assert.match(second, /1 new/);
+    assert.doesNotMatch(second, new RegExp(ref(a)), "what the group has already been shown is not repeated");
+    // That one fails to send: the third still shows Marcus.
+    const [latest] = await rows(`select * from public.ai_agent_order_update_posts order by created_at desc limit 1`);
+    await pg.run(`update public.ai_agent_outbox set status = 'failed', error = 'not_sent: socket closed' where id = ${lit(latest.outbox_id)}; update public.ai_agent_order_update_posts set created_at = now() - interval '5 minutes';`);
+    const third = reply(await groupSays("!update", { id: "UPD-C" }));
+    assert.match(third, /1 new/);
+    assert.match(third, /555-0102/);
+    // Asking marked nothing as reviewed: no order, event or status changed.
+    assert.deepEqual((await allOrders()).map((o) => o.status), ["awaiting_confirmation", "awaiting_confirmation"]);
+    assert.match(third, /does not mark anything as reviewed/);
+  });
+
+  test("an update whose delivery was never acknowledged does not move the update point (a send that may or may not have arrived)", async () => {
+    await datedOrder(JANE, "tomorrow");
+    const first = await groupSays("!update", { id: "UNC-A" });
+    assert.match(reply(first), /1 new/);
+    const [post] = await rows(`select * from public.ai_agent_order_update_posts`);
+    // Handed to the bridge, never acknowledged, long enough ago to be called unresolved.
+    await pg.run(`update public.ai_agent_outbox set status = 'dispatched', dispatched_at = now() - interval '2 hours' where id = ${lit(post.outbox_id)}; update public.ai_agent_order_update_posts set created_at = now() - interval '2 hours';`);
+    const second = reply(await groupSays("!update", { id: "UNC-B" }));
+    assert.match(second, /1 new/, "the change is shown again rather than lost");
+    assert.match(second, /286-7466/);
+  });
+
+  test("!update names cancellations and changes, and leaves out completions and the group's own commands", async () => {
+    const a = await datedOrder(JANE, "tomorrow");
+    const b = await datedOrder(MARCUS, "tomorrow");
+    const c = await datedOrder(PRIYA, "tomorrow");
+    await groupSays("!update", { id: "UPD-A" });
+    const [post] = await rows(`select * from public.ai_agent_order_update_posts`);
+    await pg.run(`update public.ai_agent_outbox set status = 'sent', sent_at = now() where id = ${lit(post.outbox_id)}; update public.ai_agent_order_update_posts set created_at = now() - interval '5 minutes';`);
+    await groupSays(`!order ${ref(a)} completed`);
+    await groupSays(`!update ${ref(b)} 4 bags`);
+    await orders.updateOrderManually({ businessSlug: "dog_food", orderId: c.id, adminId: "admin-1", action: "cancel", reason: "customer called" });
+    const text = reply(await groupSays("!update", { id: "UPD-B" }));
+    assert.match(text, /1 cancelled/);
+    assert.match(text, /🚫 \*555-0103/);
+    assert.doesNotMatch(text, new RegExp(ref(a)), "a completion is bookkeeping");
+    assert.doesNotMatch(text, new RegExp(ref(b)), "the group already saw the acknowledgement of its own command");
+  });
+
   // ── The report ─────────────────────────────────────────────────────────────
 
   test("the report is compact: name, reference, phone, items, delivery, one warning", async () => {
     const jane = await makeOrder(JANE, ORDER_TEXT);
     await pg.run(`update public.ai_agent_orders set customer_name = 'Jane Doe' where id = ${lit(jane.id)};`);
     await makeOrder(MARCUS, "2 bags of Monello, deliver please", draft({ items: [{ product: "Monello", quantity: "2" }], delivery_address: null }));
-    const res = await groupSays("!update");
+    const res = await groupSays("!orders all");
     assert.equal(res.outbox.length, 1);
     const text = res.outbox[0].body;
-    assert.match(text, /^📋 \*DAILY ORDERS — \d{1,2} [A-Z]{3}\*\n2 orders · 0 confirmed · 2 open\n\n📦 \*OPEN ORDERS\*\n\*1\. Jane Doe · #[A-Z2-9]{5}\*\n286-7466\n1 × Monello Chicken 25kg\nDelivery: Cap Estate\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\*\n2 × Monello\nDelivery$/);
+    assert.match(text, /^📋 \*ALL OUTSTANDING ORDERS\*\n\n❔ \*NO DAY GIVEN \(2\)\*\n\n\*1\. Jane Doe · #[A-Z2-9]{5}\* 🕓 to confirm\n1 × Monello Chicken 25kg\n📍 Cap Estate · 🗓 no day · 📞 286-7466\n⚠️ Missing: day\n\n\*2\. 555-0102 · #[A-Z2-9]{5}\* ❔ incomplete\n2 × Monello\n📍 address needed · 🗓 no day\n⚠️ Missing: delivery address, day/);
     assert.equal(await customerBound(), 0);
   });
 
@@ -689,18 +899,18 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
         values (${lit(refOf("ZZ2", i))}, 'dog_food', ${lit(`1758555${String(1000 + i)}@s.whatsapp.net`)}, ${lit(`1758555${String(1000 + i)}`)}, ${lit(`Customer ${i}`)}, 'awaiting_confirmation',
           '[{"product":"Monello","quantity":"2","variant":null,"size":"25kg"}]'::jsonb, 'delivery', '12 Main Street, Gros Islet, Saint Lucia', ${lit("n".repeat(100))}, '{}', now(), now());`);
     }
-    const res = await groupSays("!update");
+    const res = await groupSays("!orders all");
     assert.ok(res.outbox.length >= 2, `split into ${res.outbox.length}`);
     res.outbox.forEach((item, i) => {
       assert.equal(item.to, GROUP);
       assert.equal(item.send, true);
       assert.ok(item.body.length <= 3800);
-      assert.match(item.body, new RegExp(`^📋 \\*DAILY ORDERS — .*\\* \\(${i + 1}/${res.outbox.length}\\)`));
+      assert.match(item.body, new RegExp(`^📋 \\*ALL OUTSTANDING ORDERS\\* \\(${i + 1}/${res.outbox.length}\\)`));
     });
     const refs = res.outbox.flatMap((item) => item.body.match(/#ZZ2\w{2}/g) ?? []);
     assert.equal(new Set(refs).size, 45, "each order appears once, across the messages");
     // Stored in the outbox in sending order, each with its own key.
-    const stored = await rows(`select dedupe_key, to_jid from public.ai_agent_outbox where dedupe_key like 'ordersummary:manual:%' order by created_at, id`);
+    const stored = await rows(`select dedupe_key, to_jid from public.ai_agent_outbox where dedupe_key like 'ordersview:%' order by created_at, id`);
     assert.equal(stored.length, res.outbox.length);
     assert.ok(stored.every((r) => r.to_jid === GROUP));
     assert.equal(new Set(stored.map((r) => r.dedupe_key)).size, stored.length);
@@ -749,7 +959,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.deepEqual([names[marcus.id]?.name, names[marcus.id]?.source], ["Marcus Saved", "saved"]);
     assert.deepEqual([names[priya.id]?.name, names[priya.id]?.source], [null, null], "a phone number posing as a name is not a name");
 
-    const text = (await groupSays("!update")).outbox[0].body;
+    const text = (await groupSays("!orders all")).outbox[0].body;
     assert.match(text, /\*\d\. Jane Staffname · #/);
     assert.match(text, /\*\d\. Marcus Saved · #/);
     assert.match(text, /\*\d\. 555-0103 · #/);
@@ -826,7 +1036,7 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     assert.equal((await allOrders()).length, 0);
     const o = await makeOrder(MARCUS, ORDER_TEXT);
     await groupSays(`!update ${ref(o)} cancelled`);
-    const text = (await groupSays("!update")).outbox[0].body;
+    const text = (await groupSays("!orders all")).outbox[0].body;
     assert.match(text, /No outstanding orders\./);
     assert.doesNotMatch(text, /Monello/);
   });

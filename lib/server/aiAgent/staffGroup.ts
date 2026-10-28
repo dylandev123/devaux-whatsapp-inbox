@@ -195,7 +195,7 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
   // first so a quote or reference in the message can never route one to an escalation, and kept apart from the
   // approval commands (a "!moreinfo" without an order reference still goes to the escalation logic below).
   // Authorization and the group check live in handleOrderCommand.
-  const orderCommand = parseOrderCommand(input.text);
+  const orderCommand = parseOrderCommand(input.text, { timezone: settings.orders_timezone });
   if (orderCommand) {
     const result = await handleOrderCommand({
       settings,

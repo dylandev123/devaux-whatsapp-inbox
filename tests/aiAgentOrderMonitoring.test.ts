@@ -243,7 +243,7 @@ const escalations = () => count(`select 1 from public.ai_agent_escalations`);
 const events = (chat?: string) => rows<{ kind: string; status: string; reason_codes: string[] }>(`select kind, status, reason_codes from public.ai_agent_events${chat ? ` where chat_id = ${lit(chat)}` : ""} order by created_at, id`);
 const lastReasons = async (chat: string) => (await events(chat)).at(-1)?.reason_codes ?? [];
 const D = (iso: string) => new Date(iso);
-const reportText = async (biz = "dog_food") => (await orders.buildSummaryNow(await settingsOf(biz), "scheduled", new Date())).text;
+const reportText = async (biz = "dog_food") => (await orders.buildSummaryNow(await settingsOf(biz), "scheduled", new Date(), { type: "all" })).text;
 
 describe("Order monitoring of every conversation (real server code, real SQL)", { skip: !pgAvailable && "PostgreSQL binaries not installed" }, () => {
   before(async () => {
@@ -279,7 +279,7 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
 
   beforeEach(async () => {
     await pg.run(`
-      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_order_backfill_runs, public.ai_agent_escalations,
+      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_order_update_posts, public.ai_agent_order_backfill_runs, public.ai_agent_escalations,
         public.ai_agent_outbox, public.ai_agent_staff_answers, public.ai_agent_events, public.ai_agent_learning_candidates,
         public.ai_agent_knowledge, public.ai_agent_customer_memory, public.ai_agent_audit_log, public.ai_agent_conversations,
         public.ai_agent_contact_rules, public.ai_agent_order_requests, public.ai_agent_batches, public.ai_agent_batch_messages,
@@ -588,7 +588,7 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     const text = await reportText();
     assert.match(text, /Monello Chicken/);
     assert.match(text, /Dog Treats/);
-    assert.match(text, /2 orders · 0 confirmed · 2 open/);
+    assert.match(text, /📅 \*Fri 30 Oct\* \(2\)/, "grouped under the day they are for, not the day they were written");
     assert.doesNotMatch(text, /⚠️ May be incomplete|OFF/, "nothing is missing, so nothing is flagged");
     assert.doesNotMatch(text, /selected for the AI/);
   });

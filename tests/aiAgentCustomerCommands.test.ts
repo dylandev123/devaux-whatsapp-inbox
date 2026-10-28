@@ -37,7 +37,7 @@ describe("!rules registry", () => {
       ...DRAFT_COMMANDS,
       ...BUSINESS_COMMANDS,
       "send", "note", "close", "takeover", "resume", // escalation commands (matchStaffReply)
-      "update", "order", // order commands (parseOrderCommand)
+      "update", "order", "orders", // order commands (parseOrderCommand)
       "rules", "customer", "location", "remember", // customer commands (parseCustomerCommand)
     ]);
     for (const name of documented) assert.ok(recognised.has(name), `!${name} is advertised but no parser knows it`);
@@ -50,6 +50,8 @@ describe("!rules registry", () => {
     assert.equal(parseCustomerCommand("!remember 17585550123 Dog is nervous")?.kind, "remember");
     assert.equal(parseOrderCommand("!update")?.kind, "report");
     assert.equal(parseOrderCommand("!order #QU6U9")?.kind, "info");
+    assert.equal(parseOrderCommand("!orders")?.kind, "orders");
+    assert.equal(parseOrderCommand("!orders overdue")?.kind, "orders");
   });
 
   test("!rules and !help are advertised as read-only, authorized-staff-only; !location documents clear; !remember documents expiry", () => {

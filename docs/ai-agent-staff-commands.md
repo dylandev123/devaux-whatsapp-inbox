@@ -27,11 +27,14 @@ customer" and nothing changes. If the reply and a typed customer disagree, or a 
 Every command is read from the START of a message and is handled before escalation matching, so replying to a customer's notice with
 `!location Cap Estate` sets a location; it is never an "answer" to that request and never reaches the customer.
 
-## Orders (unchanged; documented in `!rules`)
+## Orders (documented in `!rules`)
 
-`!update` (today's report), `!update #REF confirmed|cancelled|2 bags|delivery tomorrow`, `!order <name|phone|#REF>`, `!order #REF completed`, `!order #REF reopen`, `!moreinfo #REF` —
-in the Orders group (the staff group unless a separate Orders group is set). There is no `!orders`, `!done` or order `!confirm`:
-`!confirm K-ABCD` still means *approve a suggested knowledge fact* and nothing else.
+`!orders [today|tomorrow|<date>|all|overdue|missing|undated]` (outstanding orders by the day they are for, split into delivery
+and collection), `!update` (new and changed orders since the last update delivered to the group; nothing is marked reviewed),
+`!update #REF confirmed|cancelled|2 bags|delivery tomorrow|delivery 30 Oct`, `!order <name|phone|#REF>`, `!order #REF completed`,
+`!order #REF reopen`, `!moreinfo #REF` — in the Orders group (the staff group unless a separate Orders group is set).
+There is no `!done` or order `!confirm`: `!confirm K-ABCD` still means *approve a suggested knowledge fact* and nothing else.
+See `docs/ai-agent-daily-orders.md` ("Order days, `!orders` and `!update`").
 
 ## Memory behaviour
 

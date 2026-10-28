@@ -51,7 +51,7 @@ Optional optimisation; cache for ~60 s.
 ```
 
 Daily order summary (additive, see `docs/ai-agent-daily-orders.md`): each entry also carries
-`ordersSummaryEnabled` and `ordersGroupJid` (null = the summary and `!update` use `staffGroupJid`, which needs no
+`ordersSummaryEnabled` and `ordersGroupJid` (null = the morning list, `!orders` and `!update` use `staffGroupJid`, which needs no
 bridge change). A non-null `ordersGroupJid` that differs from `staffGroupJid` must also be forwarded to `/message`,
 and `staff_notice` items addressed to it may be sent in every mode in which `staffGroupJid` accepts notices.
 

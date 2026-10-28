@@ -179,7 +179,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
 
   beforeEach(async () => {
     await pg.run(`
-      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_escalations, public.ai_agent_outbox,
+      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_order_update_posts, public.ai_agent_escalations, public.ai_agent_outbox,
         public.ai_agent_staff_answers, public.ai_agent_events, public.ai_agent_learning_candidates, public.ai_agent_knowledge,
         public.ai_agent_customer_memory, public.ai_agent_audit_log, public.ai_agent_conversations, public.ai_agent_contact_rules,
         public.ai_agent_order_requests, public.ai_agent_batches, public.ai_agent_batch_messages, public.ai_agent_pilot_drafts,
@@ -470,8 +470,9 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(row.attention, "customer_replied_yes");
     assert.equal((await orderEvents(o.id)).at(-1)!.kind, "customer_replied_yes");
 
-    const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(report, /1 order · 0 confirmed · 1 open/);
+    const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date(), { type: "all" })).text;
+    assert.match(report, /🕓 to confirm/);
+    assert.doesNotMatch(report, /✅ confirmed/);
     assert.doesNotMatch(report, /Customer said yes|Needs confirmation/, "the recorded yes lives in the dashboard and !moreinfo, not the report");
 
     // Saying yes again does not pile up events.
@@ -484,9 +485,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(row.status, "confirmed");
     assert.equal(row.confirmed_by, "admin:u1");
     assert.equal(row.attention, null);
-    const after = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(after, /✅ \*CONFIRMED\*/);
-    assert.match(after, /1 order · 1 confirmed · 0 open/);
+    const after = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date(), { type: "all" })).text;
+    assert.match(after, /✅ confirmed/);
     assert.doesNotMatch(after, /⚠️/, "a confirmed order carries no warning");
   });
 
@@ -496,8 +496,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await staffWritesTo(JANE, "Can you confirm?");
     modelOrders(draft(), { order_target: o.ref_code });
     await customerSays(JANE, "confirmed");
-    const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date())).text;
-    assert.match(report, /1 order · 1 confirmed · 0 open/);
+    const report = (await orders.buildSummaryNow(await settingsOf(), "manual", new Date(), { type: "all" })).text;
+    assert.match(report, /✅ confirmed/);
     assert.equal((await allOrders())[0].confirmed_by, "customer");
   });
 
@@ -634,10 +634,10 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     const cross = await orders.updateOrderManually({ businessSlug: "dog_food", orderId: seaOrder.id, adminId: "u", action: "cancel" });
     assert.deepEqual(cross, { ok: false, status: 404, error: "Order not found", code: "not_found" });
 
-    const dogSummary = await orders.buildSummaryNow(await settingsOf("dog_food"), "manual", D(EIGHT_AM));
+    const dogSummary = await orders.buildSummaryNow(await settingsOf("dog_food"), "manual", D(EIGHT_AM), { type: "all" });
     assert.match(dogSummary.text, /Monello Chicken/);
     assert.doesNotMatch(dogSummary.text, /Sea Moss/);
-    const seaSummary = await orders.buildSummaryNow(await settingsOf("by_sea"), "manual", D(EIGHT_AM));
+    const seaSummary = await orders.buildSummaryNow(await settingsOf("by_sea"), "manual", D(EIGHT_AM), { type: "all" });
     assert.match(seaSummary.text, /Sea Moss/);
     assert.doesNotMatch(seaSummary.text, /Monello/);
   });
@@ -679,13 +679,14 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(item.to_jid, GROUP);
     assert.equal(item.status, "pending");
     assert.equal(item.dedupe_key, "ordersummary:dog_food:2026-10-27:1");
-    assert.match(item.body, /✅ \*CONFIRMED\*/);
-    assert.match(item.body, /📦 \*OPEN ORDERS\*/);
-    assert.match(item.body, /Jane · #[A-Z2-9]{5}\*\n555-0101/);
-    assert.match(item.body, /Marcus · #[A-Z2-9]{5}\*/);
+    // The morning post is the by-day view: Jane's order is for Friday, so it is counted, not listed; Marcus has no day yet.
+    assert.match(item.body, /^📋 \*ORDERS — Tue 27 Oct\*/);
+    assert.match(item.body, /❔ \*NO DAY GIVEN YET \(1\)\*[\s\S]*Marcus · #[A-Z2-9]{5}\*/);
+    assert.doesNotMatch(item.body, /Jane/, "an order for Friday is not carried into Tuesday's list");
+    assert.match(item.body, /🗓 1 later order — !orders <date>/);
     assert.doesNotMatch(item.body, /Needs delivery address|Needs confirmation/);
     const [run] = await runs();
-    assert.deepEqual([run.status, run.local_date.slice(0, 10), run.confirmed_count, run.attention_count, run.carried_count], ["queued", "2026-10-27", 1, 1, 1]);
+    assert.deepEqual([run.status, run.local_date.slice(0, 10), run.confirmed_count, run.attention_count, run.carried_count], ["queued", "2026-10-27", 1, 1, 0]);
     assert.equal(run.outbox_id, item.id);
   });
 
@@ -740,7 +741,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     const outboxId = () => pg.run(`select id from public.ai_agent_outbox where dedupe_key like 'ordersummary:%' order by created_at desc limit 1;`);
 
     // Handed to the bridge, never acknowledged: it may have gone out. Not resent.
-    await pg.run(`update public.ai_agent_outbox set status = 'dispatched', dispatched_at = now() - interval '30 minutes' where id = ${lit(await outboxId())};`);
+    await pg.run(`update public.ai_agent_outbox set status = 'dispatched', dispatched_at = '2026-10-27T12:00:00Z' where id = ${lit(await outboxId())};`); // 40 minutes before the clock below, however far real time has moved
     assert.equal(await orders.runScheduledSummary(settings, D("2026-10-27T12:40:00Z")), "uncertain_not_resent");
 
     // Acked failed with an ambiguous error: not resent either.
@@ -774,21 +775,20 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(await orders.runScheduledSummary({ ...(await settingsOf()), orders_summary_enabled: false }, D(EIGHT_AM)), "skipped");
   });
 
-  test("the report is rebuilt from the database each time: a staff edit shows up in the next !update", async () => {
+  test("the list is rebuilt from the database each time: a cancellation shows up in the next !orders", async () => {
     await seedMixedOrders();
-    const first = await groupSays("!update");
+    const first = await groupSays("!orders all");
     assert.match(first.outbox[0].body, /Marcus/);
     const [marcus] = await orders.listOrders("dog_food", { q: "Treats" });
     await orders.updateOrderManually({ businessSlug: "dog_food", orderId: marcus.id, adminId: "u", action: "cancel", reason: "changed mind" });
-    await pg.run(`update public.ai_agent_order_summary_runs set created_at = now() - interval '5 minutes';`);
-    const second = await groupSays("!update");
+    const second = await groupSays("!orders all");
     assert.doesNotMatch(second.outbox[0].body, /Marcus/);
     assert.match(second.outbox[0].body, /Jane/);
   });
 
   // ── What the report claims to cover ────────────────────────────────────────
 
-  const reportText = async (biz = "dog_food") => (await orders.buildSummaryNow(await settingsOf(biz), "scheduled", D(EIGHT_AM))).text;
+  const reportText = async (biz = "dog_food") => (await orders.buildSummaryNow(await settingsOf(biz), "scheduled", D(EIGHT_AM), { type: "all" })).text;
 
   test("with tracking switched off the report says it is incomplete", async () => {
     await configure({ orders_tracking_enabled: false });
@@ -852,7 +852,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await pg.run(`update public.ai_agent_orders set first_message_at = '2026-10-25T15:00:00Z', last_message_at = '2026-10-26T15:00:00Z' where chat_id = ${lit(MARCUS.chat)};`);
     const text = await reportText();
     for (const part of [
-      "Jane Doe · #", "\n555-0101\n", "2 × Monello Chicken 15kg", "Delivery: 12 Main St Gros Islet · ", "(Friday morning)",
+      "Jane Doe · #", "📞 555-0101", "2 × Monello Chicken 15kg", "📍 12 Main St Gros Islet", "🕐 morning",
       "Note: Gate code 1234, ring twice",
       "555-0102 · #", "4 × Dog Treats",
     ]) assert.ok(text.includes(part), part);
@@ -868,7 +868,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(all[0].fulfilment_method, "collection");
     assert.match(all[0].requested_for, /^\w{3} \d{1,2} \w{3} \(Saturday 10am\)$/);
     assert.deepEqual(all[0].missing_fields, []);
-    assert.match(await reportText(), /Collection: \w{3} \d{1,2} \w{3} \(Saturday 10am\)/);
+    assert.match(await reportText(), /📅 \*\w{3} \d{1,2} \w{3}\* \(1\)\n\n🛍 \*Collection\*[\s\S]*🛍 collection · 🕐 10am/);
 
     await orders.updateOrderManually({ businessSlug: "dog_food", orderId: o.id, adminId: "u", action: "cancel", reason: "customer called" });
     const text = await reportText();
@@ -877,46 +877,129 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal((await allOrders())[0].status, "cancelled");
   });
 
-  // ── !update ────────────────────────────────────────────────────────────────
+  // ── !update: a short summary of what is new or changed ──────────────────────
 
-  test("!update from an authorized sender in the configured group returns a fresh summary at once", async () => {
+  const updateDone = async (eventId: string) => {
+    await pg.run(`update public.ai_agent_outbox set status = 'sent', sent_at = now() where event_id = (select id from public.ai_agent_events where whatsapp_message_id = ${lit(eventId)});`);
+  };
+  /** The cooldown between two updates, and the "still being sent" guard, are exercised by their own tests. */
+  const ageUpdates = () => pg.run(`update public.ai_agent_order_update_posts set created_at = now() - interval '5 minutes';`);
+
+  test("!update from an authorized sender lists what is new, at once, in one short message", async () => {
     await seedMixedOrders();
     const before = modelCalls.length;
-    const res = await groupSays("!update");
+    const res = await groupSays("!update", { id: "U-1" });
     assert.equal(res.status, "done");
     assert.equal(res.outbox.length, 1);
     assert.equal(res.outbox[0].send, true);
     assert.equal(res.outbox[0].kind, "staff_notice");
     assert.equal(res.outbox[0].to, GROUP);
-    assert.match(res.outbox[0].body, /^📋 \*DAILY ORDERS — \d{1,2} [A-Z]{3}\*/);
-    assert.match(res.outbox[0].body, /Jane/);
+    const body = res.outbox[0].body;
+    assert.match(body, /^🔔 \*ORDER UPDATE\* — since /);
+    assert.match(body, /2 new/);
+    assert.match(body, /🆕 \*Jane · #[A-Z2-9]{5}\*/);
+    assert.match(body, /🆕 \*Marcus · #[A-Z2-9]{5}\*/);
+    assert.match(body, /does not mark anything as reviewed/);
+    assert.doesNotMatch(body, /DAILY ORDERS|OPEN ORDERS/, "no longer the full list");
     assert.equal(modelCalls.length, before, "no model call for a staff summary request");
-    const [run] = await runs();
-    assert.equal(run.trigger, "manual");
-    assert.ok(run.requested_by);
+    const [post] = await rows(`select * from public.ai_agent_order_update_posts`);
+    assert.equal(post.business_slug, "dog_food");
+    assert.equal(post.group_jid, GROUP);
+    assert.ok(post.requested_by);
+    assert.equal(post.new_count, 2);
+    assert.ok(post.outbox_id);
     assert.equal(await count(`select 1 from public.ai_agent_audit_log where action = 'orders.update_requested'`), 1);
     assert.equal(await customerBound(), 0);
   });
 
-  test("a retried !update message does not post a second summary", async () => {
+  test("the next !update shows only what happened after the last one that was delivered", async () => {
+    await seedMixedOrders();
+    await groupSays("!update", { id: "U-1" });
+    await updateDone("U-1");
+    await ageUpdates();
+    const quiet = await groupSays("!update", { id: "U-2" });
+    assert.match(quiet.outbox[0].body, /✅ No new or changed orders\./);
+    assert.doesNotMatch(quiet.outbox[0].body, /Jane|Marcus/, "orders already shown are not repeated");
+    await updateDone("U-2");
+    await ageUpdates();
+
+    // Rapid edits to one order are one line: first value → last value.
+    const [marcus] = await orders.listOrders("dog_food", { q: "Treats" });
+    for (const qty of ["5", "6"]) {
+      const [cur] = (await allOrders()).filter((o) => o.id === marcus.id);
+      await orders.updateOrderManually({ businessSlug: "dog_food", orderId: marcus.id, adminId: "u1", action: "edit", expectedVersion: cur.version, patch: { items: [{ product: "Dog Treats", quantity: qty, variant: null, size: null }] } });
+    }
+    const changed = await groupSays("!update", { id: "U-3" });
+    const body = changed.outbox[0].body;
+    assert.match(body, /1 changed/);
+    assert.equal((body.match(/Marcus/g) ?? []).length, 1, "one entry however many edits");
+    assert.match(body, /✏️ \*Marcus · #[A-Z2-9]{5}\* — products: 4 × Dog Treats → 6 × Dog Treats/);
+  });
+
+  test("a delivery that failed or is uncertain does not move the point: nothing is lost, and nothing is marked reviewed", async () => {
+    await seedMixedOrders();
+    await groupSays("!update", { id: "U-1" });
+    const orderSnapshot = JSON.stringify(await allOrders());
+    // Never acknowledged by the bridge (still pending/dispatched) and then provably not sent: the changes are shown again.
+    await ageUpdates();
+    await pg.run(`update public.ai_agent_outbox set status = 'failed', error = 'not_sent: socket closed' where dedupe_key like 'orderupdate:%';`);
+    const again = await groupSays("!update", { id: "U-2" });
+    assert.match(again.outbox[0].body, /2 new/);
+    assert.match(again.outbox[0].body, /Jane/);
+    // A possibly-delivered one (dispatched, never acked) also does not count as seen.
+    await ageUpdates();
+    await pg.run(`update public.ai_agent_outbox set status = 'dispatched', dispatched_at = now() - interval '30 minutes', error = null where dedupe_key = 'orderupdate:dog_food:' || (select id::text from public.ai_agent_events where whatsapp_message_id = 'U-2');`);
+    const third = await groupSays("!update", { id: "U-3" });
+    assert.match(third.outbox[0].body, /2 new/);
+    assert.equal(JSON.stringify(await allOrders()), orderSnapshot, "asking for an update changes no order");
+  });
+
+  test("an update still on its way is not repeated, and a retried !update message posts once", async () => {
+    await seedMixedOrders();
     await groupSays("!update", { id: "UPD-1" });
     const again = await groupSays("!update", { id: "UPD-1" });
     assert.equal(again.status, "duplicate");
     assert.equal(again.outbox.every((o) => o.send === false), true);
-    assert.equal((await summaryOutbox()).length, 1);
-  });
-
-  test("two quick !update commands: the second is told one was just posted", async () => {
-    await groupSays("!update");
-    const second = await groupSays("!update");
-    assert.equal((await summaryOutbox()).length, 1);
+    assert.equal(await count(`select 1 from public.ai_agent_outbox where dedupe_key like 'orderupdate:%'`), 1);
+    assert.equal(await count(`select 1 from public.ai_agent_order_update_posts`), 1);
+    // A different message while the first is still being delivered gets the "just posted" answer, not a copy.
+    const second = await groupSays("!update", { id: "UPD-2" });
     assert.match(second.outbox[0].body, /just posted/);
+    assert.equal(await count(`select 1 from public.ai_agent_outbox where dedupe_key like 'orderupdate:%'`), 1);
   });
 
-  test("an unauthorized sender is refused and no summary is produced", async () => {
+  test("an order created and cancelled between two updates is not announced; one the customer cancels afterwards is", async () => {
+    await seedMixedOrders();
+    await groupSays("!update", { id: "U-1" });
+    await updateDone("U-1");
+    await ageUpdates();
+    const [marcus] = await orders.listOrders("dog_food", { q: "Treats" });
+    modelOrders(null);
+    await orders.updateOrderManually({ businessSlug: "dog_food", orderId: marcus.id, adminId: "u2", action: "cancel", reason: "customer called" });
+    // Completed by staff in the dashboard: bookkeeping, not news.
+    const [jane] = await orders.listOrders("dog_food", { q: "Monello" });
+    await orders.updateOrderManually({ businessSlug: "dog_food", orderId: jane.id, adminId: "u2", action: "fulfil" });
+    const res = await groupSays("!update", { id: "U-2" });
+    assert.match(res.outbox[0].body, /1 cancelled/);
+    assert.match(res.outbox[0].body, /🚫 \*Marcus/);
+    assert.doesNotMatch(res.outbox[0].body, /Jane/);
+  });
+
+  test("each business has its own update point and sees only its own orders", async () => {
+    await seedMixedOrders();
+    await configure({ mode: "observe", staff_notices_enabled: true }, "by_sea", SEA_GROUP);
+    const dog = await groupSays("!update", { id: "U-1" });
+    assert.match(dog.outbox[0].body, /Jane/);
+    const sea = await groupSays("!update", { group: SEA_GROUP, biz: "by_sea", id: "U-SEA" });
+    assert.match(sea.outbox[0].body, /✅ No new or changed orders/);
+    assert.doesNotMatch(sea.outbox[0].body, /Jane|Marcus|Monello/);
+    assert.deepEqual((await rows(`select business_slug from public.ai_agent_order_update_posts order by business_slug`)).map((r) => r.business_slug), ["by_sea", "dog_food"]);
+  });
+
+  test("an unauthorized sender is refused and no update is produced", async () => {
     await seedMixedOrders();
     const res = await groupSays("!update", { sender: STRANGER });
-    assert.equal((await summaryOutbox()).length, 0);
+    assert.equal(await count(`select 1 from public.ai_agent_order_update_posts`), 0);
     assert.equal(res.outbox.length, 1);
     assert.match(res.outbox[0].body, /Only authorized staff/);
     assert.doesNotMatch(res.outbox[0].body, /Jane|Marcus/);
@@ -931,18 +1014,18 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(res.status, "ignored");
     assert.deepEqual(res.outbox, []);
     assert.equal(await count(`select 1 from public.ai_agent_outbox where to_jid = ${lit(OTHER_GROUP)}`), 0);
-    assert.equal((await summaryOutbox()).length, 0);
+    assert.equal(await count(`select 1 from public.ai_agent_order_update_posts`), 0);
     assert.equal(await count(`select 1 from public.ai_agent_audit_log where action = 'orders.update_rejected' and details->>'reason' = 'wrong_group'`), 1);
     // The other business's group cannot pull this business's orders either.
     const sea = await groupSays("!update", { group: SEA_GROUP, biz: "by_sea" });
-    assert.doesNotMatch(sea.outbox[0].body, /Jane|Marcus|Monello/);
+    assert.doesNotMatch(sea.outbox[0]?.body ?? "", /Jane|Marcus|Monello/);
     const crossed = await groupSays("!update", { group: SEA_GROUP, biz: "dog_food" });
     assert.equal(crossed.status, "ignored");
   });
 
   test("only the exact command counts; a longer message is ordinary staff chatter", async () => {
     const res = await groupSays("!update the price list please");
-    assert.equal((await summaryOutbox()).length, 0);
+    assert.equal(await count(`select 1 from public.ai_agent_order_update_posts`), 0);
     assert.equal(res.outbox.some((o) => /order/i.test(o.body)), false);
   });
 
@@ -950,42 +1033,42 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await configure({ orders_summary_enabled: false });
     const res = await groupSays("!update");
     assert.match(res.outbox[0]?.body ?? "", /not switched on/);
-    assert.equal((await summaryOutbox()).length, 0);
+    assert.equal(await count(`select 1 from public.ai_agent_order_update_posts`), 0);
   });
 
   test("!update in Observe mode without notices enabled posts nothing", async () => {
     await configure({ mode: "observe", staff_notices_enabled: false });
     const res = await groupSays("!update");
     assert.deepEqual(res.outbox, []);
-    assert.equal((await summaryOutbox()).length, 0);
+    assert.equal(await count(`select 1 from public.ai_agent_order_update_posts`), 0);
   });
 
-  test("!update only reads: no orders or events change, no model call, no customer message", async () => {
+  test("!update and !orders only read: no orders or events change, no model call, no customer message", async () => {
     await seedMixedOrders();
     const snapshot = async () => JSON.stringify([await allOrders(), await orderEvents()]);
     const before = await snapshot();
     const escalations = await count(`select 1 from public.ai_agent_escalations`);
     const calls = modelCalls.length;
-    const res = await groupSays("!update");
-    assert.equal(res.outbox.length, 1);
+    for (const text of ["!update", "!orders", "!orders overdue", "!orders missing", "!orders today", "!orders tomorrow", "!orders all"]) {
+      await ageUpdates();
+      const res = await groupSays(text);
+      assert.ok(res.outbox.length >= 1, text);
+    }
     assert.equal(await snapshot(), before);
     assert.equal(modelCalls.length, calls);
     assert.equal(await customerBound(), 0);
     assert.equal(await count(`select 1 from public.ai_agent_escalations`), escalations);
   });
 
-  // ── The schedule and !update are independent ────────────────────────────────
+  // ── The schedule and the commands are independent ───────────────────────────
 
   test("!update works although the scheduled summary has never run, and the schedule works although nobody ever types !update", async () => {
     await seedMixedOrders();
     assert.equal((await groupSays("!update")).outbox.length, 1);
-    assert.equal((await runs()).filter((r) => r.trigger === "scheduled").length, 0);
-    // A manual summary does not use up the day's scheduled one, and vice versa.
+    assert.equal((await runs()).length, 0, "!update leaves no scheduled-run record");
     assert.equal(await orders.runScheduledSummary(await settingsOf(), D(EIGHT_AM)), "sent");
-    await pg.run(`update public.ai_agent_order_summary_runs set created_at = now() - interval '5 minutes' where trigger = 'manual';`);
-    assert.equal((await groupSays("!update")).outbox.length, 1);
-    assert.equal((await summaryOutbox()).length, 3);
-    assert.deepEqual((await runs()).map((r) => r.trigger).sort(), ["manual", "manual", "scheduled"]);
+    assert.equal((await summaryOutbox()).length, 1);
+    assert.deepEqual((await runs()).map((r) => r.trigger), ["scheduled"]);
   });
 
   test("a scheduled run that was missed or blocked leaves !update working", async () => {
@@ -1005,8 +1088,8 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     assert.equal(inOrders.outbox.length, 1);
     assert.equal(inOrders.outbox[0].to, ORDERS_GROUP);
     assert.match(inOrders.outbox[0].body, /Jane/);
-
-    await pg.run(`update public.ai_agent_order_summary_runs set created_at = now() - interval '5 minutes';`);
+    const viewed = await groupSays("!orders all", { group: ORDERS_GROUP });
+    assert.equal(viewed.outbox[0].to, ORDERS_GROUP);
     const inStaff = await groupSays("!update");
     assert.match(inStaff.outbox[0].body, /posted in the Orders group/);
     assert.equal(inStaff.outbox[0].to, GROUP);
@@ -1048,7 +1131,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
 
   test("a whole day of orders, confirmations, the report and !update creates no customer-bound message", async () => {
     for (const mode of ["approval_pilot", "observe"]) {
-      await pg.run(`truncate public.ai_agent_orders, public.ai_agent_outbox, public.ai_agent_events, public.ai_agent_escalations, public.ai_agent_order_summary_runs, public.ai_agent_pilot_drafts, public.ai_agent_order_requests cascade;`);
+      await pg.run(`truncate public.ai_agent_orders, public.ai_agent_outbox, public.ai_agent_events, public.ai_agent_escalations, public.ai_agent_order_summary_runs, public.ai_agent_order_update_posts, public.ai_agent_pilot_drafts, public.ai_agent_order_requests cascade;`);
       await configure({ mode, staff_notices_enabled: true });
       const o = await awaitingOrder();
       await staffWritesTo(JANE, "Please confirm");

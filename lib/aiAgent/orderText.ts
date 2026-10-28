@@ -224,7 +224,7 @@ const DAY_NAMES: [RegExp, number][] = [
   [/\b(?:thu(?:r|rs|rsday)?)\b/i, 4], [/\b(?:fri(?:day)?)\b/i, 5], [/\b(?:sat(?:urday)?)\b/i, 6],
 ];
 
-function addDays(dateKey: string, days: number): { key: string; weekday: number; label: string } {
+export function addDays(dateKey: string, days: number): { key: string; weekday: number; label: string } {
   const [y, m, d] = dateKey.split("-").map(Number);
   const t = new Date(Date.UTC(y, m - 1, d + days, 12));
   const key = `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, "0")}-${String(t.getUTCDate()).padStart(2, "0")}`;
@@ -266,6 +266,96 @@ export function resolveRelativeDay(phrase: string, at: Date, timezone: string): 
 
 const stored = /^(\w{3} \d{1,2} \w{3}) \((.+)\)$/;
 
+// ── Explicit dates ("30 Oct", "Oct 30th", "30/10", "2026-10-30") ─────────────
+
+const MONTH_PATTERN = "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?";
+const monthIndex = (name: string) => MONTHS.findIndex((m) => name.toLowerCase().startsWith(m.toLowerCase()));
+const keyOf = (y: number, m: number, d: number) => `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+const realDate = (y: number, m: number, d: number) => {
+  const t = new Date(Date.UTC(y, m, d, 12));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m && t.getUTCDate() === d;
+};
+const dayNumber = (key: string) => {
+  const [y, m, d] = key.split("-").map(Number);
+  return Date.UTC(y, m - 1, d) / 86_400_000;
+};
+const labelOf = (key: string) => addDays(key, 0).label;
+
+/** The calendar day (YYYY-MM-DD) nearest to `anchor` that has this month and day; `weekday` (0-6) narrows the years. */
+function nearestYear(anchorKey: string, month: number, day: number, weekday?: number): string | null {
+  const anchorYear = Number(anchorKey.slice(0, 4));
+  let best: { key: string; gap: number } | null = null;
+  for (const y of [anchorYear - 1, anchorYear, anchorYear + 1]) {
+    if (!realDate(y, month, day)) continue;
+    const key = keyOf(y, month, day);
+    if (weekday !== undefined && addDays(key, 0).weekday !== weekday) continue;
+    const gap = Math.abs(dayNumber(key) - dayNumber(anchorKey));
+    if (!best || gap < best.gap) best = { key, gap };
+  }
+  return best?.key ?? null;
+}
+
+/**
+ * A date written out: "30 Oct", "30th October 2026", "Oct 30", "2026-10-30", "30/10/2026" (day first, as in St Lucia). With no year
+ * it is the occurrence nearest to the day `at` falls on. Two different dates in one phrase, or an impossible one
+ * ("31 Nov"), return null: the customer's words are kept and the order stays undated.
+ */
+export function resolveExplicitDay(phrase: string, at: Date, timezone: string): ResolvedDay | null {
+  if (Number.isNaN(at.getTime())) return null;
+  const anchor = localParts(at, timezone).dateKey;
+  const found = new Set<string>();
+  const add = (key: string | null) => key && found.add(key);
+  const text = phrase.toLowerCase();
+  for (const m of text.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
+    const [y, mo, d] = [Number(m[1]), Number(m[2]) - 1, Number(m[3])];
+    add(realDate(y, mo, d) ? keyOf(y, mo, d) : null);
+  }
+  const withYear = (y: string | undefined) => (y ? (y.length === 2 ? 2000 + Number(y) : Number(y)) : undefined);
+  const pick = (d: number, mo: number, y: number | undefined) => {
+    if (y !== undefined) return add(realDate(y, mo, d) ? keyOf(y, mo, d) : null);
+    // No year: 29 Feb is real in some years, other impossible days ("31 Nov") in none.
+    return add(realDate(2024, mo, d) ? nearestYear(anchor, mo, d) : null);
+  };
+  for (const m of text.matchAll(new RegExp(String.raw`\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(${MONTH_PATTERN})\b(?:\s*,?\s*(\d{4}))?`, "g"))) pick(Number(m[1]), monthIndex(m[2]), withYear(m[3]));
+  for (const m of text.matchAll(new RegExp(String.raw`\b(${MONTH_PATTERN})\s+(\d{1,2})(?:st|nd|rd|th)?\b(?:\s*,?\s*(\d{4}))?`, "g"))) pick(Number(m[2]), monthIndex(m[1]), withYear(m[3]));
+  // Only a full 30/10/2026 (or 30/10/26): "1/2 a bag" and "2.5 bags" are quantities, not dates.
+  for (const m of text.matchAll(/(?<![\d/])(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})(?![\d/])/g)) pick(Number(m[1]), Number(m[2]) - 1, withYear(m[3]));
+  if (found.size !== 1) return null;
+  const key = [...found][0];
+  return { date: key, label: labelOf(key) };
+}
+
+/**
+ * The day a phrase means: a relative day ("tomorrow", "Friday") or a written date. When both appear they must agree
+ * ("Friday 30 Oct" is fine; "tomorrow, 30 Oct" said on the 27th is not), otherwise null.
+ */
+export function resolveRequestedDay(phrase: string, at: Date, timezone: string): ResolvedDay | null {
+  const relative = resolveRelativeDay(phrase, at, timezone);
+  const explicit = resolveExplicitDay(phrase, at, timezone);
+  if (relative && explicit) return relative.date === explicit.date ? relative : null;
+  return relative ?? explicit;
+}
+
+/**
+ * The calendar day an order is for (YYYY-MM-DD in the business's timezone), or null when it has none or it cannot be
+ * read safely. Works on what is stored in `requested_for`: the resolved form "Fri 30 Oct (tomorrow)" (its weekday picks
+ * the year), or the customer's own words, counted from `anchorIso` (when the order was first written).
+ */
+export function requestedDate(requestedFor: string | null | undefined, anchorIso: string, timezone: string): string | null {
+  const text = (requestedFor ?? "").trim();
+  if (!text) return null;
+  const anchor = new Date(anchorIso);
+  if (Number.isNaN(anchor.getTime())) return null;
+  const label = text.match(stored)?.[1] ?? text.match(/^(\w{3} \d{1,2} \w{3})$/)?.[1];
+  if (label) {
+    const [wd, day, mon] = label.split(" ");
+    const weekday = WEEKDAYS.findIndex((w) => w.toLowerCase() === wd.toLowerCase());
+    const month = MONTHS.findIndex((m) => m.toLowerCase() === mon.toLowerCase());
+    if (weekday >= 0 && month >= 0) return nearestYear(localParts(anchor, timezone).dateKey, month, Number(day), weekday);
+  }
+  return resolveRequestedDay(text, anchor, timezone)?.date ?? null;
+}
+
 /** The same wish, whether stored as the customer's words ("tomorrow") or as the resolved form ("Tue 27 Oct (tomorrow)"). */
 export function sameRequestedFor(existing: string | null | undefined, phrase: string | null | undefined): boolean {
   if (!existing || !phrase) return false;
@@ -283,7 +373,7 @@ export function anchorRequestedFor(phrase: string | null | undefined, existing: 
   if (!text) return existing ?? null;
   if (sameRequestedFor(existing, text)) return existing ?? text;
   if (stored.test(text)) return text;
-  const day = resolveRelativeDay(text, at, timezone);
+  const day = resolveRequestedDay(text, at, timezone);
   return day ? `${day.label} (${text})` : text;
 }
 

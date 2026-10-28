@@ -2,21 +2,24 @@
 // tests/aiAgentOrderCommands.test.ts. The server side (lib/server/aiAgent/orders.ts handleOrderCommand) loads the
 // orders, checks who may do what, and applies the change through the same code the Orders dashboard uses.
 //
-//   !update                         today's report (read-only)
+//   !orders [today|tomorrow|<date>|all|overdue|missing|undated]   what is outstanding, by the day it is for (read-only)
+//   !update                         what is new or changed since the last update (read-only)
 //   !update #QU6U9 confirmed        staff-confirm one order
 //   !update #QU6U9 cancelled        cancel it
 //   !update #QU6U9 2 bags           change its quantity (single-product orders)
 //   !update #QU6U9 delivery tomorrow   change the requested delivery date
 //   !order <name or phone>          search active orders
 //   !order #QU6U9 / !moreinfo #QU6U9   full details of one order
-//   !order #QU6U9 completed         mark it done (status "fulfilled"): it leaves !update, its history stays
+//   !order #QU6U9 completed         mark it done (status "fulfilled"): it leaves !orders, its history stays
 //   !order #QU6U9 reopen            undo an accidental completion
 //
 // A selector is a reference (#QU6U9), a phone number, or a customer name. Whatever it is, it must identify exactly ONE
 // active order; with two or more matches nothing is changed and the choices are listed. No model is involved.
 
 import { normalizeText } from "./escalationUpdates.ts";
+import { dayLabel, orderDate, parseOrdersView, type OrdersView } from "./orderViews.ts";
 import {
+  DEFAULT_ORDERS_TIMEZONE,
   conflictFields,
   conflictText,
   displayRef,
@@ -46,10 +49,11 @@ export type UpdateAction =
 
 export type OrderCommand =
   | { kind: "report" }
+  | { kind: "orders"; view: OrdersView }
   | { kind: "update"; selector: Selector; action: UpdateAction }
   | { kind: "search"; query: string }
   | { kind: "info"; selector: Selector }
-  | { kind: "help"; reason: "update" | "order" | "moreinfo" };
+  | { kind: "help"; reason: "update" | "order" | "moreinfo" | "orders" };
 
 const MAX_SELECTOR = 60;
 
@@ -104,10 +108,16 @@ const REPORT = /^!update\s*[.!]?\s*$/i;
  * Approval Pilot commands untouched. "!moreinfo" is an order command only when it names an order reference
  * (#QU6U9); "!moreinfo" alone, or with an escalation code (#E-AB12C), stays with the escalation logic.
  */
-export function parseOrderCommand(raw: string): OrderCommand | null {
+export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: string | null } = {}): OrderCommand | null {
   const text = raw.replace(/\s+/g, " ").trim();
   if (REPORT.test(text)) return { kind: "report" };
-  let m = text.match(/^!update\s+(.+)$/i);
+  // "!orders" is the viewing command ("!order" is one order). An argument we do not understand gets the usage, not silence.
+  let m = text.match(/^!orders\b\s*(.*)$/i);
+  if (m) {
+    const view = parseOrdersView(m[1], opts.now ?? new Date(), opts.timezone || DEFAULT_ORDERS_TIMEZONE);
+    return view ? { kind: "orders", view } : { kind: "help", reason: "orders" };
+  }
+  m = text.match(/^!update\s+(.+)$/i);
   if (m) return parseUpdateBody(m[1]);
   m = text.match(/^!order\b\s*(.*)$/i);
   if (m) {
@@ -195,13 +205,25 @@ const STATUS_NAME: Record<string, string> = { possible: "possible", awaiting_con
 
 export const ORDER_HELP = [
   "ℹ️ Order commands:",
-  "!update — today's report",
+  "!orders — outstanding orders for today and tomorrow",
+  "!orders today | tomorrow | 30 Oct | all | overdue | missing | undated",
+  "!update — what is new or changed since the last update",
   "!update #REF confirmed | cancelled | 2 bags | delivery tomorrow",
   "!order <name or phone> — find an order",
-  "!moreinfo #REF — order details",
-  "!order #REF completed — mark done (leaves !update)",
+  "!order #REF — order details (also !moreinfo #REF)",
+  "!order #REF completed — mark done (leaves !orders)",
   "!order #REF reopen — undo a completion",
-  "#REF is the code shown in the report, e.g. #QU6U9.",
+  "#REF is the code shown in the lists, e.g. #QU6U9.",
+].join("\n");
+
+export const ORDERS_HELP = [
+  "ℹ️ !orders shows what is outstanding, by the day it is for:",
+  "!orders — today and tomorrow",
+  "!orders today · !orders tomorrow · !orders 30 Oct",
+  "!orders all — every outstanding order, by day",
+  "!orders overdue — older, still open",
+  "!orders missing — lacking products, quantity, delivery/collection, address or day",
+  "!orders undated — no day given",
 ].join("\n");
 
 export const ORDER_REPLY = {
@@ -218,8 +240,8 @@ export const ORDER_REPLY = {
   alreadyCompleted: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is already completed — no change.`,
   notCompleted: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is not completed (${STATUS_NAME[o.status] ?? o.status}) — nothing to reopen.`,
   // Internal bookkeeping only, like confirmation: the customer is not told and nothing is delivered or sent.
-  completed: (o: TrackedOrder, names?: OrderNames) => `✔️ ${label(o, names)}: completed. It no longer shows in !update. The customer was not messaged. Undo: !order ${displayRef(o.ref_code)} reopen`,
-  reopened: (o: TrackedOrder, names?: OrderNames) => `↩️ ${label(o, names)}: reopened (${STATUS_NAME[o.status] ?? o.status}). It shows in !update again.`,
+  completed: (o: TrackedOrder, names?: OrderNames) => `✔️ ${label(o, names)}: completed. It no longer shows in !orders. The customer was not messaged. Undo: !order ${displayRef(o.ref_code)} reopen`,
+  reopened: (o: TrackedOrder, names?: OrderNames) => `↩️ ${label(o, names)}: reopened (${STATUS_NAME[o.status] ?? o.status}). It shows in !orders again.`,
   alreadyConfirmed: (o: TrackedOrder, names?: OrderNames) => `ℹ️ ${label(o, names)} is already confirmed — no change.`,
   // Internal bookkeeping only: nothing here is, or implies, a message to the customer.
   confirmed: (o: TrackedOrder, before: string, names?: OrderNames) =>
@@ -230,7 +252,8 @@ export const ORDER_REPLY = {
     `✅ ${label(o, names)}: quantity ${before ?? "not set"} → ${after} (${clip(orderProductText(o.items[0]), 60)}).`,
   sameQuantity: (o: TrackedOrder, q: number) => `ℹ️ ${displayRef(o.ref_code)} already has quantity ${q} — no change.`,
   severalProducts: (o: TrackedOrder) => `⚠️ ${displayRef(o.ref_code)} has ${o.items.length === 0 ? "no products" : `${o.items.length} products`} — change quantities in the Orders dashboard. Nothing changed.`,
-  delivery: (o: TrackedOrder, when: string, names?: OrderNames) => `✅ ${label(o, names)}: delivery date → ${clip(when, 60)}.${o.fulfilment_method === "collection" ? " (This order is for collection.)" : ""}`,
+  delivery: (o: TrackedOrder, when: string, names?: OrderNames, dated = true) =>
+    `✅ ${label(o, names)}: ${o.fulfilment_method === "collection" ? "collection" : "delivery"} date → ${clip(when, 60)}.${dated ? "" : " ⚠️ That is not a date I can read, so the order has no day yet. Use e.g. “delivery 30 Oct” or “delivery tomorrow”."}`,
   sameDelivery: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} already has that date — no change.`,
   stale: (o: TrackedOrder) => `⚠️ ${displayRef(o.ref_code)} changed after your message was sent — nothing applied. Check !moreinfo ${displayRef(o.ref_code)} and send it again.`,
   conflict: (o: TrackedOrder) => `⚠️ ${displayRef(o.ref_code)} was just changed by someone else — nothing applied. Check !moreinfo ${displayRef(o.ref_code)} and try again.`,
@@ -305,7 +328,9 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
     ...(name?.name && name.source ? [`Name: ${NAME_SOURCE_TEXT[name.source]}`] : []),
     ...(o.items.length > 0 ? o.items.map((i) => `• ${orderItemText(i)}`) : ["• no products yet"]),
     `Method: ${o.fulfilment_method ?? "not stated"}${o.delivery_address ? ` · ${clip(o.delivery_address, 120)}` : ""}`,
-    ...(o.requested_for ? [`When: ${clip(o.requested_for, 80)}`] : []),
+    ...(o.requested_for
+      ? [orderDate(o, timezone) ? `Day: ${dayLabel(orderDate(o, timezone)!)} (${clip(o.requested_for, 60)})` : `When: ${clip(o.requested_for, 80)} — no date read`]
+      : ["Day: not given"]),
     ...(o.notes ? [`Note: ${clip(o.notes, 160)}`] : []),
     ...conflictFields(o).map((f) => `⚠️ Customer now says ${conflictText(f, o.field_conflicts[f]!, 50)}`),
     ...(o.attention ? [`⚠️ ${clip(o.attention.replace(/_/g, " "), 60)}`] : []),

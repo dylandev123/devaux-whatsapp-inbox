@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { Coverage } from "@/lib/aiAgent/orders";
-import { aiAgentApi, BackfillRunView, OrderEventView, OrderRunView, OrderView } from "@/lib/aiAgent/client";
+import { aiAgentApi, BackfillRunView, OrderCountsView, OrderEventView, OrderRunView, OrderView, OrderViewName } from "@/lib/aiAgent/client";
 import type { AgentSettings } from "@/lib/aiAgent/engine";
 import { ATTENTION_TEXT, CONFLICT_LABEL, conflictFields, conflictValueText, confirmationLabel, coverageLines, displayRef, formatLine, MISSING_TEXT, ORDER_STATUSES, type OrderLine, type OrderStatus } from "@/lib/aiAgent/orders";
 import { useDebounced } from "@/components/admin/aiAgent/useDebounced";
@@ -12,7 +12,7 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   possible: "Possible",
   awaiting_confirmation: "Awaiting confirmation",
   confirmed: "Confirmed",
-  fulfilled: "Fulfilled",
+  fulfilled: "Completed",
   cancelled: "Cancelled",
 };
 const STATUS_STYLE: Record<OrderStatus, string> = {
@@ -163,9 +163,8 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const open = order.status === "possible" || order.status === "awaiting_confirmation" || order.status === "confirmed";
-  const missing = order.missing_fields.filter((m) => m in MISSING_TEXT);
 
-  async function act(action: "edit" | "confirm" | "cancel" | "fulfil" | "keep", extra: { patch?: Record<string, unknown>; conflictFields?: string[]; reason?: string } = {}) {
+  async function act(action: "edit" | "confirm" | "cancel" | "fulfil" | "keep" | "reopen", extra: { patch?: Record<string, unknown>; conflictFields?: string[]; reason?: string } = {}) {
     setBusy(true);
     setError(null);
     try {
@@ -191,13 +190,32 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
         </span>
       </div>
       <p className="mt-1 text-zinc-800">{order.items.length ? order.items.map(formatLine).join("; ") : "No products yet"}</p>
-      <p className="text-xs text-zinc-600">
-        {order.fulfilment_method === "delivery" ? "Delivery" : order.fulfilment_method === "collection" ? "Collection" : "Delivery/collection not stated"}
-        {order.delivery_address ? ` — ${order.delivery_address}` : ""}
-        {order.requested_for ? ` — ${order.requested_for}` : ""}
+      <p className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-zinc-600">
+        <span className={`rounded px-1.5 py-0.5 font-medium ${order.fulfilment_method === "collection" ? "bg-violet-50 text-violet-700" : order.fulfilment_method === "delivery" ? "bg-sky-50 text-sky-700" : "bg-zinc-100 text-zinc-600"}`}>
+          {order.fulfilment_method === "delivery" ? "Delivery" : order.fulfilment_method === "collection" ? "Collection" : "Delivery/collection not stated"}
+        </span>
+        <span className={`rounded px-1.5 py-0.5 font-medium ${order.bucket === "overdue" ? "bg-red-50 text-red-700" : order.fulfilment_date ? "bg-zinc-100 text-zinc-700" : "bg-amber-50 text-amber-800"}`}>
+          {order.fulfilment_date_label ? `For ${order.fulfilment_date_label}${order.bucket === "overdue" ? " — overdue" : order.bucket === "today" ? " (today)" : order.bucket === "tomorrow" ? " (tomorrow)" : ""}` : order.bucket === "overdue" ? "No day — overdue" : "No day given"}
+        </span>
+        {order.requested_for && <span className="text-zinc-500">“{order.requested_for}”</span>}
+        {order.delivery_address && <span>— {order.delivery_address}</span>}
       </p>
+      {order.saved_location && order.fulfilment_method !== "collection" && (
+        <p className="text-xs text-zinc-600">
+          📍 Saved delivery location (set by staff {formatWhen(order.saved_location.set_at)}): <span className="font-medium">{order.saved_location.content}</span>
+          {order.delivery_address && order.delivery_address.trim().toLowerCase() !== order.saved_location.content.trim().toLowerCase() ? <span className="text-amber-700"> — differs from this order's address</span> : null}
+          {!order.delivery_address ? <span className="text-amber-700"> — not used on this order; check with the customer</span> : null}
+        </p>
+      )}
       {order.notes && <p className="text-xs text-zinc-600">Note: {order.notes}</p>}
-      {missing.length > 0 && <p className="mt-1 text-xs text-amber-700">Missing: {missing.map((m) => MISSING_TEXT[m]).join(", ")}</p>}
+      {open && (order.gaps ?? []).length > 0 && (
+        <p className="mt-1 flex flex-wrap items-center gap-1 text-xs text-amber-800">
+          <span className="font-medium">Missing:</span>
+          {(order.gaps ?? []).map((g) => (
+            <span key={g} className="rounded bg-amber-50 px-1.5 py-0.5">{g === "requested_for" ? "day" : (MISSING_TEXT[g] ?? g)}</span>
+          ))}
+        </p>
+      )}
       {conflictFields(order).map((field) => {
         const c = order.field_conflicts[field]!;
         return (
@@ -242,8 +260,8 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
             <button type="button" className={secondaryButton} disabled={busy} onClick={() => setEditing((v) => !v)}>
               {editing ? "Close editor" : "Correct"}
             </button>
-            <button type="button" className={secondaryButton} disabled={busy} onClick={() => window.confirm("Mark this order as fulfilled?") && void act("fulfil")}>
-              Fulfilled
+            <button type="button" className={secondaryButton} disabled={busy} onClick={() => window.confirm("Mark this order as completed? It leaves the outstanding lists; its history is kept and you can reopen it.") && void act("fulfil")}>
+              Complete
             </button>
             <button
               type="button"
@@ -257,6 +275,11 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
               Cancel order
             </button>
           </>
+        )}
+        {order.status === "fulfilled" && (
+          <button type="button" className={secondaryButton} disabled={busy} onClick={() => window.confirm("Reopen this order? It returns to the outstanding lists.") && void act("reopen")}>
+            Reopen
+          </button>
         )}
         <button type="button" className={secondaryButton} onClick={() => setHistory((v) => !v)}>
           {history ? "Hide history" : "History"}
@@ -301,7 +324,7 @@ function RunsCard({ businessSlug, runs, settings, onSent }: { businessSlug: stri
   const on = settings.orders_summary_enabled === true;
   return (
     <Card
-      title="Daily summary"
+      title="Morning list"
       subtitle={
         on
           ? `Posted every day at ${String(settings.orders_summary_hour ?? 8).padStart(2, "0")}:00 (${settings.orders_timezone ?? "America/St_Lucia"}) to ${settings.orders_group_name ?? settings.orders_group_jid ?? settings.staff_group_name ?? "the staff group"}.`
@@ -309,8 +332,8 @@ function RunsCard({ businessSlug, runs, settings, onSent }: { businessSlug: stri
       }
     >
       <div className="flex items-center gap-2">
-        <button type="button" className={secondaryButton} disabled={busy || !on} onClick={() => window.confirm("Post the order summary to the group now?") && void sendNow()}>
-          Send summary now
+        <button type="button" className={secondaryButton} disabled={busy || !on} onClick={() => window.confirm("Post today's and tomorrow's orders to the group now? (The same as typing !orders.)") && void sendNow()}>
+          Post orders list now
         </button>
         {ok && <span className="text-sm text-emerald-700">Queued.</span>}
       </div>
@@ -324,7 +347,7 @@ function RunsCard({ businessSlug, runs, settings, onSent }: { businessSlug: stri
               <Badge value={r.status === "queued" ? (r.delivery ?? "pending") : r.status} />
               <span className="text-zinc-500">
                 {r.status === "queued" && r.delivery ? DELIVERY_TEXT[r.delivery] : r.status === "missed" ? "not posted: outside the catch-up window" : r.status === "skipped" ? `not posted: ${r.skip_reason?.replace(/_/g, " ") ?? ""}` : ""}
-                {r.confirmed_count != null ? ` · ${r.confirmed_count} confirmed, ${r.attention_count ?? 0} need attention${r.carried_count ? `, ${r.carried_count} carried forward` : ""}` : ""}
+                {r.confirmed_count != null ? ` · ${r.confirmed_count} listed, ${r.attention_count ?? 0} need attention${r.carried_count ? `, ${r.carried_count} overdue` : ""}` : ""}
                 {r.attempts > 1 ? ` · attempt ${r.attempts}` : ""}
               </span>
               <span className="ml-auto text-zinc-400">{formatWhen(r.created_at)}</span>
@@ -436,31 +459,96 @@ function BackfillCard({ businessSlug, enabled, onDone }: { businessSlug: string;
   );
 }
 
+type TabId = "today" | "tomorrow" | "overdue" | "missing" | "undated" | "open" | "fulfilled" | "cancelled";
+const TABS: { id: TabId; label: string; status: "open" | OrderStatus; view: OrderViewName; count?: keyof OrderCountsView }[] = [
+  { id: "today", label: "Today", status: "open", view: "today", count: "today" },
+  { id: "tomorrow", label: "Tomorrow", status: "open", view: "tomorrow", count: "tomorrow" },
+  { id: "overdue", label: "Overdue", status: "open", view: "overdue", count: "overdue" },
+  { id: "missing", label: "Missing information", status: "open", view: "missing", count: "missing" },
+  { id: "undated", label: "No day", status: "open", view: "undated", count: "undated" },
+  { id: "open", label: "All outstanding", status: "open", view: "all", count: "open" },
+  { id: "fulfilled", label: "Completed", status: "fulfilled", view: "all" },
+  { id: "cancelled", label: "Cancelled", status: "cancelled", view: "all" },
+];
+const EMPTY_TEXT: Record<TabId, string> = {
+  today: "Nothing outstanding for today.",
+  tomorrow: "Nothing outstanding for tomorrow.",
+  overdue: "No overdue orders.",
+  missing: "Every outstanding order has the essentials.",
+  undated: "Every outstanding order has a day.",
+  open: "No outstanding orders.",
+  fulfilled: "No completed orders match.",
+  cancelled: "No cancelled orders match.",
+};
+
+/** Orders grouped by the day they are for, then Delivery / Collection / not stated (outstanding views only). */
+function GroupedOrders({ orders, businessSlug, onChanged }: { orders: OrderView[]; businessSlug: string; onChanged: () => void }) {
+  const days: { key: string; label: string; orders: OrderView[] }[] = [];
+  for (const o of orders) {
+    const key = o.fulfilment_date ?? "none";
+    let day = days.find((d) => d.key === key);
+    if (!day) {
+      day = { key, label: o.fulfilment_date_label ?? (o.bucket === "overdue" ? "No day given — first mentioned before today" : "No day given yet"), orders: [] };
+      days.push(day);
+    }
+    day.orders.push(o);
+  }
+  return (
+    <div className="flex flex-col gap-4">
+      {days.map((day) => (
+        <section key={day.key}>
+          <h3 className="mb-1 text-sm font-semibold text-zinc-800">
+            {day.label} <span className="font-normal text-zinc-500">({day.orders.length})</span>
+          </h3>
+          {(["delivery", "collection", "none"] as const).map((method) => {
+            const group = day.orders.filter((o) => (o.fulfilment_method ?? "none") === method);
+            if (group.length === 0) return null;
+            return (
+              <div key={method} className="mb-2">
+                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{method === "delivery" ? "Delivery" : method === "collection" ? "Collection" : "Delivery or collection not stated"}</p>
+                <ul className="divide-y divide-zinc-100 rounded-md border border-zinc-200">
+                  {group.map((o) => (
+                    <OrderCard key={`${o.id}:${o.version}`} businessSlug={businessSlug} order={o} onChanged={onChanged} />
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </section>
+      ))}
+    </div>
+  );
+}
+
 export function OrdersPanel({ businessSlug, settings }: { businessSlug: string; settings: AgentSettings }) {
-  const [status, setStatus] = useState<"open" | "all" | OrderStatus>("open");
+  const [tab, setTab] = useState<TabId>("today");
   const [query, setQuery] = useState("");
   const debounced = useDebounced(query, 300);
   const [orders, setOrders] = useState<OrderView[] | null>(null);
   const [runs, setRuns] = useState<OrderRunView[]>([]);
   const [coverage, setCoverage] = useState<Coverage | null>(null);
+  const [counts, setCounts] = useState<OrderCountsView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const current = TABS.find((t) => t.id === tab)!;
 
   const load = useCallback(async () => {
     try {
-      const res = await aiAgentApi.listOrders(businessSlug, status, debounced);
+      const res = await aiAgentApi.listOrders(businessSlug, current.status, debounced, current.view);
       setOrders(res.orders);
       setRuns(res.runs);
       setCoverage(res.coverage);
+      setCounts(res.counts);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load orders");
     }
-  }, [businessSlug, status, debounced]);
+  }, [businessSlug, current.status, current.view, debounced]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
+  const grouped = current.status === "open";
   return (
     <div className="flex flex-col gap-6">
       {settings.orders_tracking_enabled !== true && (
@@ -474,25 +562,49 @@ export function OrdersPanel({ businessSlug, settings }: { businessSlug: string; 
           {coverage.filteredMessages} message{coverage.filteredMessages === 1 ? "" : "s"} in the last {coverage.windowHours} h had no order wording (thanks, greetings, questions) and were only checked by the free filter.
         </p>
       )}
+      {counts && (
+        <div className={`rounded-md border px-4 py-3 text-sm ${counts.attention > 0 ? "border-amber-300 bg-amber-50 text-amber-900" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`}>
+          {counts.attention > 0 ? (
+            <>
+              <span className="font-semibold">{counts.attention} order{counts.attention === 1 ? "" : "s"} need{counts.attention === 1 ? "s" : ""} attention</span>
+              <span> — {[counts.overdue ? `${counts.overdue} overdue` : "", counts.missing ? `${counts.missing} missing information` : ""].filter(Boolean).join(", ") || "flagged for a look"}. </span>
+            </>
+          ) : (
+            <span className="font-semibold">Nothing needs attention.</span>
+          )}
+          <span className="text-xs"> {counts.open} outstanding · {counts.today} today · {counts.tomorrow} tomorrow{counts.later ? ` · ${counts.later} later` : ""}</span>
+        </div>
+      )}
       <RunsCard businessSlug={businessSlug} runs={runs} settings={settings} onSent={load} />
       <BackfillCard businessSlug={businessSlug} enabled={settings.orders_tracking_enabled === true} onDone={load} />
-      <Card title="Orders" subtitle="Orders found in customer conversations. Changes you make here are recorded with your name and never message the customer.">
-        <div className="mb-3 flex flex-wrap gap-2">
+      <Card title="Orders" subtitle="Grouped by the day each order is for, not the day the message arrived. Changes you make here are recorded with your name and never message the customer.">
+        <div className="mb-3 flex flex-wrap gap-1" role="tablist" aria-label="Order views">
+          {TABS.map((t) => {
+            const n = t.count && counts ? counts[t.count] : null;
+            const hot = (t.id === "overdue" || t.id === "missing") && (n ?? 0) > 0;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={tab === t.id}
+                onClick={() => setTab(t.id)}
+                className={`rounded-md border px-3 py-1.5 text-sm ${tab === t.id ? "border-zinc-900 bg-zinc-900 text-white" : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"}`}
+              >
+                {t.label}
+                {n !== null && <span className={`ml-1.5 rounded px-1.5 text-xs font-medium ${tab === t.id ? "bg-white/20" : hot ? "bg-red-100 text-red-700" : "bg-zinc-100 text-zinc-600"}`}>{n}</span>}
+              </button>
+            );
+          })}
+        </div>
+        <div className="mb-3">
           <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search name, phone, product, address, reference…" className={`${inputClass} sm:max-w-sm`} />
-          <select value={status} onChange={(e) => setStatus(e.target.value as typeof status)} className={`${inputClass} sm:max-w-[14rem]`}>
-            <option value="open">Outstanding</option>
-            <option value="all">All</option>
-            {ORDER_STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {STATUS_LABEL[s]}
-              </option>
-            ))}
-          </select>
         </div>
         {error && <Notice tone="error">{error}</Notice>}
         {!orders && !error && <p className="text-sm text-zinc-500">Loading…</p>}
-        {orders && orders.length === 0 && <p className="text-sm text-zinc-500">No orders match.</p>}
-        {orders && orders.length > 0 && (
+        {orders && orders.length === 0 && <p className="text-sm text-zinc-500">{debounced ? "No orders match your search." : EMPTY_TEXT[tab]}</p>}
+        {orders && orders.length > 0 && grouped && <GroupedOrders orders={orders} businessSlug={businessSlug} onChanged={load} />}
+        {orders && orders.length > 0 && !grouped && (
           <ul className="divide-y divide-zinc-100 rounded-md border border-zinc-200">
             {orders.map((o) => (
               <OrderCard key={`${o.id}:${o.version}`} businessSlug={businessSlug} order={o} onChanged={load} />

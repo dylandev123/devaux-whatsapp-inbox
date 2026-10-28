@@ -150,7 +150,7 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
 
   beforeEach(async () => {
     await pg.run(`
-      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_escalations, public.ai_agent_outbox,
+      truncate public.ai_agent_orders, public.ai_agent_order_summary_runs, public.ai_agent_order_update_posts, public.ai_agent_escalations, public.ai_agent_outbox,
         public.ai_agent_staff_answers, public.ai_agent_events, public.ai_agent_learning_candidates, public.ai_agent_knowledge,
         public.ai_agent_customer_memory, public.ai_agent_audit_log, public.ai_agent_conversations, public.ai_agent_contact_rules,
         public.ai_agent_order_requests, public.ai_agent_batches, public.ai_agent_batch_messages, public.ai_agent_pilot_drafts,
@@ -207,7 +207,7 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
     assert.equal(after.id, enquiry.id, "it joins the one open order rather than starting another");
     assert.deepEqual(lines(after), [["Bandit", "9", null]], "the open order's own lines are not 'history' and nothing was added");
     assert.equal(after.attention, "history_unresolved");
-    const report = (await groupSays("!update")).outbox.map((x) => x.body).join("\n");
+    const report = (await groupSays("!orders all")).outbox.map((x) => x.body).join("\n");
     assert.match(report, /⚠️ Refers to an earlier order — check/);
     assert.equal(await customerBound(), 0);
   });
@@ -218,7 +218,7 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
     await customerSays(JANE, "Same as last time");
     const [o] = await live();
     assert.deepEqual([o.items, o.attention, o.notes], [[], "history_unresolved", "Same as last time"]);
-    assert.match((await groupSays("!update")).outbox.map((x) => x.body).join("\n"), /Note: Same as last time/);
+    assert.match((await groupSays("!orders all")).outbox.map((x) => x.body).join("\n"), /Note: Same as last time/);
   });
 
   test("a customer with no history at all gets a flagged note, never an invented order", async () => {
@@ -430,7 +430,7 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
     [o] = await live();
     assert.deepEqual(lines(o)[0], ["Monello Chicken", "3", "25kg"], "the staff value is never overwritten");
     assert.deepEqual(Object.keys(o.field_conflicts), ["items"]);
-    assert.match((await groupSays("!update")).outbox.map((x) => x.body).join("\n"), /⚠️ Customer asked for a change — check before fulfilling/);
+    assert.match((await groupSays("!orders all")).outbox.map((x) => x.body).join("\n"), /⚠️ Customer asked for a change — check before fulfilling/);
     assert.equal(await customerBound(), 0);
   });
 
@@ -447,8 +447,8 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
     assert.equal(o.status, "awaiting_confirmation");
     assert.equal(o.attention, "changed_after_confirmation");
     assert.equal(o.confirmed_by, null, "the staff confirmation no longer stands");
-    const report = (await groupSays("!update")).outbox.map((x) => x.body).join("\n");
-    assert.match(report, /📦 \*OPEN ORDERS\*[\s\S]*⚠️ Changed after confirmation — re-confirm/);
+    const report = (await groupSays("!orders all")).outbox.map((x) => x.body).join("\n");
+    assert.match(report, /⚠️ Changed after confirmation — re-confirm/);
     assert.doesNotMatch(report, /CONFIRMED/);
   });
 
