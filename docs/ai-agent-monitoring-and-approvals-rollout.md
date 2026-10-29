@@ -34,7 +34,7 @@ Nothing is enabled by this release. Every setting keeps its value; the only new 
    attention and stays unconfirmed. Press Confirm in the dashboard to finalize.
 7. **Customer yes**: staff write "shall I confirm?", the customer replies "yes": the order is flagged *Customer replied yes*, not confirmed (customer
    confirmation stays off).
-8. **Report**: `!orders all` in the orders/staff group lists the order by the day it is for (a healthy list carries no coverage line). Switch the bridge's forwarding off for a minute, send a message, `!update`: the report warns that a message reached the inbox but not the agent.
+8. **Report**: `!orders all` in the orders/staff group lists the order by the day it is for (a healthy list carries no coverage line). Switch the bridge's forwarding off for a minute, send a message, `!orders`: the report warns that a message reached the inbox but not the agent.
 9. **Approval notice** (AI-eligible customer, Approval Pilot): the notice is the compact format; quote it with `!moreinfo`: one detailed message, the draft
    unchanged; `!moreinfo` again within 45 s: nothing. A non-authorized member's `!moreinfo` gets the refusal.
 10. **One approval per request**: send a question, then (before approving) "also, do you deliver to <area>?": one short "— updated" notice. Quote the OLD

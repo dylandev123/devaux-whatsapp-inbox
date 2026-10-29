@@ -78,7 +78,8 @@ import {
   productHints,
   readTurnPictures,
 } from "@/lib/server/aiAgent/context";
-import { type ConversationLine, isAffirmation } from "@/lib/aiAgent/staffDelivery";
+import { mayAnswerQuestion } from "@/lib/aiAgent/orderConversation";
+import { type ConversationLine } from "@/lib/aiAgent/staffDelivery";
 import {
   BatchRow,
   claimBatches,
@@ -185,7 +186,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   if (!settings?.enabled) return ignored("agent_disabled");
 
   const isStaffGroup = Boolean(settings.staff_group_jid) && input.chatId === settings.staff_group_jid;
-  // A separate Orders group (when configured) accepts the "!update" command and nothing else.
+  // A separate Orders group (when configured) accepts the order commands (!orders, !order, !moreinfo #REF) and nothing else.
   const isOrdersGroup = !isStaffGroup && hasSeparateOrdersGroup(settings) && input.chatId === settings.orders_group_jid;
   // Our own sends echoed back by the bridge are dropped before anything else:
   // an echoed staff notice must never be read as a staff answer, and an echoed
@@ -194,7 +195,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
     await recordIgnored(input, isStaffGroup || isOrdersGroup ? "staff_group" : "staff_outbound", "agent_echo", settings);
     return ignored("agent_echo");
   }
-  // Order commands ("!update", "!order", "!moreinfo #REF") are honoured in the configured group only. From any other
+  // Order commands ("!orders", "!order", "!moreinfo #REF") are honoured in the configured group only. From any other
   // group they are refused, silently (the agent never posts into a group it was not given) and on the record.
   if (!isStaffGroup && !isOrdersGroup && input.chatId.endsWith("@g.us") && parseOrderCommand(input.text)) {
     await audit(input.businessSlug, "staff", input.senderJid, "orders.update_rejected", { type: "chat", id: input.chatId }, { reason: "wrong_group" });
@@ -760,7 +761,7 @@ async function runPipeline(args: {
           pictureWords: pictureTexts,
           recent: recentLines,
           // Only a bare yes needs to know which message it answered: one query, and only then.
-          quotedId: segmentsOfTurn.every(isAffirmation) && chatId ? await loadTurnQuote(businessSlug, chatId, args.excludeMessageIds) : null,
+          quotedId: mayAnswerQuestion(segmentsOfTurn) && chatId ? await loadTurnQuote(businessSlug, chatId, args.excludeMessageIds) : null,
           history: orderHistory,
           intent: orderOnlyIntent,
         }

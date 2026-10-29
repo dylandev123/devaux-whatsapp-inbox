@@ -191,7 +191,7 @@ const customerLabel = (e: EscalationRow) => e.customer_name ?? e.contact_number 
 export async function processStaffGroupMessage(input: StaffGroupMessage): Promise<StaffGroupResult> {
   const { settings } = input;
   const groupJid = settings.staff_group_jid!;
-  // Order commands ("!update", "!update #REF …", "!order …", "!moreinfo #REF"): deterministic, from the database. Handled
+  // Order commands ("!orders", "!order …", "!moreinfo #REF"): deterministic, from the database. Handled
   // first so a quote or reference in the message can never route one to an escalation, and kept apart from the
   // approval commands (a "!moreinfo" without an order reference still goes to the escalation logic below).
   // Authorization and the group check live in handleOrderCommand.

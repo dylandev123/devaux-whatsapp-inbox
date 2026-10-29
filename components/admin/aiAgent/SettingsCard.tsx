@@ -292,7 +292,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
           <p className="text-sm font-medium text-zinc-900">Daily orders</p>
           <p className="mb-2 mt-1 text-xs text-zinc-500">
             Keeps a record of the orders customers place (Orders tab) and posts one summary to a WhatsApp group every morning. Staff type{" "}
-            <code>!update</code> in that group for a fresh one. Neither ever messages a customer, and neither changes Approval Pilot.
+            <code>!orders</code> in that group for the current list. Neither ever messages a customer, and neither changes Approval Pilot.
           </p>
           <label className="flex items-center gap-2 text-sm text-zinc-700">
             <input type="checkbox" checked={ordersTracking} onChange={(e) => setOrdersTracking(e.target.checked)} />
@@ -304,7 +304,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
           </label>
           <label className="mt-2 flex items-center gap-2 text-sm text-zinc-700">
             <input type="checkbox" checked={ordersSummary} onChange={(e) => setOrdersSummary(e.target.checked)} />
-            Post the daily summary and answer <code>!update</code>
+            Post the daily summary and answer <code>!orders</code>
           </label>
           <div className={`mt-3 flex flex-col gap-3 ${ordersSummary ? "" : "opacity-60"}`}>
             <div>
@@ -312,7 +312,7 @@ export function SettingsCard({ businessSlug, data, onSaved }: Props) {
               <StaffGroupPicker businessSlug={businessSlug} value={ordersGroup} onChange={setOrdersGroup} />
               <p className="mt-1 text-xs text-zinc-400">
                 Leave empty to use the staff group above. A different group also needs the bridge to forward its messages (see docs/ai-agent-daily-orders.md).
-                <code> !update</code> works only here, and only for the authorized staff above.
+                <code> !orders</code> works only here, and only for the authorized staff above.
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

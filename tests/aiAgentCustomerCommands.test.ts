@@ -37,7 +37,7 @@ describe("!rules registry", () => {
       ...DRAFT_COMMANDS,
       ...BUSINESS_COMMANDS,
       "send", "note", "close", "takeover", "resume", // escalation commands (matchStaffReply)
-      "update", "order", "orders", // order commands (parseOrderCommand)
+      "order", "orders", // order commands (parseOrderCommand)
       "rules", "customer", "location", "remember", // customer commands (parseCustomerCommand)
     ]);
     for (const name of documented) assert.ok(recognised.has(name), `!${name} is advertised but no parser knows it`);
@@ -48,7 +48,7 @@ describe("!rules registry", () => {
     assert.equal(parseCustomerCommand("!location 17585550123 clear")?.kind, "location_clear");
     assert.equal(parseCustomerCommand("!customer 17585550123")?.kind, "customer");
     assert.equal(parseCustomerCommand("!remember 17585550123 Dog is nervous")?.kind, "remember");
-    assert.equal(parseOrderCommand("!update")?.kind, "report");
+    assert.equal(parseOrderCommand("!update"), null);
     assert.equal(parseOrderCommand("!order #QU6U9")?.kind, "info");
     assert.equal(parseOrderCommand("!orders")?.kind, "orders");
     assert.equal(parseOrderCommand("!orders overdue")?.kind, "orders");
@@ -349,7 +349,7 @@ describe("customer commands (real server code, real SQL)", { skip: !pgAvailable 
       assert.equal(res.status, "done");
       assert.ok(res.outbox.length >= 2, "more than one WhatsApp message");
       assert.ok(res.outbox.every((o) => o.to === GROUP));
-      assert.match(bodies(res), /!approve[^]*!location[^]*!remember[^]*!update/);
+      assert.match(bodies(res), /!approve[^]*!location[^]*!remember[^]*!orders/);
     }
     assert.equal(await count("select 1 from public.ai_agent_customer_staff_memory"), before);
     assert.equal(await count("select 1 from public.ai_agent_escalations where status <> 'open'"), 0);

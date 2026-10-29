@@ -10,7 +10,6 @@ import {
   CATCH_UP_HOURS,
   computeMissing,
   isPureConfirmation,
-  isUpdateCommand,
   isWholeOrderCancellation,
   localParts,
   mergeDraft,
@@ -270,13 +269,6 @@ describe("timezone-aware schedule", () => {
   test("the date in the key is the business's local date, not UTC", () => {
     // 01:00 UTC on the 28th is still the 27th in St Lucia.
     assert.equal(localParts(new Date("2026-10-28T01:00:00Z"), tz).dateKey, "2026-10-27");
-  });
-});
-
-describe("!update is exactly that command", () => {
-  test("recognition", () => {
-    for (const t of ["!update", "!UPDATE", "  !update  ", "!update."]) assert.equal(isUpdateCommand(t), true, t);
-    for (const t of ["update", "!update the price", "please !update", "!updates", "!status"]) assert.equal(isUpdateCommand(t), false, t);
   });
 });
 

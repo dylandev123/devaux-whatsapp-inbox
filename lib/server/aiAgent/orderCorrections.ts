@@ -181,7 +181,7 @@ async function createProposal(args: {
 export async function handleCorrectionCommand(args: CorrectionCommandArgs): Promise<UpdateCommandResult> {
   const { settings, fromGroup, command, senderAuth } = args;
   const slug = settings.business_slug;
-  const refused = await guardOrderCommand(args, "command");
+  const refused = await guardOrderCommand(args);
   if (refused) return refused;
 
   const say = (body: string, outcome: string, key = `ordercorr:${slug}:${args.whatsappMessageId}:reply`) => groupReply(settings, fromGroup, args.eventId, body, "staff_notice", `orders:${outcome}`, key);

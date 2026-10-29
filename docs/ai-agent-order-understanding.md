@@ -114,7 +114,7 @@ Orders → **Check orders against their conversations** (`GET /api/ai-agent/orde
 conversation and lists suggestions with the messages that support them: might not be an order, a delivery day staff stated or the customer
 accepted, a "this one" order whose photo shows a product. It makes no model call (it only reads picture readings that already exist), writes
 nothing, and ignores orders staff edited, confirmed, completed or cancelled. Customer memories, staff locks and approved corrections are
-never touched. A person applies any change with the normal Orders actions (or `!update`). **#JXBDS and #KBNYW were not repaired.**
+never touched. A person applies any change with the normal Orders actions (or `!order #REF …`). **#JXBDS and #KBNYW were not repaired.**
 
 ## Deployment and rollback
 

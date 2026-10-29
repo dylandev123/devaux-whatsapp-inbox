@@ -53,7 +53,7 @@ export interface SettingsPatch {
   autoLearningEnabled?: boolean;
   /** Daily orders: extract orders from conversations into the Orders tab. */
   ordersTrackingEnabled?: boolean;
-  /** Daily orders: the 8 AM summary and the !update command. */
+  /** Daily orders: the 8 AM summary and the order commands. */
   ordersSummaryEnabled?: boolean;
   /** null = post in the staff group. */
   ordersGroupJid?: string | null;

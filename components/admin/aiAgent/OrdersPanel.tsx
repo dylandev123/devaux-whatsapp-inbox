@@ -718,7 +718,16 @@ function GroupedOrders({ orders, businessSlug, onChanged }: { orders: OrderView[
   );
 }
 
-const FINDING_LABEL: Record<string, string> = { might_not_be_order: "Might not be an order", delivery_day: "Delivery day", picture_unresolved: "Photo" };
+const FINDING_LABEL: Record<string, string> = {
+  might_not_be_order: "Might not be an order",
+  delivery_day: "Delivery day",
+  picture_unresolved: "Photo",
+  address_answered: "Address answered in chat",
+  product_confirmed: "Product confirmed in chat",
+  quantity_answered: "Quantity answered in chat",
+  quantity_corrected: "Quantity corrected",
+  staff_warning_resolvable: "Staff warning can be cleared",
+};
 
 /** READ-ONLY: where an existing order's own conversation points somewhere other than what the order says. Applies nothing. */
 function ConversationReviewCard({ businessSlug }: { businessSlug: string }) {
@@ -737,7 +746,7 @@ function ConversationReviewCard({ businessSlug }: { businessSlug: string }) {
     }
   }
   return (
-    <Card title="Check orders against their conversations" subtitle="Read-only. Looks for orders that may not be orders, delivery days staff agreed with the customer and photos nobody resolved. Nothing is changed here: you decide, using the usual actions on each order.">
+    <Card title="Check orders against their conversations" subtitle="Read-only. Looks for orders that may not be orders, delivery days staff agreed with the customer, photos nobody resolved, addresses, products and quantities the chat answered or corrected, and old staff warnings that can now be understood. Each suggestion shows the messages behind it and before → after. Nothing is changed here: you decide, using the usual actions on each order.">
       <button type="button" className={secondaryButton} disabled={busy} onClick={() => void run()}>
         {busy ? "Checking…" : result ? "Check again" : "Check outstanding orders"}
       </button>

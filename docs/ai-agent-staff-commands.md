@@ -30,15 +30,14 @@ Every command is read from the START of a message and is handled before escalati
 ## Orders (documented in `!rules`)
 
 `!orders [today|tomorrow|<date>|all|overdue|missing|undated]` (outstanding orders by the day they are for, split into delivery
-and collection), `!update` (new and changed orders since the last update delivered to the group; nothing is marked reviewed),
-`!update #REF confirmed|cancelled|2 bags|delivery tomorrow|delivery 30 Oct`, `!order <name|phone|#REF>`, `!order #REF completed`,
+and collection), `!order #REF confirmed|cancelled|2 bags|delivery tomorrow|delivery 30 Oct` (the reference is required), `!order <name|phone|#REF>`, `!order #REF completed`,
 `!order #REF reopen`, `!moreinfo #REF` — in the Orders group (the staff group unless a separate Orders group is set).
 `!order #REF teach <words>` corrects one order in plain language (several fields at once); `!orders complete all` completes today's
 outstanding orders. Both only PREVIEW first and give a one-time code: `!confirm C-ABCDE` / `!discard C-ABCDE` (a correction, valid 30
 minutes) or `!confirm B-ABCDE` / `!discard B-ABCDE` (a bulk completion, valid 10 minutes). `!confirm K-ABCD` still means *approve a
 suggested knowledge fact*: the code's letter decides, so the two never collide. See `docs/ai-agent-daily-orders.md` ("Order corrections and bulk completion").
 There is no `!done`.
-See `docs/ai-agent-daily-orders.md` ("Order days, `!orders` and `!update`").
+See `docs/ai-agent-daily-orders.md` ("Order days and `!orders`"; `!update` was retired, see `docs/ai-agent-conversation-orders.md`).
 
 ## Memory behaviour
 

@@ -84,9 +84,9 @@ describe("command parsing", () => {
     assert.equal(parseOrderCommand("!order #ZWL67 completed")?.kind, "update");
     assert.equal(parseOrderCommand("!order #ZWL67 reopen")?.kind, "update");
     assert.equal(parseOrderCommand("!order Jason")?.kind, "search");
-    assert.equal(parseOrderCommand("!update #ZWL67 2 bags")?.kind, "update");
+    assert.equal(parseOrderCommand("!order #ZWL67 2 bags")?.kind, "update");
     assert.equal(parseOrderCommand("!orders tomorrow")?.kind, "orders");
-    assert.equal(parseOrderCommand("!update")?.kind, "report");
+    assert.equal(parseOrderCommand("!update"), null);
     assert.equal(parseOrderCommand("!moreinfo #ZWL67")?.kind, "info");
     assert.equal(parseOrderCommand("!moreinfo"), null, "an escalation !moreinfo is not ours");
   });
@@ -383,7 +383,7 @@ describe("the cleaner order report", () => {
 describe("!rules", () => {
   const text = buildRulesMessages().join("\n");
   test("documents teach, the confirm/discard workflow, complete all and the existing order commands", () => {
-    for (const part of ["!order <name, phone or #REF> | #REF completed | #REF reopen | #REF teach <instruction>", "!orders complete all", "!confirm C-ABCDE", "!discard C-ABCDE", "!update [#REF", "!orders [today|tomorrow"]) {
+    for (const part of ["!order <name, phone or #REF> | #REF confirmed | #REF cancelled | #REF 2 bags | #REF delivery tomorrow | #REF completed | #REF reopen | #REF teach <instruction>", "!orders complete all", "!confirm C-ABCDE", "!discard C-ABCDE", "!orders [today|tomorrow"]) {
       assert.ok(text.includes(part), part);
     }
     assert.match(text, /C- code first; nothing changes until you !confirm C-ABCDE/);

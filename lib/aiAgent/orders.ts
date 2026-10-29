@@ -58,6 +58,10 @@ export interface FieldConflict {
   proposed: unknown;
   current: unknown;
   at: string;
+  /** Who proposed it: the customer (default, older rows have no source) or staff writing in the customer's chat. */
+  source?: "customer" | "staff_chat";
+  /** The words it came from, clipped. */
+  evidence?: string;
 }
 export type FieldConflicts = Partial<Record<EditableOrderField, FieldConflict>>;
 
@@ -98,6 +102,8 @@ export const ATTENTION_TEXT: Record<string, string> = {
   staff_confirmed_in_chat: "Staff wrote a confirmation in WhatsApp — verify it and press Confirm",
   staff_cancelled_in_chat: "Staff wrote in WhatsApp that this was cancelled — verify and cancel it here",
   staff_changed_in_chat: "Staff wrote about changes to this order in WhatsApp — check the order",
+  staff_change_unclear: "Staff wrote a change in WhatsApp that could not be matched to a field of this order — see the staff message in the order's history",
+  customer_answer_unclear: "Customer replied to a staff question without making the answer clear — check the chat",
   history_unresolved: "Customer referred to an earlier order or place that could not be matched safely — please check",
   other_customer_note: "Needs a staff look",
   review_order_intent: "Might not be an order (an invoice, price or product discussion, or no clear request) — confirm it, or cancel it",
@@ -504,13 +510,6 @@ export function scheduleState(args: { now: Date; timezone: string; hour: number;
   return { state: "due", localDate: dateKey };
 }
 
-// ── The !update command ──────────────────────────────────────────────────────
-
-/** Exactly "!update" (case/spacing/punctuation tolerant). "!update the price" is not the command. */
-export function isUpdateCommand(text: string): boolean {
-  return /^!update\s*[.!]?\s*$/i.test(text.trim());
-}
-
 // ── The morning report ───────────────────────────────────────────────────────
 
 const MAX_REPORT_CHARS = 3800;
@@ -687,6 +686,8 @@ const REPORT_ATTENTION: Record<string, string> = {
   check_if_duplicate: "May be a duplicate order",
   staff_cancelled_in_chat: "Staff cancelled in chat — verify",
   staff_changed_in_chat: "Staff changed it in chat — check",
+  staff_change_unclear: "Staff wrote a change that was not understood — check chat",
+  customer_answer_unclear: "Customer's answer to a staff question was unclear — check chat",
   history_unresolved: "Refers to an earlier order — check",
 };
 
@@ -713,12 +714,21 @@ export function conflictValueText(field: EditableOrderField, v: unknown, max = 6
 
 /** "Customer now says day/time: Fri 30 Oct (staff set Thu 29 Oct)". */
 export function conflictText(field: EditableOrderField, c: FieldConflict, max = 60): string {
+  if (c.source === "staff_chat") return `${CONFLICT_LABEL[field]}: ${conflictValueText(field, c.proposed, max)} (the order has ${conflictValueText(field, c.current, max)}, edited by staff)`;
   return `${CONFLICT_LABEL[field]}: ${conflictValueText(field, c.proposed, max)} (staff set ${conflictValueText(field, c.current, max)})`;
+}
+
+/** Who raised the conflicts on an order: "customer", "staff_chat", or both. */
+export function conflictSources(o: Pick<TrackedOrder, "field_conflicts">): ("customer" | "staff_chat")[] {
+  return [...new Set(conflictFields(o).map((f) => o.field_conflicts[f]?.source ?? "customer"))];
 }
 
 /** The one warning the report may show for an order, or null. A contradicted staff value outranks everything else. */
 export function orderWarning(o: Pick<TrackedOrder, "attention"> & Partial<Pick<TrackedOrder, "field_conflicts">>): string | null {
-  if (o.field_conflicts && conflictFields({ field_conflicts: o.field_conflicts }).length > 0) return "Customer asked for a change — check before fulfilling";
+  if (o.field_conflicts && conflictFields({ field_conflicts: o.field_conflicts }).length > 0) {
+    const sources = conflictSources({ field_conflicts: o.field_conflicts });
+    return sources.length === 1 && sources[0] === "staff_chat" ? "Staff wrote a different detail in chat than the order has — check before fulfilling" : "Customer asked for a change — check before fulfilling";
+  }
   return o.attention ? (REPORT_ATTENTION[o.attention] ?? null) : null;
 }
 

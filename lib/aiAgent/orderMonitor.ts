@@ -45,7 +45,7 @@ const ORDER_SIGNAL =
 
 /** Words a staff message may use about an existing order. */
 const STAFF_SIGNAL =
-  /\d|\b(confirm\w*|cancel\w*|deliver\w*|collect\w*|ready|total|price|cost|bags?|kg|order\w*|address|tomorrow|today|tonight|noted|dispatch\w*|done|sorted|all set|out of stock|don'?t have|only have|change\w*|instead)\b/i;
+  /\d|\b(confirm\w*|cancel\w*|deliver\w*|collect\w*|bring\w*|send\w*|book\w*|pick\s?up|put you down|ready|total|price|cost|bags?|kg|order\w*|address|tomorrow|today|tonight|noted|dispatch\w*|done|sorted|all set|out of stock|don'?t have|only have|change\w*|instead)\b/i;
 
 const MEDIA_PLACEHOLDER = "(media message without text)";
 
@@ -129,15 +129,20 @@ export const MONITOR_FILTERED_PREFIX = "orders_monitor_skipped_";
 export type StaffAction = "confirms" | "cancels" | "changes";
 
 /**
- * What a staff message in the chat may do to an order: raise a flag for a person to verify. It never confirms,
- * cancels or edits the order (the business phone cannot say WHO wrote, and staff verification stays the rule), and it
- * never creates an order: a message staff wrote is not the customer's request.
+ * What a staff message in the chat may do to an order. A confirmation or cancellation only raises a flag for a person to verify
+ * (the business phone cannot say WHO wrote, and staff verification stays the rule). A specific change it states (a product,
+ * quantity, address, delivery or collection, a day) is applied by lib/server/aiAgent/orders.ts applyStaffChanges; the generic
+ * "staff changed it in chat" warning is no longer raised: only a change that could NOT be understood is flagged, as
+ * `staff_change_unclear`, with the staff words kept in the order's history. A staff message never creates an order.
  */
 export const STAFF_ACTION_ATTENTION: Record<StaffAction, string> = {
   confirms: "staff_confirmed_in_chat",
   cancels: "staff_cancelled_in_chat",
-  changes: "staff_changed_in_chat",
+  changes: "staff_change_unclear",
 };
+
+/** Warnings an understood staff change makes obsolete. `staff_changed_in_chat` is the retired generic one; old orders may still carry it. */
+export const STAFF_CHANGE_FLAGS: readonly string[] = ["staff_changed_in_chat", "staff_change_unclear"];
 
 /** Flags that must not be replaced by a staff flag: they say the CUSTOMER changed or withdrew something. */
 const STRONGER_ATTENTION = new Set(["changed_after_confirmation", "cancellation_requested"]);

@@ -375,7 +375,7 @@ describe("order corrections and bulk completion (real server code, real SQL)", {
     test("stale: any change to the order after the preview voids the proposal", async () => {
       const o = await makeOrder(JANE);
       const code = await propose(o);
-      await groupSays(`!update ${ref(o)} 3 bags`); // a staff command bumps the order's version
+      await groupSays(`!order ${ref(o)} 3 bags`); // a staff command bumps the order's version
       assert.match(reply(await groupSays(`!confirm ${code}`)), /changed since .* was proposed — nothing applied/);
       const after = await orderById(o.id);
       assert.deepEqual([after.delivery_address, after.items[0].quantity], ["Cap Estate", "3"]);
@@ -600,7 +600,7 @@ describe("order corrections and bulk completion (real server code, real SQL)", {
     test("an order that changes after the preview is skipped and reported, not completed; the rest are", async () => {
       const o = await seed();
       const code = codeIn(reply(await groupSays("!orders complete all")), "B");
-      await groupSays(`!update ${ref(o.b)} 4 bags`);
+      await groupSays(`!order ${ref(o.b)} 4 bags`);
       const done = reply(await groupSays(`!confirm ${code}`));
       assert.match(done, /Completed: 1/);
       assert.match(done, new RegExp(`Skipped: 1\\n• ${ref(o.b)} — changed after the preview`));
@@ -611,7 +611,7 @@ describe("order corrections and bulk completion (real server code, real SQL)", {
     test("a cancelled-meanwhile order is skipped", async () => {
       const o = await seed();
       const code = codeIn(reply(await groupSays("!orders complete all")), "B");
-      await groupSays(`!update ${ref(o.a)} cancelled`);
+      await groupSays(`!order ${ref(o.a)} cancelled`);
       const done = reply(await groupSays(`!confirm ${code}`));
       assert.match(done, new RegExp(`${ref(o.a)} — now cancelled`));
       assert.equal((await orderById(o.a.id)).status, "cancelled");
@@ -702,8 +702,8 @@ describe("order corrections and bulk completion (real server code, real SQL)", {
       assert.match(reply(await groupSays("!orders all")), /ALL OUTSTANDING ORDERS/);
       assert.match(reply(await groupSays(`!order ${ref(o)}`)), /Status:/);
       assert.match(reply(await groupSays("!order Jane")), /active order|No active order/);
-      assert.match(reply(await groupSays(`!update ${ref(o)} 2 bags`)), /quantity 1 → 2/);
-      assert.match(reply(await groupSays(`!update ${ref(o)} confirmed`)), /confirmed \(internal staff confirmation\)/);
+      assert.match(reply(await groupSays(`!order ${ref(o)} 2 bags`)), /quantity 1 → 2/);
+      assert.match(reply(await groupSays(`!order ${ref(o)} confirmed`)), /confirmed \(internal staff confirmation\)/);
       assert.match(reply(await groupSays(`!order ${ref(o)} completed`)), /completed\. It no longer shows in !orders/);
       assert.match(reply(await groupSays(`!order ${ref(o)} reopen`)), /reopened/);
       assert.match(reply(await groupSays("!orders sideways")), /!orders shows what is outstanding/);

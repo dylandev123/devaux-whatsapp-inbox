@@ -31,7 +31,7 @@ export async function GET(request: Request) {
       batchingEnabled: row.batching_enabled === true,
       batchQuietSeconds: row.batch_quiet_seconds,
       batchMaxWaitSeconds: row.batch_max_wait_seconds,
-      // Daily order summary. ordersGroupJid is where the summary goes and where "!update" is honoured (null = the
+      // Daily order summary. ordersGroupJid is where the summary goes and where the order commands are honoured (null = the
       // staff group). A group other than staffGroupJid must also be forwarded to /message.
       ordersSummaryEnabled: row.orders_summary_enabled === true,
       ordersGroupJid: row.orders_summary_enabled === true && row.orders_group_jid ? row.orders_group_jid : null,

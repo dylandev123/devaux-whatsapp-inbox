@@ -331,7 +331,7 @@ export const CORRECTION_REPLY = {
   ambiguous: (o: TrackedOrder, names: OrderNames | undefined, ambiguities: string[]) =>
     [`❓ I could not safely turn that into a change for ${labelOf(o, names)}. Nothing changed.`, ...ambiguities.map((a) => `• ${a}`), "Say it again with the exact product, quantity, place or day.", "Example: !order #REF teach Jason wants 2 Birbo Meat 25kg delivered to Gros Islet"].join("\n"),
   nothing: (o: TrackedOrder, names: OrderNames | undefined) => `ℹ️ ${labelOf(o, names)} already matches that — nothing to change.`,
-  unavailable: () => "⚠️ I could not read that instruction right now (the assistant is unavailable). Nothing changed. Try again, or use !update #REF …",
+  unavailable: () => "⚠️ I could not read that instruction right now (the assistant is unavailable). Nothing changed. Try again, or use !order #REF …",
   closed: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is ${o.status === "fulfilled" ? "completed" : o.status} — it cannot be corrected. Reopen it first if needed (!order ${displayRef(o.ref_code)} reopen).`,
   applied: (o: TrackedOrder, names: OrderNames | undefined, plan: PlannedChange[], reusable: ReusableSuggestion[]) =>
     [

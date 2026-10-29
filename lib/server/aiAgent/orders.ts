@@ -4,7 +4,6 @@
 //   * trackOrders()        folds one customer turn's model draft into the orders (no extra model call).
 //   * updateOrderManually  staff corrections, confirmation, fulfilment, cancellation (audited).
 //   * runDueOrderSummaries the 8 AM job (idempotent per business per local day; safe to call from anywhere).
-//   * handleUpdateCommand  "!update" in the orders group.
 //
 // Nothing here ever creates a customer-bound message: the only outbox rows are order summaries and refusals
 // addressed to the orders / staff group.
@@ -20,7 +19,7 @@ import {
   OrderRequestDraft,
   outboxAllowed,
 } from "@/lib/aiAgent/engine";
-import { groundOrderDraft, quantityStated } from "@/lib/aiAgent/escalationUpdates";
+import { groundOrderDraft, normalizeText, quantityStated } from "@/lib/aiAgent/escalationUpdates";
 import { SenderAuthorization } from "@/lib/aiAgent/identity";
 import {
   moreInfoReply,
@@ -34,6 +33,21 @@ import {
   searchReply,
 } from "@/lib/aiAgent/orderCommands";
 import { BULK_HELP, TEACH_HELP } from "@/lib/aiAgent/orderTeach";
+import {
+  type ConversationAnswer,
+  type ConfirmedProduct,
+  isGenericProduct,
+  isUnspecificLine,
+  latestConfirmedProduct,
+  mergeStaffItems,
+  patchWithProduct,
+  patchWithQuantity,
+  type ProductSource,
+  resolveConversationAnswer,
+  resolveGenericProduct,
+  staffStatesCommitment,
+  staffSubstitutes,
+} from "@/lib/aiAgent/orderConversation";
 import {
   acceptModelHistoryLine,
   cueActive,
@@ -51,7 +65,7 @@ import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote
 import { classifyOrderIntent, INTENT_REASON_CODE, staffRecentlyOfferedDelivery } from "@/lib/aiAgent/orderIntent";
 import { agreedDeliveryDate, type ConversationLine, isAffirmation } from "@/lib/aiAgent/staffDelivery";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
-import { buildOrdersView, buildUpdateSummary, countOrders, dayContext, type OrderEventRow, orderDate, type OrdersView, summarizeUpdates } from "@/lib/aiAgent/orderViews";
+import { buildOrdersView, type OrdersView, orderDate } from "@/lib/aiAgent/orderViews";
 import {
   coverageWarning,
   type Coverage,
@@ -81,13 +95,14 @@ import {
   planOrderUpdate,
   resolveOrderTarget,
   sameLineProduct,
+  sameLines,
   scheduleState,
   toLine,
   TrackedOrder,
   turnDrafts,
   turnIsConfirmation,
 } from "@/lib/aiAgent/orders";
-import { MONITOR_BUDGET_REASON, MONITOR_FAILED_REASONS, MONITOR_FILTERED_PREFIX, MONITOR_GATE_REASONS, monitorEligibleChat, type StaffAction, staffFlagFor } from "@/lib/aiAgent/orderMonitor";
+import { MONITOR_BUDGET_REASON, MONITOR_FAILED_REASONS, MONITOR_FILTERED_PREFIX, MONITOR_GATE_REASONS, monitorEligibleChat, type StaffAction, STAFF_CHANGE_FLAGS, staffFlagFor } from "@/lib/aiAgent/orderMonitor";
 import { BLOCK_REASONS, failureReason, outboxState } from "@/lib/aiAgent/outboxStatus";
 import { agentDb, audit, loadSettings } from "@/lib/server/aiAgent/db";
 import { enqueue, OutboxInsert, OutboxRow } from "@/lib/server/aiAgent/outbox";
@@ -645,6 +660,32 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     }
   }
 
+  // 0b. A short reply to a question staff asked ("Which bag did you want, Bandit 25kg?" / "Yes, that one."; "Where to?" / "Cap Estate";
+  //     "How many?" / "two"). Read from the conversation by rules, no model call. The answer completes the ONE order it belongs to; a
+  //     staff suggestion nobody answered is never taken as the customer's choice; two products and a bare yes picks neither. The reply
+  //     is consumed by the question it answers: it is neither a new order nor an order confirmation.
+  if (args.allowConfirmation !== false && (args.recent ?? []).some((m) => m.who === "Staff")) {
+    const answerHistory = args.history ?? (await loadCustomerHistory(businessSlug, args.chatIds ?? [chatId], args.phone).catch(() => []));
+    const known = [...reliableHistory(answerHistory).flatMap((o) => o.items), ...open.flatMap((o) => o.items)];
+    const reading = resolveConversationAnswer({ segments, at: args.lastAt, recent: args.recent ?? [], quotedId: args.quotedId, known });
+    if (reading?.status === "ambiguous") {
+      result.reasons.push("order_answer_ambiguous");
+      if (await flagUnclearAnswer({ businessSlug, chatId, question: reading.staff, reason: reading.reason, customerText: segments.join(" "), key: `${args.dedupeBase}:answerflag`, messageIds: args.messageIds })) result.applied += 1;
+      return result;
+    }
+    if (reading?.status === "answer") {
+      const done = await applyConversationAnswer({ businessSlug, open, answer: reading.answer, key: `${args.dedupeBase}:answer`, messageIds: args.messageIds, at: args.lastAt });
+      result.reasons.push(...done.reason.split(","));
+      if (done.written) {
+        result.applied += 1;
+        result.reasons.push("orders_tracked");
+      }
+      // Answered (or deliberately left alone): the reply was an answer, not a new request. Only a reply that fits no open order
+      // falls through to the usual reading.
+      if (done.reason !== "order_answer_no_order" && done.reason !== "order_answer_not_needed") return result;
+    }
+  }
+
   // 1. A customer's yes. It is attributed to an order only when there is exactly ONE open order in the chat and it
   //    is complete and awaiting confirmation: with anything else open, "yes" could mean any of them, so nothing
   //    changes (the model's guess at which order is meant is deliberately not trusted for this). It needs a
@@ -695,9 +736,14 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   const mayFillLocation =
     args.useHistory !== false && intentOk && !cue.elsewhere && (drafts.some((d) => !d.draft.delivery_address) || open.some((o) => !o.delivery_address && o.fulfilment_method !== "collection"));
   let history: HistoryOrder[] = args.useHistory === false ? [] : (args.history ?? []);
-  if (args.useHistory !== false && args.history === undefined && (pointsBack || mayFillLocation)) {
+  // "Send me one bag": a request that names no product is resolved from the customer's verified purchases, so they are needed.
+  const namesNoProduct = drafts.some((d) => d.draft.items.some((i) => isGenericProduct(toLine(i))));
+  if (args.useHistory !== false && args.history === undefined && (pointsBack || mayFillLocation || namesNoProduct)) {
     history = await loadCustomerHistory(businessSlug, args.chatIds ?? [chatId], args.phone).catch(() => []);
   }
+  // The product the customer explicitly confirmed in this conversation (a staff question that named it, and their yes): it comes
+  // before any statistic from their past orders when a request names no product.
+  const confirmedInChat: ConfirmedProduct | null = namesNoProduct ? latestConfirmedProduct(args.recent ?? [], [...reliableHistory(history).flatMap((o) => o.items), ...open.flatMap((o) => o.items)]) : null;
   // The staff-saved default delivery location answers "same place" / "usual location" before any earlier order does.
   // Read-only here: nothing in the order flow can change it (only the staff !location command does).
   const savedLocation = cue.sameLocation || mayFillLocation ? await loadStaffLocationSafe(businessSlug, [...(args.phone ? [args.phone] : []), ...(args.chatIds ?? [chatId]).map((id) => `chat:${id}`)]) : null;
@@ -773,6 +819,22 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
         .filter((l) => !inferredLines.some((i) => sameLineProduct(toLine(i), toLine(l)))),
       ...inferredLines,
     ];
+    // "Send me one bag": a request that names no product. The product on this order, else the one the customer confirmed in this
+    // conversation, else their only verified purchase. Several plausible products is never a choice: it stays unresolved for a person,
+    // and the order records why a product was picked (history entry `product_source`).
+    const genericUnresolved: string[] = [];
+    const productSources: ProductSource[] = [];
+    const specificSiblings = grounded.items.some((i) => !isGenericProduct(toLine(i)));
+    grounded.items = grounded.items.flatMap((item) => {
+      const res = resolveGenericProduct({ line: toLine(item), held: specificSiblings ? [] : (existing?.items ?? []), confirmed: confirmedInChat, pool });
+      if (res.kind === "keep") return [item];
+      if (res.kind === "unresolved" || specificSiblings) {
+        genericUnresolved.push(res.kind === "unresolved" ? res.reason : `items: “${item.product}” names no product`);
+        return [];
+      }
+      productSources.push(res.source);
+      return [{ product: res.line.product, quantity: item.quantity, ...(res.line.variant ? { variant: res.line.variant } : {}), ...(res.line.size ? { size: res.line.size } : {}) }];
+    });
     // Plainly stated quantities and delivery/collection are recorded even when the model left them out.
     const refined = refineOrderDraft(grounded, segments, args.customerWords);
     // Is this really an order? An invoice, quotation, price or product discussion names products without anyone asking for a
@@ -820,7 +882,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
         : { items: [], address: null, setDelivery: false, clearAddress: false, sources: {}, unresolved: [] };
     const planned = fillFor(existing);
     const hasContent = refined.items.length > 0 || planned.items.length > 0 || Boolean(existing);
-    const noteOnly = !hasContent && cue.repeat !== null && planned.unresolved.length > 0;
+    const noteOnly = !hasContent && (cue.repeat !== null && planned.unresolved.length > 0 || genericUnresolved.length > 0);
     // Nothing the customer said or their records can answer, and nothing to attach it to: no order is invented.
     if (!hasContent && !noteOnly) {
       if (pointsBack) result.reasons.push("order_history_unresolved");
@@ -886,7 +948,8 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       const conflictsChanged = merged.conflicts.some((c) => JSON.stringify(cur?.field_conflicts?.[c.field]?.proposed ?? null) !== JSON.stringify(c.after));
       const plan = planOrderUpdate({ existing: cur, fields, contentChanged: changed, customerTexts: segments, outboundSinceAwaiting: false, now });
       // Pointing at an earlier order that could not be matched safely is for a person to look at; never guessed.
-      const unresolvedFlag = fill.unresolved.length > 0 && !plan.attention ? "history_unresolved" : null;
+      const unresolved = [...fill.unresolved, ...genericUnresolved];
+      const unresolvedFlag = unresolved.length > 0 && !plan.attention ? "history_unresolved" : null;
       const baseAttention = !cur && resolved.kind === "create" && resolved.flag ? resolved.flag : (unresolvedFlag ?? plan.attention);
       // A doubtful new order is held for review (on no delivery list); a later plain request on a held order releases it.
       const releasesReview = Boolean(cur) && cur!.attention === ORDER_REVIEW_ATTENTION && clearsReview;
@@ -895,14 +958,14 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       if (cur && plan.event === "no_change" && !changed && !conflictsChanged && !flagged && !confirmsAddress && !releasesReview) return null;
       const finalPlan = { ...plan, attention };
       const itemsChanged = merged.changes.some((c) => c.field === "items");
-      const inferredItems = [...(fillItems.length > 0 && fill.sources.items ? [fill.sources.items] : []), ...nominatedRefs, ...upgradedRefs];
+      const inferredItems = [...(fillItems.length > 0 && fill.sources.items ? [fill.sources.items] : []), ...nominatedRefs, ...upgradedRefs, ...productSources.flatMap((x) => (x.source === "order_history" ? [x.ref] : []))];
       const inferred = {
         ...(itemsChanged && inferredItems.length > 0 ? { items: [...new Set(inferredItems)] } : {}),
         ...(historyAddress && fill.sources.delivery_address && merged.changes.some((c) => c.field === "delivery_address") ? { delivery_address: fill.sources.delivery_address } : {}),
-        ...(fill.unresolved.length > 0 ? { unresolved: fill.unresolved } : {}),
+        ...(unresolved.length > 0 ? { unresolved } : {}),
       };
       if (Object.keys(inferred).length > 0) {
-        const code = fill.unresolved.length > 0 ? "order_history_unresolved" : "order_history_used";
+        const code = unresolved.length > 0 ? "order_history_unresolved" : "order_history_used";
         if (!result.reasons.includes(code)) result.reasons.push(code);
       }
       return {
@@ -925,6 +988,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
           ...(cur && cur.status !== finalPlan.status ? { status: { before: cur.status, after: finalPlan.status } } : {}),
           ...(cur && cur.attention !== finalPlan.attention && (cur.attention === ORDER_REVIEW_ATTENTION || finalPlan.attention === ORDER_REVIEW_ATTENTION) ? { attention: { before: cur.attention, after: finalPlan.attention } } : {}),
           ...(Object.keys(inferred).length > 0 ? { inferred: { before: null, after: inferred } } : {}),
+          ...(itemsChanged && productSources.length > 0 ? { product_source: { before: null, after: productSources } } : {}),
           ...(created && created.defaulted.length > 0 ? { defaulted: { before: null, after: { fields: created.defaulted, basis: ctx.firstAt, timezone: tz } } } : {}),
         },
       };
@@ -1069,6 +1133,325 @@ export async function applyDeliveryDay(a: DeliveryDayArgs): Promise<{ applied: b
     if (res.result === "duplicate" || res.result === "not_found") return { applied: false, reason: "orders_monitor_already_applied" };
   }
   return { applied: false, reason: "order_write_conflict" };
+}
+
+
+// ── Answers to staff questions, and what staff state, written into an order ──
+
+type PatchField = "items" | "delivery_address" | "fulfilment_method";
+
+export interface FieldPatchArgs {
+  businessSlug: string;
+  orderId: string;
+  chatId: string;
+  patch: Partial<Pick<OrderFields, PatchField>>;
+  /** Fields that are recorded as a conflict for a person even though they are not locked (a different specific product). */
+  asConflict?: PatchField[];
+  event: string;
+  actor: "customer" | "staff";
+  key: string;
+  messageIds: string[];
+  /** When the message that caused this was written. A delayed message never moves "last customer activity" backwards. */
+  at: string;
+  conflictSource: "customer" | "staff_chat";
+  /** The words it came from (clipped), kept beside any conflict. */
+  evidence: string;
+  /** Extra entries for the order's history: where the value came from. */
+  provenance: Record<string, unknown>;
+  /** Attention flags this change makes obsolete (a retired generic staff warning). */
+  clearFlags?: readonly string[];
+}
+
+export interface FieldPatchResult {
+  /** A history event was written (fields changed and/or a conflict was recorded). */
+  written: boolean;
+  changed: PatchField[];
+  conflicted: PatchField[];
+  reason: string;
+}
+
+const patchValueSame = (field: PatchField, a: unknown, b: unknown): boolean =>
+  field === "items" ? sameLines(a as OrderLine[], b as OrderLine[]) : field === "delivery_address" ? normalizeText(String(a ?? "")) === normalizeText(String(b ?? "")) : a === b;
+
+/**
+ * The one way a conversation answer or a staff statement reaches an order. What it will not do, whoever asks:
+ *   * overwrite a field a person edited (locked): the proposed value is recorded as a specific conflict, with the words it came from;
+ *   * replace a value with an older message's: when a newer customer message was already processed, only EMPTY fields are filled;
+ *   * lock anything (the dashboard's edit lock is for people), message anyone, or change the order's identity.
+ * Version-checked and idempotent through `applyOrder`; a retried or duplicated message changes nothing the second time.
+ */
+export async function applyFieldPatch(a: FieldPatchArgs): Promise<FieldPatchResult> {
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    const fresh = (await loadOpenOrders(a.businessSlug, a.chatId)).find((o) => o.id === a.orderId);
+    if (!fresh) return { written: false, changed: [], conflicted: [], reason: "order_answer_order_closed" };
+    const customer = a.actor === "customer";
+    // A newer customer message has already been processed: this one is late, and may fill gaps but never replace.
+    const late = customer && Date.parse(fresh.last_message_at) > Date.parse(a.at);
+    const fields: OrderFields = { ...fieldsOf(fresh), items: [...fresh.items] };
+    const changes: FieldChange[] = [];
+    const conflicts: FieldConflicts = { ...(fresh.field_conflicts ?? {}) };
+    const conflicted: PatchField[] = [];
+    for (const field of Object.keys(a.patch) as PatchField[]) {
+      const next = a.patch[field];
+      if (next === undefined) continue;
+      const before = fresh[field];
+      if (patchValueSame(field, next, before)) continue;
+      const filled = field === "items" ? fresh.items.length > 0 : Boolean(before);
+      if (fresh.manual_locked_fields.includes(field) || a.asConflict?.includes(field)) {
+        if (late) continue;
+        conflicts[field] = { proposed: next, current: before, at: a.at, source: a.conflictSource, evidence: a.evidence.slice(0, 200) };
+        conflicted.push(field);
+        continue;
+      }
+      if (late && filled) continue;
+      (fields as unknown as Record<string, unknown>)[field] = next;
+      changes.push({ field, before, after: next });
+    }
+    const conflictsChanged = conflicted.some((f) => JSON.stringify(fresh.field_conflicts?.[f]?.proposed ?? null) !== JSON.stringify(conflicts[f]?.proposed ?? null));
+    if (changes.length === 0 && !conflictsChanged) return { written: false, changed: [], conflicted: [], reason: late ? "order_answer_superseded" : "order_answer_no_change" };
+
+    const base = {
+      status: fresh.status,
+      attention: fresh.attention,
+      awaitingSince: fresh.awaiting_since,
+      missing: computeMissing(fields),
+      event: "no_change" as const,
+      confirmedByCustomer: false,
+      customerConfirmedAt: fresh.customer_confirmed_at,
+    };
+    // The customer completing their own order is a content change like any other (a confirmed order needs re-confirming); staff
+    // stating what they will do is not: the order keeps its status.
+    const plan = changes.length > 0 && customer ? { ...planOrderUpdate({ existing: fresh, fields, contentChanged: true, customerTexts: [], outboundSinceAwaiting: false, now: new Date(a.at) }), } : base;
+    // Someone answered a question about this order, or staff stated its details: it is plainly an order, and a retired warning is understood.
+    const clearsFlag = changes.length > 0 && (fresh.attention === ORDER_REVIEW_ATTENTION || Boolean(fresh.attention && a.clearFlags?.includes(fresh.attention)));
+    const attention = clearsFlag ? null : plan.attention;
+    const lastAt = customer ? new Date(Math.max(Date.parse(a.at) || 0, Date.parse(fresh.last_message_at) || 0)).toISOString() : fresh.last_message_at;
+    const res = await applyOrder({
+      businessSlug: a.businessSlug,
+      key: a.key,
+      existing: fresh,
+      row: rowFrom(fresh, fields, { ...plan, attention }, { chatId: fresh.chat_id, phone: fresh.contact_number, messageIds: a.messageIds, firstAt: fresh.first_message_at, lastAt, conflicts }),
+      event: changes.length === 0 ? "locked_field_conflict" : a.event,
+      actorKind: a.actor,
+      actorId: null,
+      changes: {
+        ...diff(changes),
+        ...(conflictsChanged ? { field_conflicts: { before: fresh.field_conflicts ?? {}, after: conflicts } } : {}),
+        ...(fresh.status !== plan.status ? { status: { before: fresh.status, after: plan.status } } : {}),
+        ...(fresh.attention !== attention ? { attention: { before: fresh.attention, after: attention } } : {}),
+        ...a.provenance,
+      },
+      messageIds: a.messageIds,
+    });
+    if (res.result === "applied") return { written: true, changed: changes.map((c) => c.field as PatchField), conflicted, reason: changes.length > 0 ? "applied" : "conflict" };
+    if (res.result === "duplicate" || res.result === "not_found") return { written: false, changed: [], conflicted: [], reason: "orders_monitor_already_applied" };
+    // conflict: someone changed the order meanwhile; read it again and decide again.
+  }
+  return { written: false, changed: [], conflicted: [], reason: "order_write_conflict" };
+}
+
+/** Raises one attention flag on an order, for a person. Never changes its content or status. */
+async function raiseFlag(a: { businessSlug: string; order: TrackedOrder; flag: string; actor: "customer" | "staff"; event: string; key: string; messageIds: string[]; extra: Record<string, unknown> }): Promise<boolean> {
+  let order = a.order;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    if (order.attention === a.flag) return false;
+    const plan = { status: order.status, attention: a.flag, awaitingSince: order.awaiting_since, missing: computeMissing(fieldsOf(order)), event: "attention_flagged" as const, confirmedByCustomer: false, customerConfirmedAt: order.customer_confirmed_at };
+    const res = await applyOrder({
+      businessSlug: a.businessSlug,
+      key: a.key,
+      existing: order,
+      row: rowFrom(order, fieldsOf(order), plan, { chatId: order.chat_id, phone: order.contact_number, messageIds: a.messageIds, firstAt: order.first_message_at, lastAt: order.last_message_at }),
+      event: a.event,
+      actorKind: a.actor,
+      actorId: null,
+      changes: { attention: { before: order.attention, after: a.flag }, ...a.extra },
+      messageIds: a.messageIds,
+    });
+    if (res.result === "applied") return true;
+    if (res.result === "duplicate" || res.result === "not_found") return false;
+    const again = (await loadOpenOrders(a.businessSlug, order.chat_id)).find((o) => o.id === order.id);
+    if (!again) return false;
+    order = again;
+  }
+  return false;
+}
+
+const answerSourceEntry = (answer: ConversationAnswer) => ({
+  answer_source: {
+    before: null,
+    after: {
+      kind: answer.kind,
+      how: answer.kind === "product" ? answer.how : "answer",
+      question: answer.staff.text,
+      question_at: answer.staff.at,
+      question_message_id: answer.staff.id,
+      answer: answer.customerText,
+    },
+  },
+});
+
+export interface AnswerArgs {
+  businessSlug: string;
+  open: TrackedOrder[];
+  answer: ConversationAnswer;
+  key: string;
+  messageIds: string[];
+  at: string;
+}
+
+/**
+ * A customer's answer to a staff question, written into the order it belongs to. Exactly one order must need that detail (or the chat
+ * must have exactly one open order); with more, nothing is guessed. A product the order already contradicts, or a field staff edited,
+ * becomes a specific conflict instead of a write.
+ */
+export async function applyConversationAnswer(a: AnswerArgs): Promise<{ reason: string; written: boolean }> {
+  const { answer, open } = a;
+  if (open.length === 0) return { reason: "order_answer_no_order", written: false };
+  const pick = (needs: (o: TrackedOrder) => boolean): TrackedOrder | null => {
+    const needing = open.filter(needs);
+    return needing.length === 1 ? needing[0] : needing.length === 0 && open.length === 1 ? open[0] : null;
+  };
+  let order: TrackedOrder | null = null;
+  let patch: FieldPatchArgs["patch"] = {};
+  let asConflict: PatchField[] | undefined;
+  if (answer.kind === "address") {
+    order = pick((o) => o.fulfilment_method !== "collection" && !o.delivery_address);
+    if (order?.fulfilment_method === "collection") return { reason: "order_answer_not_needed", written: false };
+    patch = { delivery_address: answer.address };
+  } else if (answer.kind === "quantity") {
+    order = pick((o) => o.items.some((i) => !i.quantity));
+    if (order) {
+      const next = patchWithQuantity(order.items, answer.quantity);
+      if (next.kind === "unclear") return { reason: "order_answer_ambiguous", written: false };
+      if (next.kind === "same") return { reason: "order_answer_no_change", written: false };
+      if (next.kind === "patch") patch = { items: next.items };
+    }
+  } else {
+    order = pick((o) => o.items.length === 0 || o.items.some(isGenericProduct) || (answer.open && o.items.some(isUnspecificLine)));
+    if (order) {
+      const next = patchWithProduct(order.items, answer.line, answer.open);
+      if (next.kind === "unclear") return { reason: "order_answer_ambiguous", written: false };
+      if (next.kind === "same") return { reason: "order_answer_no_change", written: false };
+      patch = { items: next.kind === "patch" ? next.items : next.proposed };
+      if (next.kind === "conflict") asConflict = ["items"];
+    }
+  }
+  if (!order) return { reason: "order_answer_ambiguous_order", written: false };
+  const done = await applyFieldPatch({
+    businessSlug: a.businessSlug,
+    orderId: order.id,
+    chatId: order.chat_id,
+    patch,
+    asConflict,
+    event: "conversation_answer",
+    actor: "customer",
+    key: a.key,
+    messageIds: [...new Set([...a.messageIds, ...(answer.staff.id ? [answer.staff.id] : [])])],
+    at: a.at,
+    conflictSource: "customer",
+    evidence: answer.customerText,
+    provenance: answerSourceEntry(answer),
+  });
+  const reason = done.reason === "applied" ? `order_answer_applied_${answer.kind}` : done.reason === "conflict" ? "order_answer_conflict" : done.reason;
+  return { reason: done.conflicted.length > 0 && done.changed.length > 0 ? `${reason},order_answer_conflict` : reason, written: done.written };
+}
+
+/** The customer replied to a staff question but the reply did not make the answer clear: one flag on the order it is about, with the question in its history. */
+export async function flagUnclearAnswer(a: { businessSlug: string; chatId: string; question: { text: string; at: string; id: string | null }; reason: string; customerText: string; key: string; messageIds: string[] }): Promise<boolean> {
+  const open = await loadOpenOrders(a.businessSlug, a.chatId);
+  if (open.length !== 1) return false;
+  const order = open[0];
+  // A flag that says the customer changed or withdrew something is stronger, and is kept.
+  if (order.attention && order.attention !== ORDER_REVIEW_ATTENTION) return false;
+  return raiseFlag({
+    businessSlug: a.businessSlug,
+    order,
+    flag: "customer_answer_unclear",
+    actor: "customer",
+    event: "attention_flagged",
+    key: a.key,
+    messageIds: [...a.messageIds, ...(a.question.id ? [a.question.id] : [])],
+    extra: { answer_unclear: { before: null, after: { reason: a.reason.slice(0, 200), question: a.question.text, question_at: a.question.at, answer: a.customerText } } },
+  });
+}
+
+export interface StaffChangeArgs {
+  businessSlug: string;
+  chatId: string;
+  /** The reference the model named, or null. With several open orders and no valid reference nothing is guessed. */
+  target: string | null;
+  text: string;
+  messageId: string;
+  at: string;
+  key: string;
+  changes: { order: OrderRequestDraft; unresolved: string | null };
+}
+
+/**
+ * Something staff STATED about an order in the customer's chat ("we'll send 2 bags of Bandit 25kg", "delivering to Cap Estate", "I've put
+ * you down for collection"). A statement only: a question, an offer or a hedge changes nothing. Every value must be in the staff words
+ * (groundOrderDraft), edits staff made in the dashboard are never overwritten (they become a specific conflict), the change is written
+ * with the staff message as its source, and nobody is messaged. The retired generic "staff changed it in chat" warning is not raised:
+ * a statement that could not be understood is flagged as such, with the staff words in the order's history.
+ */
+export async function applyStaffChanges(a: StaffChangeArgs): Promise<{ reason: string; written: boolean }> {
+  const open = await loadOpenOrders(a.businessSlug, a.chatId);
+  const named = a.target ? open.find((o) => o.ref_code.toLowerCase() === a.target!.toLowerCase()) : undefined;
+  const order = named ?? (open.length === 1 ? open[0] : null);
+  if (!order) return { reason: open.length === 0 ? "orders_monitor_skipped_no_open_order" : "orders_monitor_staff_ambiguous", written: false };
+  if (!staffStatesCommitment(a.text)) return { reason: "orders_monitor_staff_not_a_commitment", written: false };
+
+  const grounded = groundOrderDraft(a.changes.order, asDraft(order), [a.text]);
+  const patch: FieldPatchArgs["patch"] = {};
+  const lines = (grounded?.items ?? []).map(toLine);
+  const stated = lines.filter((l) => !order.items.some((o) => sameLines([o], [l])));
+  const items = stated.length > 0 ? mergeStaffItems(order.items, stated, staffSubstitutes(a.text)) : null;
+  if (items) patch.items = items;
+  if (grounded?.delivery_address && normalizeText(grounded.delivery_address) !== normalizeText(order.delivery_address ?? "")) patch.delivery_address = grounded.delivery_address;
+  const method = fulfilmentMethod(groundDeliveryPreference(a.changes.order.delivery_preference, [a.text]));
+  if (method && method !== order.fulfilment_method) patch.fulfilment_method = method;
+
+  if (Object.keys(patch).length === 0) {
+    // Staff clearly stated a change that nothing here could map to a field: a person should look, with the staff words attached.
+    if (a.changes.unresolved) {
+      const flagged = await flagStaffUnclear({ businessSlug: a.businessSlug, order, text: a.text, messageId: a.messageId, key: a.key, why: a.changes.unresolved });
+      return { reason: flagged ? "orders_monitor_staff_unclear" : "orders_monitor_staff_no_change", written: flagged };
+    }
+    return { reason: "orders_monitor_staff_no_change", written: false };
+  }
+  const done = await applyFieldPatch({
+    businessSlug: a.businessSlug,
+    orderId: order.id,
+    chatId: order.chat_id,
+    patch,
+    event: "staff_change_applied",
+    actor: "staff",
+    key: a.key,
+    messageIds: [a.messageId],
+    at: a.at,
+    conflictSource: "staff_chat",
+    evidence: a.text,
+    clearFlags: STAFF_CHANGE_FLAGS,
+    provenance: { staff_message: { before: null, after: a.text.replace(/\s+/g, " ").trim().slice(0, 200) }, change_source: { before: null, after: { source: "staff_message", staff_message_id: a.messageId, staff_message_at: a.at } } },
+  });
+  const reason = done.reason === "applied" ? "orders_monitor_staff_change_applied" : done.reason === "conflict" ? "orders_monitor_staff_conflict" : done.reason;
+  return { reason: done.conflicted.length > 0 && done.changed.length > 0 ? `${reason},orders_monitor_staff_conflict` : reason, written: done.written };
+}
+
+async function flagStaffUnclear(a: { businessSlug: string; order: TrackedOrder; text: string; messageId: string; key: string; why: string }): Promise<boolean> {
+  if (a.order.attention === "staff_change_unclear") return false;
+  const flag = staffFlagFor("changes", a.order.attention);
+  if (!flag) return false;
+  return raiseFlag({
+    businessSlug: a.businessSlug,
+    order: a.order,
+    flag,
+    actor: "staff",
+    event: "staff_noted_in_chat",
+    key: a.key,
+    messageIds: [a.messageId],
+    extra: { staff_message: { before: null, after: a.text.replace(/\s+/g, " ").trim().slice(0, 200) }, staff_change_unclear: { before: null, after: a.why.slice(0, 200) } },
+  });
 }
 
 // ── Manual corrections (dashboard) ───────────────────────────────────────────
@@ -1598,7 +1981,7 @@ export async function listSummaryRuns(businessSlug: string, limit = 14) {
   });
 }
 
-/** Dashboard "Send summary now": a manual run, same path as !update. */
+/** Dashboard "Send summary now": a manual run of the same summary the 8 AM schedule posts. */
 export async function sendSummaryNow(settings: AgentSettings, requestedBy: string, kind: "admin" | "staff", now: Date = new Date()) {
   if (!canPostOrderSummary(settings)) return { ok: false as const, error: "The summary cannot be posted right now (turn it on, set a group, and check the agent mode)" };
   const recent = await recentManualRun(settings.business_slug, now);
@@ -1626,15 +2009,7 @@ async function recentManualRun(businessSlug: string, now: Date): Promise<boolean
   return (data ?? []).length > 0;
 }
 
-// ── "!update" ────────────────────────────────────────────────────────────────
-
-export const UPDATE_REFUSAL = {
-  unauthorized: "⛔ Only authorized staff can request an order update.",
-  disabled: "ℹ️ The order summary is not switched on for this business.",
-  other_group: "ℹ️ Order updates are posted in the Orders group.",
-  cooldown: "ℹ️ An order update was just posted.",
-  blocked: "⚠️ The order update could not be posted in the current mode.",
-} as const;
+// ── Order commands: shared context and replies ───────────────────────────────
 
 export interface UpdateCommandResult {
   outbox: OutboxInsert[];
@@ -1661,155 +2036,32 @@ export function groupReply(settings: AgentSettings, fromGroup: string, eventId: 
 }
 
 /**
- * The checks every order command passes first, in the same order and with the same rules as "!update": the feature is
- * on, the message is in the configured orders group, the sender is on the verified allow-list, and the agent may post
- * there in its current mode. Returns the refusal to post (or a silent no-op), or null when the command may proceed.
+ * The checks every order command passes first: the feature is on, the message is in the configured orders group, the sender is
+ * on the verified allow-list, and the agent may post there in its current mode. Returns the refusal to post (or a silent
+ * no-op), or null when the command may proceed.
  */
-export async function guardOrderCommand(ctx: CommandContext, mode: "update" | "command"): Promise<UpdateCommandResult | null> {
+export async function guardOrderCommand(ctx: CommandContext): Promise<UpdateCommandResult | null> {
   const { settings, fromGroup, senderAuth } = ctx;
   const slug = settings.business_slug;
   const target = ordersGroupJid(settings);
-  const rejected = mode === "update" ? "orders.update_rejected" : "orders.command_rejected";
-  const outcome = (what: string) => `orders:${mode}_${what}`;
-  // "!update" keeps its established refusal kind (feedback in the staff group); other commands answer with a notice, which
-  // every mode that can post to the group accepts.
-  const refuse = (text: string, what: string) => groupReply(settings, fromGroup, ctx.eventId, text, mode === "update" && fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", outcome(what));
+  const outcome = (what: string) => `orders:command_${what}`;
+  // Every mode that can post to the group accepts a notice.
+  const refuse = (text: string, what: string) => groupReply(settings, fromGroup, ctx.eventId, text, "staff_notice", outcome(what));
 
-  if (!settings.orders_summary_enabled) return refuse(UPDATE_REFUSAL.disabled, "disabled");
+  if (!settings.orders_summary_enabled) return refuse("ℹ️ The order summary is not switched on for this business.", "disabled");
   if (!target || fromGroup !== target) {
-    await audit(slug, "staff", ctx.senderJid, rejected, { type: "chat", id: fromGroup }, { reason: "wrong_group" });
-    return hasSeparateOrdersGroup(settings) && fromGroup === settings.staff_group_jid
-      ? refuse(mode === "update" ? UPDATE_REFUSAL.other_group : "ℹ️ Order commands are used in the Orders group.", "wrong_group")
-      : { outbox: [], queued: [], outcome: outcome("wrong_group") };
+    await audit(slug, "staff", ctx.senderJid, "orders.command_rejected", { type: "chat", id: fromGroup }, { reason: "wrong_group" });
+    return hasSeparateOrdersGroup(settings) && fromGroup === settings.staff_group_jid ? refuse("ℹ️ Order commands are used in the Orders group.", "wrong_group") : { outbox: [], queued: [], outcome: outcome("wrong_group") };
   }
   if (!senderAuth.authorized) {
-    await audit(slug, "staff", ctx.senderJid, rejected, { type: "chat", id: fromGroup }, { reason: "unauthorized", sender: senderAuth.senderId });
-    return refuse(mode === "update" ? UPDATE_REFUSAL.unauthorized : "⛔ Only authorized staff can use order commands.", "unauthorized");
+    await audit(slug, "staff", ctx.senderJid, "orders.command_rejected", { type: "chat", id: fromGroup }, { reason: "unauthorized", sender: senderAuth.senderId });
+    return refuse("⛔ Only authorized staff can use order commands.", "unauthorized");
   }
-  if (!canPostOrderSummary(settings)) return refuse(mode === "update" ? UPDATE_REFUSAL.blocked : "⚠️ Order commands can't be answered in the current mode, so nothing was changed.", "blocked");
+  if (!canPostOrderSummary(settings)) return refuse("⚠️ Order commands can't be answered in the current mode, so nothing was changed.", "blocked");
   return null;
 }
 
-// ── "!update": what is new or changed since the group was last shown ─────────
-
-/** The newest "!update" posts of one business, with the delivery state of the message that carried each. */
-async function recentUpdatePosts(businessSlug: string, groupJid: string, now: Date) {
-  const { data, error } = await agentDb()
-    .from("ai_agent_order_update_posts")
-    .select("id, event_id, window_start, window_end, outbox_id, created_at")
-    .eq("business_slug", businessSlug)
-    .eq("group_jid", groupJid)
-    .order("created_at", { ascending: false })
-    .limit(10);
-  if (error) throw new Error(error.message);
-  const posts = (data ?? []) as { id: string; event_id: string | null; window_start: string; window_end: string; outbox_id: string | null; created_at: string }[];
-  const ids = posts.map((p) => p.outbox_id).filter((id): id is string => Boolean(id));
-  const outbox = ids.length ? ((await agentDb().from("ai_agent_outbox").select("id, status, error, dispatched_at, created_at").in("id", ids)).data ?? []) : [];
-  return posts.map((p) => {
-    const o = outbox.find((x) => x.id === p.outbox_id);
-    return { ...p, delivery: o ? outboxState({ status: o.status, error: o.error, dispatched_at: o.dispatched_at, created_at: o.created_at }, now) : null };
-  });
-}
-
-/** How far back the first "!update" looks when nothing has ever been delivered to the group. */
-const FIRST_UPDATE_HOURS = 24;
-
-/**
- * "!update": a short list of orders that are new or materially changed since the last "!update" that PROVABLY reached the
- * group (a failed, blocked or unconfirmed one does not move the point, so nothing is lost; the cost is that a
- * possibly-delivered one is shown again). The point is shared by the group and is not a review: nothing here marks an order
- * seen, confirmed or completed, and the message says so. Read-only for orders; the only write is the post record.
- */
-export async function handleUpdateCommand(args: {
-  settings: AgentSettings;
-  fromGroup: string;
-  senderAuth: SenderAuthorization;
-  senderJid: string | null;
-  eventId: string;
-  now?: Date;
-}): Promise<UpdateCommandResult> {
-  const { settings, fromGroup, senderAuth } = args;
-  const slug = settings.business_slug;
-  const now = args.now ?? new Date();
-  const target = ordersGroupJid(settings)!;
-  const refused = await guardOrderCommand(args, "update");
-  if (refused) return refused;
-
-  const posts = await recentUpdatePosts(slug, target, now);
-  // The same WhatsApp message delivered again keeps its window; the outbox dedupe key then makes the send itself a no-op.
-  const redelivered = posts.find((p) => p.event_id === args.eventId) ?? null;
-  const others = posts.filter((p) => p.id !== redelivered?.id);
-  const latest = others[0];
-  // A previous update still on its way would be repeated in full: wait for it instead.
-  if (!redelivered && latest && (Date.parse(latest.created_at) > now.getTime() - MANUAL_COOLDOWN_MS || latest.delivery === "pending" || latest.delivery === "dispatched")) {
-    return groupReply(settings, fromGroup, args.eventId, UPDATE_REFUSAL.cooldown, fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", "orders:update_cooldown");
-  }
-  const confirmed = others.find((p) => p.delivery === "sent");
-  const since = redelivered ? new Date(redelivered.window_start) : confirmed ? new Date(confirmed.window_end) : new Date(now.getTime() - FIRST_UPDATE_HOURS * 3_600_000);
-  const firstUpdate = redelivered ? false : !confirmed;
-
-  let post = redelivered;
-  if (!post) {
-    const { data, error } = await agentDb()
-      .from("ai_agent_order_update_posts")
-      .insert({ business_slug: slug, group_jid: target, requested_by: senderAuth.senderId, event_id: args.eventId, window_start: since.toISOString() })
-      .select("id, event_id, window_start, window_end, outbox_id, created_at")
-      .single();
-    if (error) throw new Error(error.message);
-    post = { ...(data as NonNullable<typeof redelivered>), delivery: null };
-  }
-
-  const events = await loadOrderEventsSince(slug, since);
-  const touched = await loadOrdersByIds(slug, [...new Set(events.map((e) => e.order_id))]);
-  // An order created in the window but with no event row yet (never expected) is still new.
-  const created = await loadOrdersCreatedSince(slug, since);
-  const byId = new Map([...touched, ...created].map((o) => [o.id, o]));
-  const entries = summarizeUpdates({ since, orders: [...byId.values()], events });
-  const open = await loadOutstandingOrders(slug);
-  const names = await loadOrderNames(slug, [...byId.values(), ...open]);
-  const tz = tzOf(settings);
-  const warning = coverageWarning(await loadCoverage(settings, now));
-  const body = buildUpdateSummary({ entries, since, names, timezone: tz, counts: countOrders(open, dayContext(now, tz)), firstUpdate, warning });
-
-  const item: OutboxInsert = { businessSlug: slug, chatId: target, kind: "staff_notice", toJid: target, body: body.slice(0, 3800), dedupeKey: `orderupdate:${slug}:${args.eventId}`, eventId: args.eventId };
-  if (!outboxAllowed(settings, item)) return groupReply(settings, fromGroup, args.eventId, UPDATE_REFUSAL.blocked, fromGroup === settings.staff_group_jid ? "staff_feedback" : "staff_notice", "orders:update_blocked");
-  // Dispatched in this very response: the person who typed !update is waiting for it.
-  const rows = await enqueue([item], true);
-  const outboxId = rows[0]?.id ?? post.outbox_id ?? ((await agentDb().from("ai_agent_outbox").select("id").eq("dedupe_key", item.dedupeKey).maybeSingle()).data?.id as string | undefined) ?? null;
-  await agentDb()
-    .from("ai_agent_order_update_posts")
-    .update({ outbox_id: outboxId, new_count: entries.filter((e) => e.kind === "new").length, changed_count: entries.filter((e) => e.kind === "changed" || e.kind === "attention").length, cancelled_count: entries.filter((e) => e.kind === "cancelled").length })
-    .eq("id", post.id);
-  await audit(slug, "staff", senderAuth.senderId, "orders.update_requested", { type: "order_update_post", id: post.id }, { entries: entries.length });
-  return { outbox: [], queued: rows, outcome: "orders:update_sent" };
-}
-
-async function loadOrderEventsSince(businessSlug: string, since: Date): Promise<OrderEventRow[]> {
-  const { data, error } = await agentDb()
-    .from("ai_agent_order_events")
-    .select("order_id, kind, actor_kind, changes, created_at")
-    .eq("business_slug", businessSlug)
-    .gt("created_at", since.toISOString())
-    .order("created_at")
-    .limit(2000);
-  if (error) throw new Error(error.message);
-  return (data ?? []) as OrderEventRow[];
-}
-
-async function loadOrdersByIds(businessSlug: string, ids: string[]): Promise<TrackedOrder[]> {
-  if (ids.length === 0) return [];
-  const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).in("id", ids.slice(0, 500));
-  if (error) throw new Error(error.message);
-  return (data ?? []) as TrackedOrder[];
-}
-
-async function loadOrdersCreatedSince(businessSlug: string, since: Date): Promise<TrackedOrder[]> {
-  const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).gt("created_at", since.toISOString()).limit(500);
-  if (error) throw new Error(error.message);
-  return (data ?? []) as TrackedOrder[];
-}
-
-// ── Order commands (!update #REF …, !order, !moreinfo #REF) ──────────────────
+// ── Order commands (!orders, !order, !moreinfo #REF) ─────────────────────────
 
 /** A command written longer ago than this (an offline catch-up) is not applied: send it again. */
 export const MAX_COMMAND_AGE_MS = 2 * 3_600_000;
@@ -1845,8 +2097,7 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
   const { settings, fromGroup, command, senderAuth } = args;
   const slug = settings.business_slug;
   const now = args.now ?? new Date();
-  if (command.kind === "report") return handleUpdateCommand(args);
-  const refused = await guardOrderCommand(args, "command");
+  const refused = await guardOrderCommand(args);
   if (refused) return refused;
 
   const reply = (body: string, outcome: string) => groupReply(settings, fromGroup, args.eventId, body, "staff_notice", `orders:${outcome}`);

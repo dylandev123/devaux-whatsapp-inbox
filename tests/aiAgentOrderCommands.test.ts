@@ -59,7 +59,7 @@ describe("completed / reopen parsing", () => {
     assert.deepEqual(parseOrderCommand("!order 17582867466 reopen"), { kind: "help", reason: "order" });
     assert.deepEqual(parseOrderCommand("!order #QU6U9"), { kind: "info", selector: { type: "ref", ref: "O-QU6U9" } });
     assert.deepEqual(parseOrderCommand("!order jane"), { kind: "search", query: "jane" });
-    assert.equal(parseOrderCommand("!update #QU6U9 completed")?.kind, "help");
+    assert.equal(parseOrderCommand("!order #QU6U9 banana")?.kind, "help");
   });
   test("completed orders read as completed in replies", () => {
     assert.match(ORDER_REPLY.closed(order({ status: "fulfilled" })), /already completed/);
@@ -115,31 +115,28 @@ describe("which name to show", () => {
 });
 
 describe("parsing", () => {
-  test("!update alone is the report; tolerant of case, spacing and punctuation", () => {
-    for (const t of ["!update", "!UPDATE", "  !update  ", "!update."]) assert.deepEqual(parseOrderCommand(t), { kind: "report" }, t);
+  test("!update is retired: it is ordinary staff chatter in every form it used to have", () => {
+    for (const t of ["!update", "!UPDATE", "  !update  ", "!update.", "!update #QU6U9 confirmed", "!update #QU6U9 2 bags", "!update jane delivery tomorrow"]) assert.equal(parseOrderCommand(t), null, t);
   });
   test("confirm, cancel, quantity and delivery date by reference", () => {
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 confirmed"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "confirm" } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 confirm"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "confirm" } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 cancelled"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "cancel" } });
-    assert.deepEqual(parseOrderCommand("!update #qu6u9 CANCEL."), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "cancel" } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 2 bags"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "quantity", quantity: 2 } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 two bags"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "quantity", quantity: 2 } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 qty 3"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "quantity", quantity: 3 } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 delivery tomorrow"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "delivery", when: "tomorrow" } });
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 delivery on Friday morning"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "delivery", when: "Friday morning" } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 confirmed"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "confirm" } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 confirm"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "confirm" } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 cancelled"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "cancel" } });
+    assert.deepEqual(parseOrderCommand("!order #qu6u9 CANCEL."), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "cancel" } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 2 bags"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "quantity", quantity: 2 } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 two bags"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "quantity", quantity: 2 } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 qty 3"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "quantity", quantity: 3 } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 delivery tomorrow"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "delivery", when: "tomorrow" } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 delivery on Friday morning"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "delivery", when: "Friday morning" } });
   });
-  test("name and phone selectors", () => {
-    assert.deepEqual(parseOrderCommand("!update Jane Doe confirmed"), { kind: "update", selector: { type: "name", text: "Jane Doe" }, action: { type: "confirm" } });
-    assert.deepEqual(parseOrderCommand("!update 286-7466 2 bags"), { kind: "update", selector: { type: "phone", digits: "2867466" }, action: { type: "quantity", quantity: 2 } });
-    assert.deepEqual(parseOrderCommand("!update +1 758 286 7466 cancelled"), { kind: "update", selector: { type: "phone", digits: "17582867466" }, action: { type: "cancel" } });
-    assert.deepEqual(parseOrderCommand("!update jane delivery tomorrow"), { kind: "update", selector: { type: "name", text: "jane" }, action: { type: "delivery", when: "tomorrow" } });
+  test("a name or phone cannot act on an order: only a reference can", () => {
+    for (const t of ["!order Jane Doe confirmed", "!order 286-7466 2 bags", "!order +1 758 286 7466 cancelled", "!order jane delivery tomorrow"]) assert.equal(parseOrderCommand(t)?.kind, "search", t);
   });
   test("a bare number without 'bags' is not a quantity, and zero or silly numbers are refused", () => {
-    assert.equal(parseOrderCommand("!update #QU6U9 2")?.kind, "help");
-    assert.equal(parseOrderCommand("!update #QU6U9 0 bags")?.kind, "help");
-    assert.equal(parseOrderCommand("!update #QU6U9 banana")?.kind, "help");
-    assert.equal(parseOrderCommand("!update #QU6U9")?.kind, "help");
+    assert.equal(parseOrderCommand("!order #QU6U9 2")?.kind, "help");
+    assert.equal(parseOrderCommand("!order #QU6U9 0 bags")?.kind, "help");
+    assert.equal(parseOrderCommand("!order #QU6U9 banana")?.kind, "help");
+    assert.equal(parseOrderCommand("!order #QU6U9")?.kind, "info", "a bare reference is the details view");
   });
   test("ordinary staff chatter that starts with !update is not an order command", () => {
     for (const t of ["!update the price list please", "!updates", "!update everyone about the delay", "please !update", "update", "!status"]) {
@@ -162,7 +159,7 @@ describe("parsing", () => {
     assert.deepEqual(parseSelector("QU6U9"), { type: "ref", ref: "O-QU6U9" });
     assert.deepEqual(parseSelector("Maria"), { type: "name", text: "Maria" }, "a five-letter name is a name");
     assert.equal(parseSelector("12345"), null, "too short to be a phone");
-    assert.equal(parseSelector("!update"), null);
+    assert.equal(parseSelector("!order"), null);
     assert.equal(parseSelector("x".repeat(80)), null);
   });
 });

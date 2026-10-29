@@ -80,7 +80,7 @@ describe("order monitoring: pure rules", () => {
   test("a staff message can only raise a flag, never replace a flag that says the customer changed or withdrew something", () => {
     assert.equal(staffFlagFor("confirms", null), "staff_confirmed_in_chat");
     assert.equal(staffFlagFor("cancels", "customer_replied_yes"), "staff_cancelled_in_chat");
-    assert.equal(staffFlagFor("changes", null), "staff_changed_in_chat");
+    assert.equal(staffFlagFor("changes", null), "staff_change_unclear", "the retired generic warning is never raised again");
     assert.equal(staffFlagFor("confirms", "changed_after_confirmation"), null);
     assert.equal(staffFlagFor("confirms", "cancellation_requested"), null);
     assert.equal(staffFlagFor("confirms", "staff_confirmed_in_chat"), null, "nothing new to record");

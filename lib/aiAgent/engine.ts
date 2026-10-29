@@ -92,7 +92,7 @@ export interface AgentSettings {
   auto_learning_enabled?: boolean | null;
   /** Daily order tracking (lib/aiAgent/orders.ts): extract orders from conversations into ai_agent_orders. Absent = off. */
   orders_tracking_enabled?: boolean | null;
-  /** The 8 AM summary and the "!update" command. Absent = off. */
+  /** The 8 AM summary and the order commands. Absent = off. */
   orders_summary_enabled?: boolean | null;
   /** Where the summary is posted; null = the staff group. */
   orders_group_jid?: string | null;
@@ -106,7 +106,7 @@ export interface AgentSettings {
   orders_tracking_since?: string | null;
 }
 
-/** Where the order summary goes and "!update" is accepted: the orders group, else the staff group. */
+/** Where the order summary goes and the order commands are accepted: the orders group, else the staff group. */
 export function ordersGroupJid(settings: AgentSettings | null): string | null {
   return settings?.orders_group_jid || settings?.staff_group_jid || null;
 }
@@ -116,7 +116,7 @@ export function hasSeparateOrdersGroup(settings: AgentSettings | null): boolean 
   return Boolean(settings?.orders_group_jid && settings.orders_group_jid !== settings.staff_group_jid);
 }
 
-/** Whether the order summary (scheduled or "!update") may be posted right now. Never customer-bound. */
+/** Whether the order summary (scheduled or manual) may be posted right now. Never customer-bound. */
 export function canPostOrderSummary(settings: AgentSettings | null): boolean {
   if (!settings?.enabled || !settings.orders_summary_enabled || !ordersGroupJid(settings)) return false;
   if (settings.mode === "assisted" || settings.mode === "approval_pilot") return true;
@@ -265,7 +265,7 @@ const OBSERVE_STAFF_KINDS: readonly string[] = ["staff_notice", "staff_draft"];
 /** Final gate on every item the live path is about to enqueue. */
 export function outboxAllowed(settings: AgentSettings | null, item: { kind: string; toJid: string }): boolean {
   if (!settings?.enabled) return false;
-  // A separate orders group takes only the order summary (and refusals to "!update"), in the same modes the staff
+  // A separate orders group takes only the order summary (and the order commands), in the same modes the staff
   // group takes notices. The staff group's own rules below are unchanged.
   if (hasSeparateOrdersGroup(settings) && item.toJid === settings.orders_group_jid) {
     const kinds = settings.mode === "observe" ? ["staff_notice"] : ["staff_notice", "staff_feedback"];
@@ -771,6 +771,12 @@ export interface OrderOnlyProposal {
   other_orders?: AdditionalOrderDraft[];
   /** Only meaningful when the NEW message was written by staff: what it says about an existing order. */
   staff_action: "confirms" | "cancels" | "changes" | null;
+  /**
+   * Only for a staff message: the specific operational change it states (products, quantities, address, delivery or collection).
+   * The server validates every value against the staff words before it touches an order; `unresolved` says what the model could
+   * see staff changing but could not map to a field.
+   */
+  staff_changes?: { order: OrderRequestDraft; unresolved: string | null } | null;
 }
 
 /** Strict parse of the order-monitoring JSON. Throws on anything malformed — the caller records a failed analysis. */
@@ -789,6 +795,10 @@ export function parseOrderOnlyProposal(raw: string): OrderOnlyProposal {
     ...(proposal.order_target ? { order_target: proposal.order_target } : {}),
     ...(proposal.other_orders ? { other_orders: proposal.other_orders } : {}),
     staff_action: ["confirms", "cancels", "changes"].includes(parsed.staff_action) ? parsed.staff_action : null,
+    staff_changes:
+      parsed.staff_changes && typeof parsed.staff_changes === "object"
+        ? { order: parseOrderDraft(parsed.staff_changes as Record<string, unknown>), unresolved: cleanText((parsed.staff_changes as Record<string, unknown>).unresolved, 200) }
+        : null,
   };
 }
 

@@ -125,7 +125,7 @@ export async function PATCH(request: Request) {
   }
 }
 
-// "Send summary now": the dashboard equivalent of "!update". Posts to the orders group only.
+// "Send summary now": the dashboard "Send summary now", the same summary the 8 AM schedule posts. Posts to the orders group only.
 export async function POST(request: Request) {
   const admin = await requireAdmin();
   if (admin instanceof NextResponse) return admin;

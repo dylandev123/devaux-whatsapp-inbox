@@ -19,11 +19,12 @@ import {
 } from "@/lib/aiAgent/orderMonitor";
 import { loadCustomerDisplayName, loadRecentMessages, loadTurnQuote, productHints, readTurnPictures } from "@/lib/server/aiAgent/context";
 import { agentDb, audit, loadActiveKnowledge } from "@/lib/server/aiAgent/db";
-import { readStaffDeliveryDate, isAffirmation } from "@/lib/aiAgent/staffDelivery";
+import { readStaffDeliveryDate } from "@/lib/aiAgent/staffDelivery";
+import { mayAnswerQuestion, resolveConversationAnswer } from "@/lib/aiAgent/orderConversation";
 import { loadIdentity } from "@/lib/server/aiAgent/identity";
 import { proposeOrderUpdate } from "@/lib/server/aiAgent/model";
-import { historyForModel, type HistoryOrder } from "@/lib/aiAgent/orderHistory";
-import { applyDeliveryDay, flagOrderFromStaff, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders, tzOf } from "@/lib/server/aiAgent/orders";
+import { historyForModel, type HistoryOrder, reliableHistory } from "@/lib/aiAgent/orderHistory";
+import { applyDeliveryDay, applyStaffChanges, flagOrderFromStaff, loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders, tzOf } from "@/lib/server/aiAgent/orders";
 
 export interface MonitorResult {
   /** Reason codes for the event. Never empty. */
@@ -84,7 +85,7 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
   try {
     if (await alreadyApplied(a.dedupeBase)) return { reasons: ["orders_monitor_already_applied"] };
     const open = await loadOpenOrders(businessSlug, chatId);
-    const plan = monitorPrefilter({ author: "customer", segments: a.segments, hasMedia: a.hasMedia, openOrders: open.length });
+    let plan = monitorPrefilter({ author: "customer", segments: a.segments, hasMedia: a.hasMedia, openOrders: open.length });
     if (plan.action === "skip") return { reasons: [plan.reason] };
 
     const identity = await loadIdentity(businessSlug, chatId, a.contactNumber);
@@ -98,8 +99,18 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
     // The turn's own photos and voice messages: the customer's "this one" under a picture.
     const turnPictures = await readTurnPictures(businessSlug, chatId, a.messageIds, pictureOptions);
     const recent = window.forModel;
-    // The customer's earlier orders: shown to the model in compact form and used by the server to resolve "same as last time".
-    const history: HistoryOrder[] = plan.action === "analyse" ? await loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => []) : [];
+    // The customer's earlier orders: shown to the model in compact form and used by the server to resolve "same as last time" and the
+    // products staff name in a question.
+    const history: HistoryOrder[] = await loadCustomerHistory(businessSlug, identity.chatIds, identity.phone).catch(() => []);
+    // A short reply to a staff question ("Yes, that one" / "Cap Estate" / "two") is read from the conversation by rules: no model call.
+    const staffSpoke = window.forGrounding.some((m) => m.who === "Staff");
+    const quotedId = staffSpoke && mayAnswerQuestion(a.segments) ? await loadTurnQuote(businessSlug, chatId, a.messageIds) : null;
+    const recentLines = window.forGrounding.map((m) => ({ who: m.who, text: m.rawText, at: m.at, id: m.id ?? null, quotedId: m.quotedId ?? null }));
+    if (plan.action === "analyse" && staffSpoke) {
+      const known = [...reliableHistory(history).flatMap((o) => o.items), ...open.flatMap((o) => o.items)];
+      const reading = resolveConversationAnswer({ segments: a.segments, at: a.lastAt, recent: recentLines, quotedId, known });
+      if (reading) plan = { action: "deterministic", reason: "orders_monitor_conversation_answer" };
+    }
     if (plan.action === "analyse") {
       if (monitorBudgetExceeded(await callsLastHour(businessSlug, chatId))) {
         await audit(businessSlug, "system", null, "orders.monitor_rate_limited", { type: "chat", id: chatId }, {});
@@ -135,8 +146,8 @@ export async function monitorCustomerTurn(a: MonitorTurnArgs): Promise<MonitorRe
       // Grounding: the customer's own words only (this turn, and their earlier messages in the stored history).
       customerWords: [...a.segments, ...window.forGrounding.filter((m) => m.who === "Customer").map((m) => m.rawText)],
       pictureWords: [...window.forGrounding.flatMap((m) => m.pictureWords), ...turnPictures.pictureWords],
-      recent: window.forGrounding.map((m) => ({ who: m.who, text: m.rawText, at: m.at, id: m.id ?? null, quotedId: m.quotedId ?? null })),
-      quotedId: a.segments.every(isAffirmation) ? await loadTurnQuote(businessSlug, chatId, a.messageIds) : null,
+      recent: recentLines,
+      quotedId,
       chatIds: identity.chatIds,
       history,
       messageIds: a.messageIds,
@@ -221,17 +232,35 @@ export async function monitorStaffMessage(a: MonitorStaffArgs): Promise<MonitorR
       return { reasons: ["orders_monitor_failed"] };
     }
     const action: StaffAction | null = res.proposal.staff_action;
-    if (!action) return { reasons: [plan.reason, "orders_monitor_staff_no_order_effect"] };
-    const flagged = await flagOrderFromStaff({
+    const changes = res.proposal.staff_changes ?? null;
+    const stated = Boolean(changes && (changes.order.items.length > 0 || changes.order.delivery_address || changes.order.delivery_preference));
+    if (!action && !stated) return { reasons: [plan.reason, "orders_monitor_staff_no_order_effect"] };
+    // A confirmation or cancellation written in the chat only raises a flag for a person to verify.
+    if (action === "confirms" || action === "cancels") {
+      const flagged = await flagOrderFromStaff({
+        businessSlug,
+        chatId,
+        target: res.proposal.order_target ?? null,
+        action,
+        text: a.text,
+        messageId: a.whatsappMessageId,
+        key,
+      });
+      return { reasons: [plan.reason, flagged.reason] };
+    }
+    // A specific change staff STATE (a product, quantity, address, delivery or collection) is applied to the order, with the staff
+    // message as its source. A question, offer or hedge is not one. Only a statement that cannot be mapped to a field is flagged.
+    const applied = await applyStaffChanges({
       businessSlug,
       chatId,
       target: res.proposal.order_target ?? null,
-      action,
       text: a.text,
       messageId: a.whatsappMessageId,
-      key,
+      at: when ? when.toISOString() : new Date().toISOString(),
+      key: `${a.eventId}:staffchange`,
+      changes: changes ?? { order: { items: [], delivery_address: null, delivery_preference: null, notes: null }, unresolved: "staff described a change to the order" },
     });
-    return { reasons: [plan.reason, flagged.reason] };
+    return { reasons: [plan.reason, ...applied.reason.split(",")] };
   } catch (err) {
     await failed(businessSlug, chatId, "staff", err instanceof Error ? err.message : "Unknown error");
     return { reasons: ["orders_monitor_failed"] };

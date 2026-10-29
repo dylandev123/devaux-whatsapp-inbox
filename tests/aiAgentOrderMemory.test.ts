@@ -416,7 +416,7 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
     modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "1", size: "25kg" }] }));
     await customerSays(JANE, "A bag of Monello Chicken 25kg, bring it to Cap");
     const [created] = await live();
-    await groupSays(`!update ${ref(created)} 3 bags`);
+    await groupSays(`!order ${ref(created)} 3 bags`);
     assert.deepEqual((await live())[0].manual_locked_fields.includes("items"), true);
 
     modelOrders(draft({ items: [{ product: "Monello Chicken", quantity: "3", size: "25kg" }, { product: "Pool Salt", quantity: "4" }] }), { order_target: created.ref_code });
@@ -438,7 +438,7 @@ describe("Customer order memory (real server code, real SQL)", { skip: !pgAvaila
     modelOrders(draft({ delivery_preference: "delivery", delivery_address: "Cap" }));
     await customerSays(JANE, "A bag of Monello Chicken 25kg delivered to Cap");
     const [created] = await live();
-    await groupSays(`!update ${ref(created)} confirmed`);
+    await groupSays(`!order ${ref(created)} confirmed`);
     assert.equal((await live())[0].status, "confirmed");
 
     modelOrders(draft({ delivery_preference: "delivery", delivery_address: "Cap", items: [{ product: "Monello Chicken", quantity: "1", size: "25kg" }, { product: "Pool Salt", quantity: "4" }] }), { order_target: created.ref_code });

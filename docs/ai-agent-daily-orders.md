@@ -2,8 +2,8 @@
 
 Tracks the orders customers place in WhatsApp, and posts **one morning list per business to a staff
 WhatsApp group at 8:00 AM (America/St_Lucia)** (today's and tomorrow's orders). Staff type `!orders` in that group
-to see what is outstanding, and `!update` for a short list of what is new or changed. Orders are organised by the
-day they are **for**, not the day the message arrived: see "Order days, `!orders` and `!update`" below.
+to see what is outstanding. Orders are organised by the
+day they are **for**, not the day the message arrived: see "Order days and `!orders`" below.
 
 > Later changes (order intent and review, staff-agreed delivery days, customer photos, South Deliveries, no "default day" wording in
 > order details) are described in [order understanding](ai-agent-order-understanding.md).
@@ -20,7 +20,7 @@ outbox kind, and every customer reply still needs explicit staff approval.
 | Rules (pure, tested) | `lib/aiAgent/orders.ts` |
 | Server logic | `lib/server/aiAgent/orders.ts` (hooked into `handleCustomerTurn` in `decide.ts`) |
 | Scheduler | One mechanism: the bridge's outbox poll (`/api/bridge/ai-agent/outbox/claim`) runs `runDueOrderSummaries()` at most once a minute. No cron job to configure. |
-| Order commands (`!update …`, `!order`, `!moreinfo #REF`) | parsed in `lib/aiAgent/orderCommands.ts`; run by `handleOrderCommand` from `processStaffGroupMessage` (staff group) and `processOrdersGroupMessage` (separate Orders group) |
+| Order commands (`!orders`, `!order …`, `!moreinfo #REF`) | parsed in `lib/aiAgent/orderCommands.ts`; run by `handleOrderCommand` from `processStaffGroupMessage` (staff group) and `processOrdersGroupMessage` (separate Orders group) |
 | Dashboard | Admin → AI agent → **Orders** tab; routes under `/api/ai-agent/orders` (admin-only, like every `/api/ai-agent/*` route) |
 
 `ai_agent_order_requests` (the Approval Pilot's collected request) and `customer_orders` (the analysis engine)
@@ -64,17 +64,17 @@ whole order; on a confirmed or ambiguous case it is **flagged for staff**, not a
   product (or a detail staff left blank, such as a missing quantity) is still added automatically and is not a conflict. Only a *contradiction* is
   recorded: a different quantity for a locked product the customer restated in THIS message, or a product they withdrew. A contradiction is stored in
   `ai_agent_orders.field_conflicts` (`{ proposed, current, at }`), never applied. It shows in the dashboard (Use customer's / Keep staff's), in `!moreinfo`, and
-  as one short `Customer asked for a change` warning in the report, even for a confirmed order. It clears when staff edit that field (dashboard or `!update`)
+  as one short `Customer asked for a change` warning in the report, even for a confirmed order. It clears when staff edit that field (dashboard or `!order #REF …`)
   or choose Keep staff's. No extra model call. Other locked fields (address, day, method, note) behave as before.
 * A material change to a **confirmed** order (a product added or changed, a new address) sends it back to `awaiting_confirmation`, clears the staff
   confirmation and flags it *changed after confirmation*, whether the change came from the customer's words or from their history.
 * Unknown quantities stay `null` in the database and read `Product — quantity needed` everywhere (never `? ×`).
-* Every successful `!update #REF …` answers once in the group with the reference and the change. Confirm/cancel say
+* Every successful `!order #REF <action>` answers once in the group with the reference and the change. Confirm/cancel say
   they are internal and that the customer was not messaged. The notice is keyed to the WhatsApp message, so a
   redelivery cannot post it twice.
 * Products, quantities, variants, sizes, addresses and times are kept only if the customer wrote them.
 
-### Order days, `!orders` and `!update`
+### Order days and `!orders`
 
 **The day an order is for.** `requested_for` keeps the customer's words, resolved to a calendar day when they are
 written (`Fri 30 Oct (Friday morning)`, counted from when the customer WROTE it, in the business's timezone,
@@ -128,25 +128,13 @@ An argument it cannot read gets the usage, never a guess. The 8:00 AM post is th
 Customer text is sanitised so it can never start a line that looks like a command; a list longer than ~3,200
 characters is split on order boundaries into numbered messages (at most 5; the count of orders not shown is stated),
 in order. A `⚠️` line appears only for a real hazard (changed after confirmation, the customer contradicted something
-staff set, a possible cancellation or duplicate, staff wrote in the chat that it changed). The only coverage line is a
+staff set, a possible cancellation or duplicate, staff wrote a change in the chat that could not be understood). The only coverage line is a
 warning when something is wrong (tracking OFF, conversations that failed analysis, messages that never reached the agent).
 
-**`!update`** (alone) is **a short summary, not the list**: the orders that are *new* and the ones *materially changed*
-since the group was last shown an update, plus cancellations by the customer or the dashboard.
-
-* Rapid edits to one order are one line: each field shows its value at the "since" point and its value now
-  (`products: 1 × Monello → 4 × Monello`); a change that ends where it started is not mentioned.
-* Material = products/quantity, delivery↔collection, address, the day, a cancellation, a customer contradicting a
-  staff-set field, or a safety flag. Not material: the customer's name, notes, a completion/reopening, and the
-  group's own `!update #REF …`/`!order …` commands (they were acknowledged in the group when typed). An order asked for and withdrawn
-  between two updates is never announced.
-* It is one message (at most 12 entries, then "…and N more — !orders"), and it ends *"This message does not mark anything as reviewed."*
-  Looking at it changes no order, event or status.
-* **The "since" point is shared by the group** (it records what the group was last shown, not what any person has
-  reviewed). It is the window end of the newest `!update` whose message is **provably sent** (`ai_agent_order_update_posts`
-  → the outbox row's status `sent`). A failed, blocked or possibly-delivered update does **not** move it, so the changes
-  are shown again rather than lost. The first ever update looks back 24 hours. A second `!update` while the previous one is still being delivered, or within 30 s, is told
-  "an order update was just posted"; the same WhatsApp message delivered twice posts once.
+**`!update` was retired** (see [conversation-based order understanding](ai-agent-conversation-orders.md)). `!orders` is the operational report;
+the 8 AM summary and the dashboard's *Send summary now* are unchanged. The order actions that used to hang off `!update` (`confirmed`,
+`cancelled`, `2 bags`, `delivery tomorrow`) are now `!order #REF <action>` and need the order reference. Typing `!update` does nothing
+(ordinary staff chatter). The table `ai_agent_order_update_posts` and its rows are kept as history; nothing writes to it any more.
 
 ### What the report claims to cover
 
@@ -177,11 +165,10 @@ can message a customer.
 | Command | Does |
 |---|---|
 | `!orders [today\|tomorrow\|<date>\|all\|overdue\|missing\|undated]` | Outstanding orders by the day they are for (read-only; a redelivered message answers once). |
-| `!update` | New and materially changed orders since the group's last delivered update (read-only for orders; 30 s cooldown; a retried message cannot post twice). |
-| `!update #QU6U9 confirmed` | Staff-confirms the order (same rule as the dashboard: needs products, quantity, delivery/collection and an address for delivery). |
-| `!update #QU6U9 cancelled` | Cancels it. |
-| `!update #QU6U9 2 bags` | Sets the quantity (orders with exactly one product; otherwise "use the dashboard"). Needs a unit (`2 bags`, `x2`, `qty 2`). |
-| `!update #QU6U9 delivery tomorrow` / `delivery 30 Oct` | Corrects the day (delivery or collection). "tomorrow"/weekdays/written dates become a calendar day from when the command was written, in the business's timezone. The correction is an audited event (who, when, before → after) and locks the field against the AI; a later customer message that disagrees is recorded as a conflict, never applied. If the words cannot be read as a day the reply says the order now has no day. |
+| `!order #QU6U9 confirmed` | Staff-confirms the order (same rule as the dashboard: needs products, quantity, delivery/collection and an address for delivery). |
+| `!order #QU6U9 cancelled` | Cancels it. |
+| `!order #QU6U9 2 bags` | Sets the quantity (orders with exactly one product; otherwise "use the dashboard"). Needs a unit (`2 bags`, `x2`, `qty 2`). |
+| `!order #QU6U9 delivery tomorrow` / `delivery 30 Oct` | Corrects the day (delivery or collection). "tomorrow"/weekdays/written dates become a calendar day from when the command was written, in the business's timezone. |
 | `!order <name or phone>` | Lists matching **active** orders (up to 5). |
 | `!moreinfo #QU6U9` or `!order #QU6U9` | Full details: status, phone, name and where it came from, items, delivery, who edited what, the last 5 changes. |
 | `!order #QU6U9 completed` | Marks the order completed (status `fulfilled`, `fulfilled_at` set, staff sender recorded as the event's actor). It leaves `!orders` and `!order <name>` at once; the order and its history stay and `!order #QU6U9` still shows it ("Completed … by …"). Internal only: nothing is sent to the customer and no delivery is triggered. Needs a reference, not a name or phone. Repeating it (same or new message) changes nothing and records no second event. |
@@ -196,7 +183,7 @@ Safety: the same WhatsApp message applied twice changes the order once (idempote
 or the dashboard changed the order **after the command was written** (two staff commands typed seconds apart both apply), if it is more than 2 hours old, or
 if someone changed the order while it was being applied (version conflict); unauthorized senders get a refusal and an audit entry; the commands are
 ignored (and audited) in any other group; another business's references simply do not exist. `!moreinfo` **without** an order reference, and `!moreinfo #E-…`,
-still belong to the escalation / Approval Pilot logic untouched. Anything starting `!update …` that is not a recognised command stays ordinary staff chatter.
+still belong to the escalation / Approval Pilot logic untouched. Anything starting `!update …` is ordinary staff chatter (the command is retired).
 
 ## Maintaining an order from short messages
 
@@ -326,7 +313,7 @@ three tables, six settings columns, `apply_ai_agent_order`, a replaced `claim_ai
 **Scheduler:** nothing to set up. The bridge already polls `/outbox/claim` every ~10 s for each business it can
 send for; each poll lets the app check (at most once a minute) whether a business's local 8:00 has passed, and the
 database allows one scheduled run per business per local day. No Vercel Cron, pg_cron or second endpoint. The
-schedule, `!orders` and `!update` share no state apart from the data they read: any works without the others.
+schedule and `!orders` share no state apart from the data they read: any works without the others.
 If the bridge is down or cannot send, nothing can be delivered anyway; on recovery the catch-up window applies.
 
 **Bridge (WhatsappOperation):** *a bridge update is required only to use a separate Orders group*; with the staff
@@ -345,21 +332,21 @@ until the bridge is deployed.
    order, *Awaiting confirmation*, phone shown. No customer message is sent.
 3. Send "make it 3 bags": same order, quantity 3, History shows before/after. Send a second, different order: two orders.
 4. Reply "yes" with no staff message in between: still *Awaiting*. Have staff write to the customer, then "yes please": the order stays *Awaiting*, flagged *Customer replied yes*; press *Confirm* → "verified by staff".
-5. In the staff group, an authorized sender types `!orders`: today's and tomorrow's orders appear split by delivery/collection; `!orders overdue|missing|tomorrow|30 Oct` answer too. `!update` lists what is new. Then `!update #REF confirmed`, `!update #REF 2 bags`,
-   `!update #REF delivery tomorrow`, `!order <name>` and `!moreinfo #REF` each answer in the group and change the Orders tab. A non-authorized
+5. In the staff group, an authorized sender types `!orders`: today's and tomorrow's orders appear split by delivery/collection; `!orders overdue|missing|tomorrow|30 Oct` answer too. Then `!order #REF confirmed`, `!order #REF 2 bags`,
+   `!order #REF delivery tomorrow`, `!order <name>` and `!moreinfo #REF` each answer in the group and change the Orders tab. A non-authorized
    sender gets a refusal; the commands in another group do nothing; no message ever reaches a customer.
-6. Orders tab → *Post orders list now* behaves like `!orders`. Edit an order's address in the dashboard, wait for the previous update to be delivered and 30 s, `!update` again: the change is listed once.
+6. Orders tab → *Post orders list now* behaves like `!orders`. Edit an order's address in the dashboard and `!orders` shows the new address; typing `!update` does nothing.
 7. At 8:00 St Lucia time one summary arrives (within a minute or so of the bridge's next poll); nothing further follows. The "Morning list" card shows the run and its delivery state. Switch tracking off and `!orders`: the list says it is incomplete.
 8. Kill the bridge before 8:00, restart within 6 hours: the summary arrives once after restart.
 
 ## Known limits / follow-ups
 
 * A saved contact name exists only if the business phone has the contact saved and the bridge has seen it (it reads contact events after connecting); until then the profile name, then the phone, is shown.
-* A quantity set by command locks the order's products against the AI: if the customer later changes the quantity in WhatsApp, a person must update it (dashboard or `!update`).
+* A quantity set by command locks the order's products against the AI: if the customer later changes the quantity in WhatsApp, a person must update it (dashboard or `!order #REF …`).
 * Dates: "today / tonight / tomorrow / day after tomorrow / a named weekday" and written dates ("30 Oct", "Oct 30th", "2026-10-30", "30/10/2026") become calendar days; "next Friday", a bare "28th", ranges and times stay as written (the order then shows as *no day*). Short slash dates ("30/10") are not read: "1/2 a bag" is a quantity.
 * No retention job for fulfilled/cancelled orders yet (deleting a customer via the Memory tab does remove theirs).
 * A customer's yes counts only if a person wrote to them (inbox, `!send`) in the last 48 h and exactly one order is open; a phone confirmation is a *Confirm* click.
-* A staff message in the chat can raise a flag but never creates an order, so an order the customer only described in a voice note and staff then wrote out is
+* A staff message in the chat never creates an order (it can complete one that exists, see [conversation-based order understanding](ai-agent-conversation-orders.md)), so an order the customer only described in a voice note and staff then wrote out is
   recorded only once the customer says it in text (or staff add it in the dashboard).
 * Customer memory reads `ai_agent_orders`, which starts filling when daily orders are switched on. Earlier orders only in the older `customer_orders` analysis
   table, or only in stored WhatsApp messages, are not used until "Recover missed orders" has brought them into the order book (history within the retention window).
@@ -369,13 +356,12 @@ until the bridge is deployed.
 * Cost: AI-eligible turns carry ~350 extra instruction tokens and the open-order list; monitoring-only turns make one small call (~760 instruction tokens +
   open orders + 8 context lines, typically 1.2–1.5k input and 100–200 output tokens), capped per chat/business per hour.
 
-## Order views and `!update`: deployment, notifications, website
+## Order views: deployment, notifications, website
 
 **Migration (one, additive, idempotent):** `supabase/migrations/20261108000000_ai_agent_order_update_posts.sql` creates
-`ai_agent_order_update_posts` (one row per `!update` answer: business, group, window, the outbox row that carried it). It
+`ai_agent_order_update_posts` (one row per retired `!update` answer: business, group, window, the outbox row that carried it). It
 changes no existing row, column or function and switches nothing on. No existing order is migrated.
-**Order:** run the migration in the Supabase SQL editor → deploy the app. (The old app ignores the table; the new app
-needs it for `!update`.) No bridge change, no new environment variables, no settings. Roll back by deploying the previous app version; the table can stay.
+**Order:** run the migration in the Supabase SQL editor → deploy the app. (The table is no longer used by the app; it is kept as history.) No bridge change, no new environment variables, no settings. Roll back by deploying the previous app version; the table can stay.
 
 **Which WhatsApp messages an order can cause (audit).** Every path below is a `staff_notice` to the staff/Orders group;
 none can reach a customer.
@@ -384,9 +370,9 @@ none can reach a customer.
 |---|---|---|---|
 | Approval request / escalation notice and its updates (`notifyStaff`, `decide.ts`) | A customer's order or question needs a person; an update when it materially changes (`diffSnapshots`) | Compare-and-swap on the escalation's `notified_seq` + outbox dedupe key; a redelivered batch cannot post twice | **Not suppressed** (Approval Pilot's drafts need these). Rapid messages are combined only when batching is on |
 | Morning list (8:00) | Once per business per local day | `scheduled_key` unique per day; outbox dedupe key; an uncertain send is never repeated | Now the by-day list (today, tomorrow, counts of the rest), not every open order |
-| `!update` | On request | `event_id` unique + outbox key; cooldown; the "since" point moves only on a provable delivery | Now a short change summary |
+| `!update` | Retired | — | No longer handled; `ai_agent_order_update_posts` is kept as history |
 | `!orders` | On request | Outbox key = the WhatsApp message id per part | New |
-| Command acknowledgements (`!update #REF …`, `!order #REF completed`) | One reply per command | Key = the WhatsApp message id | Unchanged |
+| Command acknowledgements (`!order #REF confirmed`, `!order #REF completed`) | One reply per command | Key = the WhatsApp message id | Unchanged |
 | Dashboard "Post orders list now" | On request | Run row + cooldown | Now the by-day list |
 
 **Root causes of the noise** (found by reading the code, not by measuring a live group):
@@ -420,7 +406,7 @@ apart, and no existing order needs migrating.
 |---|---|
 | Delivery | Every order is a delivery unless the customer explicitly asks to collect (`fulfilment_method = 'collection'` is kept). An empty method is shown as *Delivery (default)* on the website and in `!moreinfo`, is never "missing", and a default delivery needs an address. The AI never asks "delivery or collection?" and never offers pick-up (reply prompt, `missingOrderFields`, `askForMissingFields`). |
 | Day | A day the customer named wins. Otherwise: written **before 9:00 AM** America/St_Lucia → that day, **at or after 9:00** → the next day, counted from the order's `first_message_at` (the customer's message time, never the processing time). A time with no day ("morning", "around 3pm") keeps its wording and takes the default day. Words that name no single day ("next week") stay as the customer's words and **are** reported as a gap. Because the date is a pure function of the order's own timestamp, it does not move at midnight or when a later message arrives; an old order simply becomes *overdue*. |
-| Reports | `!orders`, `!orders missing/overdue/undated`, the 8 AM post, `!update` and the website all use `orderDate`/`orderGaps`/`effectiveMethod`. A defaulted day is no longer labelled in WhatsApp lines (the TODAY/TOMORROW heading carries the date; views without a day heading show the actual date, e.g. `🗓 Wed 28 Oct`, and an explicit time still shows as `🕐 morning`); the `(default)` marker stays in the stored `requested_for` and in `!order #REF`. The website still marks it `· default day`; "Missing:" lists only real gaps (products, quantity, address, an unreadable day). |
+| Reports | `!orders`, `!orders missing/overdue/undated`, the 8 AM post and the website all use `orderDate`/`orderGaps`/`effectiveMethod`. A defaulted day is no longer labelled in WhatsApp lines (the TODAY/TOMORROW heading carries the date; views without a day heading show the actual date, e.g. `🗓 Wed 28 Oct`, and an explicit time still shows as `🕐 morning`); the `(default)` marker stays in the stored `requested_for` and in `!order #REF`. The website still marks it `· default day`; "Missing:" lists only real gaps (products, quantity, address, an unreadable day). |
 | Identity | Name: staff-entered → saved contact → WhatsApp profile name → a name the customer **wrote** (only when none of those exist; checked against their words) → the verified phone. Placeholders ("Unknown Contact", "customer"), numbers and JIDs are never stored as a name. `contact_number` is always the verified sender (`@lid` mappings untouched). |
 | Alternate contact | A number the customer writes for the delivery (`contact_phone`, or a note that is only a number) is checked against their own words, excluded if it is the sender's own number, and stored in the notes as `Delivery contact: 758-123-4567`. It survives later turns and never replaces `contact_number`. |
 | Location | Priority: the location the customer gives now → the staff-saved default (`!location`) → ONE unambiguous verified earlier delivery address (a confirmed/completed/staff-corrected order, or an address staff typed; if two different verified places exist none is used) → missing, flagged for a person. Applied automatically when the customer gives no location (not when collecting, not for "somewhere else", never over an address the order or staff already hold); "same place" works as before. The source is recorded in the order history (`inferred.delivery_address`: `saved location` or the order ref). Saved customer memory is read, never written. |

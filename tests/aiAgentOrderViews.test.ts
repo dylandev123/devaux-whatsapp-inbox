@@ -10,16 +10,13 @@ import { parseOrderCommand } from "../lib/aiAgent/orderCommands.ts";
 import {
   bucketOf,
   buildOrdersView,
-  buildUpdateSummary,
   countOrders,
   dayContext,
   needsAttention,
   orderDate,
   orderGaps,
-  type OrderEventRow,
   parseOrdersView,
   selectOrders,
-  summarizeUpdates,
 } from "../lib/aiAgent/orderViews.ts";
 import { buildRulesMessages, STAFF_COMMANDS } from "../lib/aiAgent/commandRegistry.ts";
 import type { TrackedOrder } from "../lib/aiAgent/orders.ts";
@@ -200,18 +197,18 @@ describe("!orders parsing", () => {
   test("an argument we do not understand gets the usage, not silence or a guess", () => {
     for (const text of ["!orders banana", "!orders 31 Nov", "!orders next friday", "!orders " + "x".repeat(60)]) assert.deepEqual(parseOrderCommand(text, { now: NOW, timezone: TZ }), { kind: "help", reason: "orders" }, text);
   });
-  test("!order, !orders, !update and !moreinfo stay separate commands", () => {
+  test("!order, !orders and !moreinfo stay separate commands, and !update is retired", () => {
     assert.equal(parseOrderCommand("!order #QU6U9")?.kind, "info");
     assert.deepEqual(parseOrderCommand("!order #QU6U9 completed"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "complete" } });
     assert.deepEqual(parseOrderCommand("!order #QU6U9 reopen"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "reopen" } });
     assert.equal(parseOrderCommand("!order jane")?.kind, "search");
-    assert.equal(parseOrderCommand("!update")?.kind, "report");
+    assert.equal(parseOrderCommand("!update"), null);
     assert.equal(parseOrderCommand("!moreinfo #QU6U9")?.kind, "info");
     assert.equal(parseOrderCommand("!orderly conduct"), null);
     assert.equal(parseOrderCommand("orders please"), null, "a command is the first word");
   });
   test("a delivery-date correction takes an explicit date", () => {
-    assert.deepEqual(parseOrderCommand("!update #QU6U9 delivery 30 Oct"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "delivery", when: "30 Oct" } });
+    assert.deepEqual(parseOrderCommand("!order #QU6U9 delivery 30 Oct"), { kind: "update", selector: { type: "ref", ref: "O-QU6U9" }, action: { type: "delivery", when: "30 Oct" } });
   });
 });
 
@@ -292,90 +289,16 @@ describe("!orders output", () => {
   });
 });
 
-describe("!update: what is new or changed", () => {
-  const SINCE = new Date("2026-10-28T12:00:00Z");
-  const at = (min: number) => new Date(SINCE.getTime() + min * 60_000).toISOString();
-  const ev = (o: TrackedOrder, kind: string, min: number, changes: OrderEventRow["changes"], actor = "ai"): OrderEventRow => ({ order_id: o.id, kind, actor_kind: actor, changes, created_at: at(min) });
-  const line = (qty: string) => [{ product: "Monello", quantity: qty, variant: null, size: null }];
-
-  test("a new order is 'new'; an order from before the point with no material change is not mentioned", () => {
-    const fresh = order({ created_at: at(5) });
-    const quiet = order({ created_at: "2026-10-27T12:00:00Z" });
-    const entries = summarizeUpdates({ since: SINCE, orders: [fresh, quiet], events: [ev(quiet, "ai_update", 10, { customer_name: { before: null, after: "Q" }, notes: { before: null, after: "hi" } })] });
-    assert.deepEqual(entries.map((e) => [e.kind, e.order.id]), [["new", fresh.id]]);
-  });
-  test("rapid edits to one order are ONE entry, from the value at the point to the value now", () => {
-    const o = order({ created_at: "2026-10-27T12:00:00Z" });
-    const events = [
-      ev(o, "ai_update", 1, { items: { before: line("1"), after: line("2") } }),
-      ev(o, "ai_update", 2, { items: { before: line("2"), after: line("3") } }),
-      ev(o, "ai_update", 3, { items: { before: line("3"), after: line("4") }, requested_for: { before: "Thu 29 Oct (tomorrow)", after: "Fri 30 Oct (Friday)" } }),
-    ];
-    const entries = summarizeUpdates({ since: SINCE, orders: [o], events });
-    assert.equal(entries.length, 1);
-    assert.deepEqual(entries[0].changes, ["products: 1 × Monello → 4 × Monello", "day: Thu 29 Oct → Fri 30 Oct"]);
-  });
-  test("a change that ends where it started is not a change", () => {
-    const o = order({ created_at: "2026-10-27T12:00:00Z" });
-    const events = [ev(o, "ai_update", 1, { items: { before: line("1"), after: line("2") } }), ev(o, "ai_update", 2, { items: { before: line("2"), after: line("1") } })];
-    assert.deepEqual(summarizeUpdates({ since: SINCE, orders: [o], events }), []);
-  });
-  test("staff commands, completions and reopenings are bookkeeping, not news; the customer cancelling is", () => {
-    const a = order({ created_at: "2026-10-27T12:00:00Z" });
-    const b = order({ created_at: "2026-10-27T12:00:00Z", status: "fulfilled" });
-    const c = order({ created_at: "2026-10-27T12:00:00Z", status: "cancelled" });
-    const d = order({ created_at: "2026-10-27T12:00:00Z", status: "cancelled" });
-    const events = [
-      ev(a, "staff_whatsapp_edit", 1, { requested_for: { before: "x", after: "Fri 30 Oct (30 Oct)" } }, "staff"),
-      ev(b, "manual_fulfil", 2, { status: { before: "confirmed", after: "fulfilled" } }, "admin"),
-      ev(c, "customer_cancelled", 3, { status: { before: "confirmed", after: "cancelled" } }, "customer"),
-      ev(d, "staff_whatsapp_cancel", 4, { status: { before: "confirmed", after: "cancelled" } }, "staff"),
-    ];
-    const entries = summarizeUpdates({ since: SINCE, orders: [a, b, c, d], events });
-    assert.deepEqual(entries.map((e) => [e.kind, e.order.id]), [["cancelled", c.id]]);
-  });
-  test("an order asked for and withdrawn since the point is never announced", () => {
-    const o = order({ created_at: at(5), status: "cancelled" });
-    assert.deepEqual(summarizeUpdates({ since: SINCE, orders: [o], events: [ev(o, "customer_cancelled", 6, { status: { before: "possible", after: "cancelled" } }, "customer")] }), []);
-  });
-  test("a customer contradicting something staff set, and an attention flag, are surfaced", () => {
-    const x = order({ created_at: "2026-10-27T12:00:00Z", field_conflicts: { items: { proposed: line("5"), current: line("3"), at: at(2) } } });
-    const y = order({ created_at: "2026-10-27T12:00:00Z", attention: "changed_after_confirmation" });
-    const entries = summarizeUpdates({ since: SINCE, orders: [x, y], events: [ev(x, "locked_field_conflict", 2, {}), ev(y, "attention_flagged", 3, {})] });
-    assert.deepEqual(entries.map((e) => e.kind).sort(), ["attention", "changed"]);
-    assert.match(entries.find((e) => e.kind === "changed")!.changes[0], /customer asked to change something staff set/);
-  });
-  test("events at or before the point are ignored (nothing is shown twice)", () => {
-    const o = order({ created_at: "2026-10-27T12:00:00Z" });
-    assert.deepEqual(summarizeUpdates({ since: SINCE, orders: [o], events: [ev(o, "ai_update", 0, { items: { before: line("1"), after: line("2") } })] }), []);
-  });
-
-  test("the message is short, one message, honest about what it is, and caps a flood", () => {
-    const entries = Array.from({ length: 30 }, (_, i) => ({ kind: "new" as const, order: order({ customer_name: `Customer ${i}` }), changes: [] }));
-    const text = buildUpdateSummary({ entries, since: SINCE, timezone: TZ, counts: countOrders([], ctx) });
-    assert.ok(text.length < 3000, `${text.length}`);
-    assert.match(text, /^🔔 \*ORDER UPDATE\* — since Wed 28 Oct, 08:00/);
-    assert.match(text, /30 new/);
-    assert.match(text, /…and 18 more — !orders/);
-    assert.match(text, /This message does not mark anything as reviewed\./);
-    assert.doesNotMatch(text, /DAILY ORDERS|OPEN ORDERS/);
-  });
-  test("with nothing new it says so, and a first update says it looked back a day", () => {
-    assert.match(buildUpdateSummary({ entries: [], since: SINCE, timezone: TZ }), /✅ No new or changed orders\./);
-    assert.match(buildUpdateSummary({ entries: [], since: SINCE, timezone: TZ, firstUpdate: true }), /in the last 24 hours/);
-    const waiting = buildUpdateSummary({ entries: [], since: SINCE, timezone: TZ, counts: { ...countOrders([], ctx), overdue: 3, missing: 2 } });
-    assert.match(waiting, /3 overdue · 2 missing info · Full list: !orders/);
-  });
-});
-
 describe("the command menu matches the parsers", () => {
-  test("!rules documents !orders (every view), !update, !order and the completion commands", () => {
+  test("!rules documents !orders (every view), !order and the completion commands", () => {
     const text = buildRulesMessages().join("\n");
-    for (const part of ["!orders [today|tomorrow|<date>|all|overdue|missing|undated|review]", "!orders complete all", "!update [#REF", "!order <name, phone or #REF> | #REF completed | #REF reopen | #REF teach <instruction>"]) assert.ok(text.includes(part), part);
+    for (const part of ["!orders [today|tomorrow|<date>|all|overdue|missing|undated|review]", "!orders complete all", "!order <name, phone or #REF> | #REF confirmed | #REF cancelled | #REF 2 bags | #REF delivery tomorrow | #REF completed | #REF reopen | #REF teach <instruction>"]) assert.ok(text.includes(part), part);
     const doc = STAFF_COMMANDS.find((c) => c.name === "orders")!;
     assert.deepEqual([doc.section, doc.who, doc.readOnly], ["Orders", "authorized", false], "!orders complete all can change orders, so the entry is no longer read-only");
     for (const word of ["overdue", "missing", "undated", "review", "South Deliveries", "all", "complete all", "B-ABCDE"]) assert.match(doc.summary, new RegExp(word));
     // Everything the registry advertises for !orders really parses to the orders command.
+    assert.ok(!STAFF_COMMANDS.some((c) => c.name === "update"), "!update is no longer advertised");
+    assert.ok(!text.includes("!update"));
     for (const arg of ["", "today", "tomorrow", "30 Oct", "all", "overdue", "missing", "undated", "review"]) assert.equal(parseOrderCommand(`!orders ${arg}`.trim(), { now: NOW, timezone: TZ })?.kind, "orders", arg);
   });
 });

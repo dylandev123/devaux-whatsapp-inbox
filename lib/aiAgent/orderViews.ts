@@ -1,7 +1,6 @@
 // The order views staff read — pure (no I/O), unit-tested in tests/aiAgentOrderViews.test.ts.
 //
 //   !orders [today|tomorrow|<date>|all|overdue|missing|undated]   what is outstanding, by the day it is FOR
-//   !update                                                   what is new or materially changed since the last update
 //
 // Orders are placed on the day they are intended for (delivery or collection), never on the day the message arrived. The
 // day is read from `requested_for` (see requestedDate in orderText.ts); an order with no readable day is "undated", and an
@@ -417,7 +416,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
         chunks.push({ text: `❔ *DAY NOT CLEAR — first mentioned before today (${noDay.length})*`, heading: true });
         flat(noDay);
       }
-      if (picked.length > 0) chunks.push({ text: "Done? !order #REF completed · new day: !update #REF delivery <date> · cancel: !update #REF cancelled" });
+      if (picked.length > 0) chunks.push({ text: "Done? !order #REF completed · new day: !order #REF delivery <date> · cancel: !order #REF cancelled" });
       break;
     }
     case "missing":
@@ -429,13 +428,13 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       title = "📋 *POSSIBLE ORDERS TO REVIEW*";
       empty = "✅ Nothing waiting for review.";
       flat(picked, false);
-      if (picked.length > 0) chunks.push({ text: "These are not on any delivery list. Real order: !update #REF confirmed · not an order: !update #REF cancelled" });
+      if (picked.length > 0) chunks.push({ text: "These are not on any delivery list. Real order: !order #REF confirmed · not an order: !order #REF cancelled" });
       break;
     case "undated":
       title = "📋 *ORDERS WITH AN UNCLEAR DAY*";
       empty = "✅ Every outstanding order has a clear day.";
       flat(picked);
-      if (picked.length > 0) chunks.push({ text: "Set the day: !update #REF delivery <date>" });
+      if (picked.length > 0) chunks.push({ text: "Set the day: !order #REF delivery <date>" });
       break;
   }
   if (chunks.length === 0) chunks.push({ text: empty });
@@ -453,142 +452,4 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
   const packed = pack(title, chunks);
   if (packed.omitted > 0) packed.parts[packed.parts.length - 1] += `\n\n…and ${plural(packed.omitted, "more order")} — see the Orders page in the inbox.`;
   return { parts: packed.parts, shown: picked.length + (view.type === "default" ? fresh.length : 0), counts };
-}
-
-// ── !update: new and materially changed ──────────────────────────────────────
-
-export interface OrderEventRow {
-  order_id: string;
-  kind: string;
-  actor_kind: string;
-  changes: Record<string, { before?: unknown; after?: unknown }>;
-  created_at: string;
-}
-
-/** Fields whose change matters to someone preparing or delivering the order. */
-const MATERIAL_FIELDS = ["items", "fulfilment_method", "delivery_address", "requested_for"] as const;
-
-/**
- * Events that never make an order "changed": a staff WhatsApp command was already acknowledged in the group, and a
- * completion or reopening is bookkeeping (the order simply leaves or returns to !orders). An admin-approved repair of old
- * orders (orderRepair.ts) is a data correction, not something the customer changed.
- */
-export function isNoiseEvent(e: Pick<OrderEventRow, "kind">): boolean {
-  return /^staff_whatsapp_/.test(e.kind) || e.kind === "order_repair" || e.kind === "address_confirmed" || /^manual_(fulfil|reopen|keep)$/.test(e.kind) || e.kind === "no_change";
-}
-
-export interface UpdateEntry {
-  kind: "new" | "changed" | "cancelled" | "attention";
-  order: TrackedOrder;
-  /** Human-readable, one per changed field; first before → last after, however many edits happened in between. */
-  changes: string[];
-}
-
-function valueOf(field: string, v: unknown): string {
-  if (v === null || v === undefined || v === "") return "—";
-  if (field === "requested_for") return safeText(String(v).replace(/^(\w{3} \d{1,2} \w{3}) \(.*\)$/, "$1"), 40);
-  if (field === "items" && Array.isArray(v)) return conflictValueText("items", v, 90);
-  return safeText(String(v), 60);
-}
-
-const FIELD_WORD: Record<string, string> = { items: "products", fulfilment_method: "delivery/collection", delivery_address: "address", requested_for: "day" };
-
-/**
- * Sorts what happened after `since` into entries. Rapid edits to one order are one entry: each field shows the value it
- * had at the cursor and the value it has now. An order created after the cursor is "new" whatever happened to it since.
- * `orders` are the orders with events in the window (any status), all from one business.
- */
-export function summarizeUpdates(args: { since: Date; orders: TrackedOrder[]; events: OrderEventRow[] }): UpdateEntry[] {
-  const since = args.since.getTime();
-  const byOrder = new Map<string, OrderEventRow[]>();
-  for (const e of args.events) {
-    if (Date.parse(e.created_at) <= since) continue;
-    byOrder.set(e.order_id, [...(byOrder.get(e.order_id) ?? []), e]);
-  }
-  const entries: UpdateEntry[] = [];
-  for (const order of args.orders) {
-    const events = (byOrder.get(order.id) ?? []).sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
-    const isNew = Date.parse(order.created_at) > since;
-    if (events.length === 0 && !isNew) continue;
-    if (order.status === "fulfilled") continue;
-    if (order.status === "cancelled") {
-      // Asked for and withdrawn before anyone was told: nothing to act on. A cancellation staff typed was already acknowledged.
-      const cancelledByOthers = events.some((e) => (e.changes.status as { after?: unknown } | undefined)?.after === "cancelled" && !/^staff_whatsapp_/.test(e.kind));
-      if (!isNew && cancelledByOthers) entries.push({ kind: "cancelled", order, changes: [] });
-      continue;
-    }
-    if (isNew) {
-      entries.push({ kind: "new", order, changes: [] });
-      continue;
-    }
-    const relevant = events.filter((e) => !isNoiseEvent(e));
-    const changes: string[] = [];
-    for (const field of MATERIAL_FIELDS) {
-      const touched = relevant.filter((e) => field in e.changes);
-      if (touched.length === 0) continue;
-      const before = touched[0].changes[field]?.before;
-      const after = touched[touched.length - 1].changes[field]?.after;
-      if (JSON.stringify(before ?? null) === JSON.stringify(after ?? null)) continue;
-      changes.push(`${FIELD_WORD[field]}: ${valueOf(field, before)} → ${valueOf(field, after)}`);
-    }
-    if (relevant.some((e) => e.kind === "locked_field_conflict") && conflictFields(order).length > 0) {
-      changes.push("customer asked to change something staff set — check before fulfilling");
-    }
-    if (changes.length > 0) {
-      entries.push({ kind: "changed", order, changes });
-    } else if (relevant.some((e) => e.kind === "attention_flagged") && orderWarning(order)) {
-      entries.push({ kind: "attention", order, changes: [orderWarning(order)!] });
-    }
-  }
-  const rank = { cancelled: 0, attention: 1, changed: 2, new: 3 } as const;
-  return entries.sort((a, b) => rank[a.kind] - rank[b.kind] || Date.parse(a.order.first_message_at) - Date.parse(b.order.first_message_at));
-}
-
-const MAX_UPDATE_ENTRIES = 12;
-
-export interface UpdateSummaryInput {
-  entries: UpdateEntry[];
-  since: Date;
-  names?: OrderNames;
-  timezone?: string;
-  counts?: OrderCounts;
-  /** True when no earlier update was delivered, so the window is the default (the last day), not "since the last update". */
-  firstUpdate?: boolean;
-  warning?: string | null;
-}
-
-/** The text of "!update": short, one message. It lists what happened and says plainly that nothing was marked reviewed. */
-export function buildUpdateSummary(input: UpdateSummaryInput): string {
-  const tz = input.timezone ?? DEFAULT_ORDERS_TIMEZONE;
-  const when = new Intl.DateTimeFormat("en-GB", { timeZone: tz, weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(input.since);
-  const of = (k: UpdateEntry["kind"]) => input.entries.filter((e) => e.kind === k).length;
-  const lines: string[] = [`🔔 *ORDER UPDATE* — since ${when}`];
-  if (input.entries.length === 0) {
-    lines.push(`✅ No new or changed orders${input.firstUpdate ? " in the last 24 hours" : ""}.`);
-  } else {
-    lines.push([of("new") ? `${of("new")} new` : "", of("changed") ? `${of("changed")} changed` : "", of("cancelled") ? `${of("cancelled")} cancelled` : "", of("attention") ? `${of("attention")} to check` : ""].filter(Boolean).join(" · "));
-    for (const e of input.entries.slice(0, MAX_UPDATE_ENTRIES)) {
-      const who = `*${safeText(orderDisplayName(e.order, input.names) ?? formatPhone(e.order.contact_number) ?? "Unknown customer", 30)} · ${displayRef(e.order.ref_code)}*`;
-      if (e.kind === "new") {
-        const date = orderDate(e.order, tz);
-        const bits = [
-          e.order.items.length ? e.order.items.map(orderItemText).join("; ") : "no products yet",
-          effectiveMethod(e.order).method === "collection" ? "collection" : `delivery${e.order.delivery_address ? ` ${safeText(e.order.delivery_address, 40)}` : ""}`,
-          date ? dayLabel(date) : "day unclear",
-        ].filter(Boolean);
-        const gaps = orderGaps(e.order, tz).filter((g) => g !== "requested_for");
-        lines.push(`🆕 ${who} — ${bits.join(" · ")}${gaps.length ? ` ⚠️ missing ${gaps.map(gapText).join(", ")}` : ""}`);
-      } else if (e.kind === "cancelled") {
-        lines.push(`🚫 ${who} — cancelled`);
-      } else {
-        lines.push(`${e.kind === "attention" ? "⚠️" : "✏️"} ${who} — ${e.changes.join("; ")}`);
-      }
-    }
-    if (input.entries.length > MAX_UPDATE_ENTRIES) lines.push(`…and ${input.entries.length - MAX_UPDATE_ENTRIES} more — !orders`);
-  }
-  if (input.warning) lines.push(input.warning);
-  const c = input.counts;
-  const waiting = c ? [c.overdue ? `${c.overdue} overdue` : "", c.missing ? `${c.missing} missing info` : ""].filter(Boolean).join(" · ") : "";
-  lines.push(`${waiting ? `${waiting} · ` : ""}Full list: !orders · This message does not mark anything as reviewed.`);
-  return lines.join("\n");
 }

@@ -6,13 +6,24 @@
 // edited, confirmed, completed or cancelled is never suggested for change; neither are customer memories or approved corrections.
 
 import { classifyOrderIntent, staffRecentlyOfferedDelivery } from "./orderIntent.ts";
+import { patchWithProduct, patchWithQuantity, readStaffQuantity, resolveConversationAnswer } from "./orderConversation.ts";
+import { quantityAdjustments } from "./orderText.ts";
 import { effectiveDate } from "./orderDefaults.ts";
 import { dayLabel } from "./orderViews.ts";
 import { agreedDeliveryDate, type ConversationLine, isAffirmation, readStaffDeliveryDate } from "./staffDelivery.ts";
-import { isOpenStatus, isUnderReview, type TrackedOrder } from "./orders.ts";
+import { ATTENTION_TEXT, isOpenStatus, isUnderReview, orderItemText, type TrackedOrder } from "./orders.ts";
+import { STAFF_CHANGE_FLAGS } from "./orderMonitor.ts";
 import { pointsAtPicture, type PictureReading } from "./orderImages.ts";
 
-export type FindingKind = "might_not_be_order" | "delivery_day" | "picture_unresolved";
+export type FindingKind =
+  | "might_not_be_order"
+  | "delivery_day"
+  | "picture_unresolved"
+  | "address_answered"
+  | "product_confirmed"
+  | "quantity_answered"
+  | "quantity_corrected"
+  | "staff_warning_resolvable";
 
 export interface EvidenceLine {
   who: "Customer" | "Staff";
@@ -134,5 +145,91 @@ export function reviewOrder(args: { order: TrackedOrder; lines: ReviewLine[]; ti
       });
     }
   }
+  findings.push(...reviewConversation({ order: o, lines, timezone, sourceIds, first }));
   return { orderId: o.id, ref: o.ref_code, findings };
+}
+
+const itemsText = (items: TrackedOrder["items"]) => (items.length > 0 ? items.map(orderItemText).join("; ") : "no products");
+
+/**
+ * What the order's own conversation answered or corrected after the order was written, read by the same rules the live agent uses
+ * (orderConversation.ts), never by a model: an address, product or quantity staff asked for and the customer gave; a quantity changed in a
+ * follow-up; and the retired generic "staff changed it in chat" warning when the staff messages behind it read plainly. Every finding is a
+ * suggestion with the messages that support it; nothing is applied.
+ */
+function reviewConversation(args: { order: TrackedOrder; lines: ReviewLine[]; timezone: string; sourceIds: Set<string>; first: number }): ReviewFinding[] {
+  const { order: o, lines, timezone, sourceIds, first } = args;
+  const out: ReviewFinding[] = [];
+  const after = lines.filter((m) => Date.parse(m.at) >= first - 3_600_000 && m.text.trim());
+  const known = o.items;
+  const seen = new Set<string>();
+  const once = (f: ReviewFinding) => {
+    if (!seen.has(f.kind)) {
+      seen.add(f.kind);
+      out.push(f);
+    }
+  };
+  const lastSourceAt = Math.max(first, ...after.filter((m) => m.id && sourceIds.has(m.id)).map((m) => Date.parse(m.at)));
+
+  // 1. Staff asked, the customer answered: the order should hold the answer.
+  for (const [i, m] of after.entries()) {
+    if (m.who !== "Customer" || (m.id && sourceIds.has(m.id) && !m.quotedId)) continue;
+    const reading = resolveConversationAnswer({ segments: [m.text], at: m.at, recent: after.slice(0, i), quotedId: m.quotedId, known });
+    if (reading?.status !== "answer") continue;
+    const answer = reading.answer;
+    const evidence: EvidenceLine[] = [{ who: "Staff", at: answer.staff.at, text: clip(answer.staff.text) }, evidenceOf(m)];
+    if (answer.kind === "address" && !o.delivery_address && o.fulfilment_method !== "collection" && !o.manual_locked_fields.includes("delivery_address")) {
+      once({ kind: "address_answered", summary: "Staff asked for the delivery address and the customer answered, but the order has none.", current: "No address", suggested: answer.address, evidence });
+    } else if (answer.kind === "product" && !o.manual_locked_fields.includes("items")) {
+      const next = patchWithProduct(o.items, answer.line, answer.open);
+      if (next.kind === "patch") once({ kind: "product_confirmed", summary: "Staff named a product and the customer confirmed it; the order does not say so.", current: itemsText(o.items), suggested: itemsText(next.items), evidence });
+    } else if (answer.kind === "quantity" && o.items.some((l) => !l.quantity) && !o.manual_locked_fields.includes("items")) {
+      const next = patchWithQuantity(o.items, answer.quantity);
+      if (next.kind === "patch") once({ kind: "quantity_answered", summary: "Staff asked how many and the customer answered, but the order has no quantity.", current: itemsText(o.items), suggested: itemsText(next.items), evidence });
+    }
+  }
+
+  // 2. A quantity changed in a follow-up the order was not built from ("make that 3"), or one staff stated.
+  const single = o.items.length === 1 && o.items[0].quantity && /^\d+$/.test(o.items[0].quantity.trim()) ? o.items[0] : null;
+  if (single && !o.manual_locked_fields.includes("items")) {
+    const current = Number(single.quantity);
+    for (const m of after) {
+      if (Date.parse(m.at) <= lastSourceAt || (m.id && sourceIds.has(m.id))) continue;
+      let next: number | null = null;
+      let how = "";
+      if (m.who === "Customer") {
+        const adj = quantityAdjustments([m.text]);
+        if (adj.length === 1 && adj[0].kind === "set") (next = adj[0].n), (how = "the customer corrected the quantity");
+      } else {
+        const said = readStaffQuantity(m.text);
+        if (said) (next = Number(said)), (how = "staff stated the quantity");
+      }
+      if (next !== null && next !== current) {
+        once({ kind: "quantity_corrected", summary: `In a later message ${how}.`, current: itemsText(o.items), suggested: itemsText([{ ...single, quantity: String(next) }]), evidence: [evidenceOf(m)] });
+      }
+    }
+  }
+
+  // 3. The retired generic warning, when what staff wrote is plain.
+  if (o.attention && STAFF_CHANGE_FLAGS.includes(o.attention)) {
+    const readings: string[] = [];
+    const evidence: EvidenceLine[] = [];
+    for (const m of after) {
+      if (m.who !== "Staff") continue;
+      const day = readStaffDeliveryDate(m.text, new Date(m.at), timezone);
+      const qty = readStaffQuantity(m.text);
+      if (day.kind === "commitment" && day.label) (readings.push(`delivery on ${day.label}`), evidence.push(evidenceOf(m)));
+      else if (qty) (readings.push(`${qty} bag${qty === "1" ? "" : "s"}`), evidence.push(evidenceOf(m)));
+    }
+    if (readings.length > 0) {
+      once({
+        kind: "staff_warning_resolvable",
+        summary: `The warning “${ATTENTION_TEXT[o.attention] ?? o.attention}” can be understood: ${[...new Set(readings)].join(", ")}. Apply the suggested changes (if any) and it can be cleared.`,
+        current: ATTENTION_TEXT[o.attention] ?? o.attention,
+        suggested: "Warning cleared once the change above is applied",
+        evidence: evidence.slice(0, 3),
+      });
+    }
+  }
+  return out;
 }

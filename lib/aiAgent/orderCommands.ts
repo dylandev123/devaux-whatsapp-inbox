@@ -3,18 +3,20 @@
 // orders, checks who may do what, and applies the change through the same code the Orders dashboard uses.
 //
 //   !orders [today|tomorrow|<date>|all|overdue|missing|undated|review]   what is outstanding, by the day it is for (read-only)
-//   !update                         what is new or changed since the last update (read-only)
-//   !update #QU6U9 confirmed        staff-confirm one order
-//   !update #QU6U9 cancelled        cancel it
-//   !update #QU6U9 2 bags           change its quantity (single-product orders)
-//   !update #QU6U9 delivery tomorrow   change the requested delivery date
 //   !order <name or phone>          search active orders
 //   !order #QU6U9 / !moreinfo #QU6U9   full details of one order
+//   !order #QU6U9 confirmed         staff-confirm one order
+//   !order #QU6U9 cancelled         cancel it
+//   !order #QU6U9 2 bags            change its quantity (single-product orders)
+//   !order #QU6U9 delivery tomorrow    change the requested delivery date
 //   !order #QU6U9 completed         mark it done (status "fulfilled"): it leaves !orders, its history stays
 //   !order #QU6U9 reopen            undo an accidental completion
 //   !order #QU6U9 teach <words>     correct an order in plain language: previewed, applied only after !confirm C-CODE
 //   !orders complete all            complete today's outstanding orders: previewed, applied only after !confirm B-CODE
 //   !confirm C-CODE / !discard C-CODE   (also B-CODE) apply or drop a proposal made by one of the two commands above
+//
+// "!update" was retired: its report is replaced by !orders (and the 8 AM summary), and its per-order actions now live under
+// "!order #REF …" and need the order reference. A message that starts with "!update" is ordinary staff chatter again.
 //
 // A selector is a reference (#QU6U9), a phone number, or a customer name. Whatever it is, it must identify exactly ONE
 // active order; with two or more matches nothing is changed and the choices are listed. No model is involved.
@@ -25,6 +27,7 @@ import { type DateSource, effectiveDate, effectiveMethod } from "./orderDefaults
 import { dayLabel, orderDate, parseOrdersView, timeOfDay, type OrdersView } from "./orderViews.ts";
 import { BULK_HELP, MAX_INSTRUCTION, parseProposalCode, TEACH_HELP, type ProposalKind } from "./orderTeach.ts";
 import {
+  ATTENTION_TEXT,
   DEFAULT_ORDERS_TIMEZONE,
   conflictFields,
   conflictText,
@@ -54,7 +57,6 @@ export type UpdateAction =
   | { type: "reopen" };
 
 export type OrderCommand =
-  | { kind: "report" }
   | { kind: "orders"; view: OrdersView }
   | { kind: "update"; selector: Selector; action: UpdateAction }
   | { kind: "search"; query: string }
@@ -65,7 +67,7 @@ export type OrderCommand =
   | { kind: "bulk_complete" }
   /** `!confirm C-ABCDE` / `!discard B-ABCDE` */
   | { kind: "proposal"; action: "confirm" | "discard"; code: string; proposalKind: ProposalKind }
-  | { kind: "help"; reason: "update" | "order" | "moreinfo" | "orders" | "teach" | "complete_all" };
+  | { kind: "help"; reason: "order" | "moreinfo" | "orders" | "teach" | "complete_all" };
 
 /** The commands that propose or settle a proposal (handled by lib/server/aiAgent/orderCorrections.ts). */
 export type CorrectionCommand = Extract<OrderCommand, { kind: "teach" | "bulk_complete" | "proposal" }>;
@@ -89,35 +91,23 @@ export function parseSelector(raw: string): Selector | null {
 }
 
 const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
-const QUANTITY_TAIL = new RegExp(String.raw`^(.*?)\s+(?:(?:qty|quantity|x)\s*(\d{1,3}|${Object.keys(NUMBER_WORDS).join("|")})|(\d{1,3}|${Object.keys(NUMBER_WORDS).join("|")})\s*(?:bags?|sacks?|boxe?s?|units?|pcs|pieces?|x))$`, "i");
+const QUANTITY_BODY = new RegExp(String.raw`^(?:(?:qty|quantity|x)\s*(\d{1,3}|${Object.keys(NUMBER_WORDS).join("|")})|(\d{1,3}|${Object.keys(NUMBER_WORDS).join("|")})\s*(?:bags?|sacks?|boxe?s?|units?|pcs|pieces?|x))$`, "i");
 
-function parseUpdateBody(body: string): OrderCommand | null {
+/** The action part of "!order #REF <action>": confirmed, cancelled, "2 bags", "delivery tomorrow". Null when it is none of those. */
+function parseOrderAction(body: string): UpdateAction | null {
   const text = body.replace(/\s+/g, " ").replace(/[.!]+$/, "").trim();
-  // "!update the price list please" is staff chatter, as it always was. A message that starts like an order selector (a
-  // reference or a phone number) but has no action we understand gets the usage help instead of silence.
-  const first = parseSelector(text.split(" ")[0] ?? "");
-  const help: OrderCommand | null = first && first.type !== "name" ? { kind: "help", reason: "update" } : null;
-  const withAction = (selector: string, action: UpdateAction): OrderCommand | null => {
-    const s = parseSelector(selector);
-    return s ? { kind: "update", selector: s, action } : help;
-  };
-  let m = text.match(/^(.*?)\s+deliver(?:y|ed)?(?:\s+(?:date|on|for|by))?\s+(.+)$/i);
-  if (m) return m[2].trim().length <= 100 ? withAction(m[1], { type: "delivery", when: m[2].trim() }) : help;
-  m = text.match(/^(.*?)\s+(?:confirm|confirmed)$/i);
-  if (m) return withAction(m[1], { type: "confirm" });
-  m = text.match(/^(.*?)\s+(?:cancel|cancelled|canceled)$/i);
-  if (m) return withAction(m[1], { type: "cancel" });
-  m = text.match(QUANTITY_TAIL);
+  let m = text.match(/^deliver(?:y|ed)?(?:\s+(?:date|on|for|by))?\s+(.+)$/i);
+  if (m) return m[1].trim().length <= 100 ? { type: "delivery", when: m[1].trim() } : null;
+  if (/^(?:confirm|confirmed)$/i.test(text)) return { type: "confirm" };
+  if (/^(?:cancel|cancelled|canceled)$/i.test(text)) return { type: "cancel" };
+  m = text.match(QUANTITY_BODY);
   if (m) {
-    const word = (m[2] ?? m[3]).toLowerCase();
+    const word = (m[1] ?? m[2]).toLowerCase();
     const quantity = NUMBER_WORDS[word] ?? Number(word);
-    return quantity >= 1 && quantity <= 999 ? withAction(m[1], { type: "quantity", quantity }) : help;
+    return quantity >= 1 && quantity <= 999 ? { type: "quantity", quantity } : null;
   }
-  return help;
+  return null;
 }
-
-/** Exactly "!update" (case/spacing/punctuation tolerant). */
-const REPORT = /^!update\s*[.!]?\s*$/i;
 
 /**
  * Recognises the order commands. Returns null for anything else, which is handed on to the existing escalation and
@@ -126,7 +116,6 @@ const REPORT = /^!update\s*[.!]?\s*$/i;
  */
 export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: string | null } = {}): OrderCommand | null {
   const text = raw.replace(/\s+/g, " ").trim();
-  if (REPORT.test(text)) return { kind: "report" };
   // "!confirm C-ABCDE" / "!discard B-ABCDE": only OUR codes. K- (knowledge), M- (notes) and E- (requests) stay with their own
   // commands, so "!confirm K-7QX2" never reaches an order and "!confirm C-ABCDE" never reaches the knowledge flow.
   let m = text.match(/^!(confirm|discard)\s+(\S+)$/i);
@@ -141,8 +130,6 @@ export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: st
     const view = parseOrdersView(m[1], opts.now ?? new Date(), opts.timezone || DEFAULT_ORDERS_TIMEZONE);
     return view ? { kind: "orders", view } : { kind: "help", reason: "orders" };
   }
-  m = text.match(/^!update\s+(.+)$/i);
-  if (m) return parseUpdateBody(m[1]);
   m = text.match(/^!order\b\s*(.*)$/i);
   if (m) {
     const query = m[1].trim();
@@ -158,6 +145,13 @@ export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: st
     if (done) {
       const sel = parseSelector(done[1]);
       return sel?.type === "ref" ? { kind: "update", selector: sel, action: { type: /^reopen/i.test(done[2]) ? "reopen" : "complete" } } : { kind: "help", reason: "order" };
+    }
+    // "!order #QU6U9 confirmed | cancelled | 2 bags | delivery tomorrow": the reference is required (a name could match the wrong order).
+    const acting = query.match(/^(\S+)\s+(.+)$/);
+    const actingOn = acting ? parseSelector(acting[1]) : null;
+    if (acting && actingOn?.type === "ref") {
+      const action = parseOrderAction(acting[2]);
+      return action ? { kind: "update", selector: actingOn, action } : { kind: "help", reason: "order" };
     }
     const s = parseSelector(query);
     if (s?.type === "ref") return { kind: "info", selector: s };
@@ -237,10 +231,9 @@ export const ORDER_HELP = [
   "ℹ️ Order commands:",
   "!orders — outstanding orders for today and tomorrow",
   "!orders today | tomorrow | 30 Oct | all | overdue | missing | undated | review",
-  "!update — what is new or changed since the last update",
-  "!update #REF confirmed | cancelled | 2 bags | delivery tomorrow",
   "!order <name or phone> — find an order",
   "!order #REF — order details (also !moreinfo #REF)",
+  "!order #REF confirmed | cancelled | 2 bags | delivery tomorrow — change one order",
   "!order #REF completed — mark done (leaves !orders)",
   "!order #REF reopen — undo a completion",
   "!order #REF teach <what is wrong> — fix an order in your own words (previewed first)",
@@ -270,7 +263,7 @@ export const ORDER_REPLY = {
       `⚠️ "${clip(what, 40)}" matches ${orders.length} active orders — nothing changed. Use the reference:`,
       ...orders.slice(0, 5).map((o) => `${label(o, names)} · ${clip(itemsOneLine(o), 60)}`),
       ...(orders.length > 5 ? [`…and ${orders.length - 5} more`] : []),
-      "Example: !update #REF confirmed",
+      "Example: !order #REF confirmed",
     ].join("\n"),
   closed: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is already ${STATUS_NAME[o.status] ?? o.status} — nothing changed.`,
   alreadyCompleted: (o: TrackedOrder) => `ℹ️ ${displayRef(o.ref_code)} is already completed — no change.`,
@@ -330,7 +323,7 @@ function valueText(field: string, v: unknown): string {
 
 function changeText(changes: OrderEventLine["changes"]): string {
   const parts = Object.entries(changes)
-    .filter(([field]) => !["staff_message", "removed_items", "inferred", "correction", "completion_batch"].includes(field))
+    .filter(([field]) => !["staff_message", "removed_items", "inferred", "correction", "completion_batch", "answer_source", "product_source", "change_source", "staff_change_unclear", "answer_unclear", "field_conflicts"].includes(field))
     .slice(0, 3)
     .map(([field, c]) => `${field.replace(/_/g, " ")} ${valueText(field, c?.before)} → ${valueText(field, c?.after)}`);
   return parts.join("; ") || "noted";
@@ -376,8 +369,19 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
       return [`Day: ${dayLabel(day.date!)}${time ? ` · ${time}` : ""}`];
     })(),
     ...(o.notes ? [`Note: ${clip(o.notes, 160)}`] : []),
-    ...conflictFields(o).map((f) => `⚠️ Customer now says ${conflictText(f, o.field_conflicts[f]!, 50)}`),
-    ...(o.attention ? [`⚠️ ${clip(o.attention.replace(/_/g, " "), 60)}`] : []),
+    ...conflictFields(o).map((f) => {
+      const c = o.field_conflicts[f]!;
+      const evidence = c.evidence ? ` — “${clip(c.evidence, 80)}”` : "";
+      return c.source === "staff_chat" ? `⚠️ Staff said in chat ${conflictText(f, c, 50)}${evidence}` : `⚠️ Customer now says ${conflictText(f, c, 50)}${evidence}`;
+    }),
+    ...(o.attention ? [`⚠️ ${clip(ATTENTION_TEXT[o.attention] ?? o.attention.replace(/_/g, " "), 140)}`] : []),
+    ...(o.attention === "staff_change_unclear" || o.attention === "staff_changed_in_chat"
+      ? events
+          .map((e) => (e.changes?.staff_message as { after?: unknown } | undefined)?.after)
+          .filter((t): t is string => typeof t === "string" && t.length > 0)
+          .slice(0, 1)
+          .map((t) => `Staff wrote: “${clip(t, 140)}”`)
+      : []),
     `First message ${when(o.first_message_at) ?? "?"} · last ${when(o.last_message_at) ?? "?"}`,
     ...(o.manual_locked_fields.length > 0 ? [`Edited by staff: ${o.manual_locked_fields.join(", ").replace(/_/g, " ")}`] : []),
     ...(o.status === "fulfilled" ? [completionLine(o, events, when)] : []),
@@ -393,7 +397,18 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
   ];
   if (filled.length > 0) lines.push(`ℹ️ From earlier orders: ${filled.join("; ")} — not stated in this chat`);
   const unresolved = [...new Set(inferred.flatMap((i) => i.unresolved ?? []))];
-  if (unresolved.length > 0) lines.push(`ℹ️ Not resolved from history: ${unresolved.map((u) => clip(u, 60)).join("; ")}`);
+  if (unresolved.length > 0) lines.push(`ℹ️ Not resolved from history: ${unresolved.map((u) => clip(u, 100)).join("; ")}`);
+  // Why a product, quantity or address is what it is when the customer did not type it as an order: answered a staff question, or chosen from the conversation or history.
+  const answered = events
+    .map((e) => e.changes?.answer_source?.after as { kind?: string; question?: string; question_at?: string; answer?: string } | undefined)
+    .filter((x): x is NonNullable<typeof x> => Boolean(x));
+  for (const x of answered.slice(0, 3)) lines.push(`ℹ️ ${x.kind === "address" ? "Address" : x.kind === "quantity" ? "Quantity" : "Product"} from the chat: staff asked “${clip(x.question ?? "", 70)}” (${when(x.question_at ?? null) ?? "?"}), the customer replied “${clip(x.answer ?? "", 50)}”`);
+  const sources = events.flatMap((e) => (Array.isArray(e.changes?.product_source?.after) ? (e.changes.product_source.after as { source?: string; product?: string; ref?: string; staffMessage?: string; customerText?: string }[]) : []));
+  for (const x of sources.slice(0, 3)) {
+    if (x.source === "conversation_confirmed") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the customer confirmed it in this chat (staff asked “${clip(x.staffMessage ?? "", 60)}”, they replied “${clip(x.customerText ?? "", 40)}”)`);
+    else if (x.source === "order_history") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the customer's only verified purchase (${x.ref ? displayRef(x.ref) : "earlier order"})`);
+    else if (x.source === "open_order") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the product already on this order`);
+  }
   const recent = events.slice(0, 5).map((e) => `• ${when(e.created_at) ?? ""} ${e.actor_kind}: ${clip(e.kind.replace(/_/g, " "), 24)} — ${clip(changeText(e.changes), 90)}`);
   if (recent.length > 0) lines.push("Recent changes:", ...recent);
   return lines.join("\n");
