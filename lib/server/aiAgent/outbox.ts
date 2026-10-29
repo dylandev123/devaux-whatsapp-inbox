@@ -9,7 +9,7 @@ import { BLOCK_REASONS, failureReason } from "@/lib/aiAgent/outboxStatus";
 import { buildSendFailureMessage } from "@/lib/aiAgent/staffAnswers";
 import { agentDb, loadSettings } from "@/lib/server/aiAgent/db";
 
-export type OutboxKind = "customer_reply" | "holding_reply" | "staff_notice" | "staff_draft" | "staff_relay" | "staff_feedback";
+export type OutboxKind = "customer_reply" | "holding_reply" | "staff_notice" | "staff_draft" | "staff_relay" | "staff_feedback" | "missed_call_reply";
 
 export interface OutboxInsert {
   businessSlug: string;

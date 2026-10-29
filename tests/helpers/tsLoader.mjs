@@ -32,6 +32,8 @@ export async function resolve(specifier, context, next) {
     const file = firstFile(join(root, specifier.slice(2)));
     if (file) return { url: pathToFileURL(file).href, shortCircuit: true };
   }
+  // Route handlers import "next/server" and "next/headers", which Next resolves itself; plain Node ESM needs the file name.
+  if (/^next\/(server|headers)$/.test(specifier)) return next(`${specifier}.js`, context);
   return next(specifier, context);
 }
 

@@ -40,11 +40,13 @@ import {
   type ProposalKind,
   type ReusableSuggestion,
 } from "@/lib/aiAgent/orderTeach";
+import { NUMBER_REPLY } from "@/lib/aiAgent/orderNumbers";
 import { dayContext, dayLabel } from "@/lib/aiAgent/orderViews";
 import { ORDER_REPLY } from "@/lib/aiAgent/orderCommands";
 import { isOpenStatus, type TrackedOrder } from "@/lib/aiAgent/orders";
 import { agentDb, audit, loadActiveKnowledge } from "@/lib/server/aiAgent/db";
 import { proposeOrderCorrection } from "@/lib/server/aiAgent/model";
+import { resolveNumberedTarget } from "@/lib/server/aiAgent/orderNumberTarget";
 import {
   type CommandContext,
   groupReply,
@@ -67,10 +69,25 @@ export interface CorrectionCommandArgs extends CommandContext {
   timestamp: string | null;
 }
 
-/** Every order command, wherever it was typed (the staff group or the separate Orders group): proposals go to this file, the rest to orders.ts. */
-export function runOrderCommand(args: Omit<CorrectionCommandArgs, "command"> & { command: OrderCommand }): Promise<UpdateCommandResult> {
-  const command = args.command;
-  return isCorrectionCommand(command) ? handleCorrectionCommand({ ...args, command }) : handleOrderCommand({ ...args, command });
+/**
+ * Every order command, wherever it was typed (the staff group or the separate Orders group): proposals go to this file, the rest to
+ * orders.ts. A command that names its order by a report number ("!order 2 completed") is first turned into the order reference
+ * that number meant in the stored report (orderNumberTarget.ts); after that it is an ordinary #REF command.
+ */
+export async function runOrderCommand(args: Omit<CorrectionCommandArgs, "command"> & { command: OrderCommand }): Promise<UpdateCommandResult> {
+  let command = args.command;
+  let requiredVersion = args.requiredVersion;
+  if ((command.kind === "update" || command.kind === "info" || command.kind === "teach") && command.selector.type === "number") {
+    // Who may use commands, and where, is decided before anything about a list is revealed or looked up.
+    const refused = await guardOrderCommand(args);
+    if (refused) return refused;
+    const target = await resolveNumberedTarget(args, command.selector.n, command.kind !== "info", args.now ?? new Date());
+    if (!target.ok) return target.result;
+    command = { ...command, selector: { type: "ref", ref: target.ref } } as OrderCommand;
+    if (command.kind !== "info") requiredVersion = target.version;
+  }
+  const next = { ...args, requiredVersion };
+  return isCorrectionCommand(command) ? handleCorrectionCommand({ ...next, command }) : handleOrderCommand({ ...next, command });
 }
 
 const clip = (v: string, n: number) => (v.length > n ? `${v.slice(0, n - 1)}…` : v);
@@ -274,6 +291,8 @@ async function handleTeach(ctx: Ctx, command: Extract<CorrectionCommand, { kind:
   const order = await loadOrderByRef(slug, command.selector.type === "ref" ? command.selector.ref : "");
   if (!order) return ctx.reject("not_found", ORDER_REPLY.noRef(command.selector.type === "ref" ? command.selector.ref : ""));
   if (!isOpenStatus(order.status)) return ctx.reject("closed", CORRECTION_REPLY.closed(order));
+  // Named by a report number: only if the order is exactly as that report showed it.
+  if (ctx.requiredVersion !== undefined && order.version !== ctx.requiredVersion) return ctx.reject("list_stale", NUMBER_REPLY.changed(`#${order.ref_code.replace(/^O-/, "")}`));
   const names = await loadOrderNames(slug, [order]);
 
   const today = dayContext(writtenAt, tz).today;

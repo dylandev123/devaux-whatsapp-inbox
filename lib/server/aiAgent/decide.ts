@@ -35,6 +35,7 @@ import {
   missingOrderFields,
   staffNoticeSkipReason,
 } from "@/lib/aiAgent/engine";
+import { categoryForEscalation, isRoutedGroup, noticeGroup, settingsForRoutedGroup } from "@/lib/aiAgent/routing";
 import { assessDraftReadiness, buildPilotNotice, buildPilotUpdateNotice, pilotNoReplyNeeded } from "@/lib/aiAgent/pilot";
 import { gateAllowsMonitoring, ORDER_CONTEXT_FETCH, orderContextWindow } from "@/lib/aiAgent/orderMonitor";
 import { type CustomerMode, customerModeAllowsKind, effectiveCustomerMode, modeAdjustedDecision } from "@/lib/aiAgent/customerMode";
@@ -185,7 +186,11 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
   const settings = await loadSettings(input.businessSlug);
   if (!settings?.enabled) return ignored("agent_disabled");
 
-  const isStaffGroup = Boolean(settings.staff_group_jid) && input.chatId === settings.staff_group_jid;
+  // A group named by an enabled Rules & Routing rule is an authorized staff group too: it is processed as the staff group, with
+  // that group standing in for it (replies go back there; order commands are still refused in it unless it is the orders group).
+  const routedHere = input.chatId !== settings.staff_group_jid && isRoutedGroup(settings, input.chatId);
+  const isStaffGroup = (Boolean(settings.staff_group_jid) && input.chatId === settings.staff_group_jid) || routedHere;
+  const groupSettings = routedHere ? settingsForRoutedGroup(settings, input.chatId) : settings;
   // A separate Orders group (when configured) accepts the order commands (!orders, !order, !moreinfo #REF) and nothing else.
   const isOrdersGroup = !isStaffGroup && hasSeparateOrdersGroup(settings) && input.chatId === settings.orders_group_jid;
   // Our own sends echoed back by the bridge are dropped before anything else:
@@ -221,7 +226,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
       outcome = await processOrdersGroupMessage(input, settings, eventId);
     } else if (isStaffGroup) {
       const staff = await processStaffGroupMessage({
-        settings,
+        settings: groupSettings,
         text: input.text,
         quotedMessageId: input.quotedMessageId,
         senderJid: input.senderJid,
@@ -311,7 +316,7 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
       .eq("id", eventId);
     // A staff answer that died part-way must not vanish: mark it failed (retryable only when no
     // customer message may have gone out) and tell the staff group / dashboard.
-    if (isStaffGroup) await reportStaffFailure({ settings, eventId, error: err });
+    if (isStaffGroup) await reportStaffFailure({ settings: groupSettings, eventId, error: err });
     // Fail closed: nothing is sent; the event row records what went wrong.
     return { eventId, status: "error", decision: null, reasons: ["internal_error"], outbox: [] };
   }
@@ -325,6 +330,7 @@ async function processOrdersGroupMessage(input: BridgeMessageInput, settings: Ag
     settings,
     fromGroup: input.chatId,
     command,
+    quotedMessageId: input.quotedMessageId,
     senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone ?? null),
     senderJid: input.senderJid,
     eventId,
@@ -1138,8 +1144,9 @@ async function notifyStaff(args: {
 }): Promise<{ reasons: string[]; row: OutboxRow | null }> {
   const { ctx, write, escalateInput } = args;
   const { settings, businessSlug } = ctx;
-  const group = settings.staff_group_jid;
-  if (!group) return { reasons: ["staff_notice_skipped_no_staff_group"], row: null };
+  if (!settings.staff_group_jid) return { reasons: ["staff_notice_skipped_no_staff_group"], row: null };
+  // Rules & Routing: the group for this kind of escalation, else the staff group. Exactly one group hears each notice.
+  const group = noticeGroup(settings, categoryForEscalation({ priority: write.escalation.priority, reasonCodes: write.escalation.reason_codes?.length ? write.escalation.reason_codes : escalateInput.reasons, mode: settings.mode })) ?? settings.staff_group_jid;
   const observeOnly = settings.mode !== "assisted";
 
   let escalation: EscalationRow = write.escalation;

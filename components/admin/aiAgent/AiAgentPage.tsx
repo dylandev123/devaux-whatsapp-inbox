@@ -12,6 +12,7 @@ import { EvaluationPanel } from "@/components/admin/aiAgent/EvaluationPanel";
 import { KnowledgePanel } from "@/components/admin/aiAgent/KnowledgePanel";
 import { MemoryPanel } from "@/components/admin/aiAgent/MemoryPanel";
 import { OrdersPanel } from "@/components/admin/aiAgent/OrdersPanel";
+import { RoutingPanel } from "@/components/admin/aiAgent/RoutingPanel";
 import { ReviewPanel } from "@/components/admin/aiAgent/ReviewPanel";
 import { SettingsCard } from "@/components/admin/aiAgent/SettingsCard";
 import { TestConsole } from "@/components/admin/aiAgent/TestConsole";
@@ -19,6 +20,7 @@ import { inputClass, Notice } from "@/components/admin/aiAgent/ui";
 
 const TABS = [
   { id: "setup", label: "Setup" },
+  { id: "routing", label: "Rules & Routing" },
   { id: "knowledge", label: "Knowledge" },
   { id: "escalations", label: "Escalations" },
   { id: "orders", label: "Orders" },
@@ -140,6 +142,7 @@ export function AiAgentPage() {
               <ContactPermissions businessSlug={businessSlug} scope={s.contact_scope} onScopeSaved={onSettingsSaved} />
             </>
           )}
+          {tab === "routing" && <RoutingPanel key={businessSlug} businessSlug={businessSlug} data={data} onSaved={onSettingsSaved} />}
           {tab === "knowledge" && <KnowledgePanel businessSlug={businessSlug} />}
           {tab === "escalations" && <EscalationsPanel businessSlug={businessSlug} observe={s?.mode === "observe"} />}
           {tab === "orders" && <OrdersPanel businessSlug={businessSlug} settings={s} />}

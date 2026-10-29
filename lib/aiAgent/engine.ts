@@ -14,6 +14,7 @@ import { BLOCK_REASONS, failureReason } from "./outboxStatus.ts";
 import type { RepeatResolution } from "./memory.ts";
 import { type CustomerMode, effectiveCustomerMode } from "./customerMode.ts";
 import type { PilotCommand } from "./pilot.ts";
+import { isRoutedGroup } from "./routing.ts";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -104,6 +105,12 @@ export interface AgentSettings {
   orders_customer_confirms?: boolean | null;
   /** When order tracking was last switched on. */
   orders_tracking_since?: string | null;
+  /** Rules & Routing (lib/aiAgent/routing.ts): per-category groups for complaints / urgent / approvals. Absent/{} = no routing. */
+  routing_rules?: unknown;
+  /** Missed-call rule (lib/aiAgent/missedCalls.ts). Absent/false = off. */
+  missed_call_enabled?: boolean | null;
+  missed_call_message?: string | null;
+  missed_call_cooldown_minutes?: number | null;
 }
 
 /** Where the order summary goes and the order commands are accepted: the orders group, else the staff group. */
@@ -271,6 +278,12 @@ export function outboxAllowed(settings: AgentSettings | null, item: { kind: stri
     const kinds = settings.mode === "observe" ? ["staff_notice"] : ["staff_notice", "staff_feedback"];
     return kinds.includes(item.kind) && canPostOrderSummary(settings);
   }
+  // A group named by an enabled Rules & Routing rule takes the staff-group kinds, in the same modes the staff group does.
+  if (isRoutedGroup(settings, item.toJid)) {
+    return (settings.mode === "observe" ? OBSERVE_STAFF_KINDS : (STAFF_GROUP_KINDS as readonly string[])).includes(item.kind) && canSendStaffNotice(settings);
+  }
+  // The missed-call reply: only while the rule is on, and never in Observe (which never writes to a customer).
+  if (item.kind === "missed_call_reply") return settings.missed_call_enabled === true && (settings.mode === "assisted" || settings.mode === "approval_pilot") && !item.toJid.endsWith("@g.us");
   if (settings.mode === "assisted") return true;
   if (settings.mode === "approval_pilot") {
     // Staff-group kinds to the staff group, or a staff_relay (an authorized staff send). Never the AI's own customer kinds.

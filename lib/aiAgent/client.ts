@@ -63,6 +63,24 @@ export interface SettingsPatch {
   ordersSummaryHour?: number;
   /** Rollout safety: false = a customer's yes is only recorded; staff verify and confirm. */
   ordersCustomerConfirms?: boolean;
+  /** Rules & Routing: complaints / urgent / approvals. The orders category uses ordersGroupJid. */
+  routingRules?: Partial<Record<"complaints" | "urgent" | "approvals", { enabled: boolean; groupJid: string | null; groupName?: string | null }>>;
+  /** Category → true when its group was typed in rather than picked from discovered groups. */
+  routingManual?: Partial<Record<"complaints" | "urgent" | "approvals", boolean>>;
+  missedCallEnabled?: boolean;
+  missedCallMessage?: string;
+  missedCallCooldownMinutes?: number;
+}
+
+export interface CallEventView {
+  id: string;
+  call_id: string;
+  caller_jid: string;
+  decision: "replied" | "skipped";
+  reason: string;
+  video: boolean | null;
+  call_at: string | null;
+  created_at: string;
 }
 
 export interface ContactSearchResult {
@@ -546,6 +564,7 @@ export const aiAgentApi = {
   cancelBackfill: (b: string, runId: string) => api<{ run: BackfillRunView }>("/api/ai-agent/orders/backfill", send("POST", { businessSlug: b, action: "cancel", runId })),
   getBusinesses: () =>
     api<{ businesses: import("@/lib/aiAgent/businessList").AgentBusiness[]; sessionsKnown: boolean }>("/api/ai-agent/businesses"),
+  listCalls: (b: string) => api<{ calls: CallEventView[] }>(`/api/ai-agent/calls${q(b)}`),
   getSettings: (b: string) => api<SettingsResponse>(`/api/ai-agent/settings${q(b)}`),
   saveSettings: (b: string, patch: SettingsPatch) =>
     api<{ settings: SettingsResponse["settings"]; requiredConfidence: number | null }>(

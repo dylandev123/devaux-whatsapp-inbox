@@ -201,6 +201,7 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
       settings,
       fromGroup: groupJid,
       command: orderCommand,
+      quotedMessageId: input.quotedMessageId,
       senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone),
       senderJid: input.senderJid,
       eventId: input.eventId,

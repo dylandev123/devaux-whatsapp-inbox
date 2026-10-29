@@ -33,6 +33,8 @@ import {
   searchReply,
 } from "@/lib/aiAgent/orderCommands";
 import { BULK_HELP, TEACH_HELP } from "@/lib/aiAgent/orderTeach";
+import { NUMBER_REPLY } from "@/lib/aiAgent/orderNumbers";
+import { saveOrderList } from "@/lib/server/aiAgent/orderLists";
 import {
   type ConversationAnswer,
   type ConfirmedProduct,
@@ -65,7 +67,7 @@ import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote
 import { classifyOrderIntent, INTENT_REASON_CODE, staffRecentlyOfferedDelivery } from "@/lib/aiAgent/orderIntent";
 import { agreedDeliveryDate, type ConversationLine, isAffirmation } from "@/lib/aiAgent/staffDelivery";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
-import { buildOrdersView, type OrdersView, orderDate } from "@/lib/aiAgent/orderViews";
+import { buildOrdersView, type OrdersView, orderDate, viewKind } from "@/lib/aiAgent/orderViews";
 import {
   coverageWarning,
   type Coverage,
@@ -1784,7 +1786,7 @@ export async function buildSummaryNow(settings: AgentSettings, trigger: "schedul
   const names = await loadOrderNames(settings.business_slug, orders);
   const warning = coverageWarning(coverage);
   const built = buildOrdersView({ view, orders, names, now, timezone: tzOf(settings), warning, addresses: await loadAddressProvenance(settings.business_slug, orders) });
-  return { text: built.parts.join("\n\n"), parts: built.parts, shown: built.shown, attention: built.counts.attention, overdue: built.counts.overdue };
+  return { text: built.parts.join("\n\n"), parts: built.parts, numbered: built.numbered, shown: built.shown, attention: built.counts.attention, overdue: built.counts.overdue };
 }
 
 function summaryItem(settings: AgentSettings, body: string, dedupeKey: string, eventId: string | null): OutboxInsert {
@@ -1808,6 +1810,8 @@ async function queueSummary(
     await agentDb().from("ai_agent_order_summary_runs").update({ status: "skipped", skip_reason: "send_not_permitted" }).eq("id", run.id);
     return null;
   }
+  // The morning list is numbered too: store what each number means before the list is posted.
+  await saveOrderList({ businessSlug: settings.business_slug, groupJid: items[0].toJid, viewKind: "default", listKey: run.dedupeKey, numbered: summary.numbered });
   // One at a time, so the parts reach the group in order (rows created together share a timestamp).
   const created: OutboxRow[] = [];
   let first: OutboxRow | null = null;
@@ -2024,6 +2028,10 @@ export interface CommandContext {
   senderJid: string | null;
   eventId: string;
   now?: Date;
+  /** The WhatsApp message the command quotes (a quoted !orders report names the list a number belongs to). */
+  quotedMessageId?: string | null;
+  /** Set when the command named its order by a report number: the order must still be at the version the report showed. */
+  requiredVersion?: number;
 }
 
 /** A reply to the group the command came from. Always a group JID: order commands have no customer-bound output at all. */
@@ -2066,13 +2074,20 @@ export async function guardOrderCommand(ctx: CommandContext): Promise<UpdateComm
 /** A command written longer ago than this (an offline catch-up) is not applied: send it again. */
 export const MAX_COMMAND_AGE_MS = 2 * 3_600_000;
 
+export async function loadOrderById(businessSlug: string, id: string): Promise<TrackedOrder | null> {
+  const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).eq("id", id).maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as TrackedOrder | null) ?? null;
+}
+
 export async function loadOrderByRef(businessSlug: string, refCode: string): Promise<TrackedOrder | null> {
   const { data, error } = await agentDb().from("ai_agent_orders").select(ORDER_COLUMNS).eq("business_slug", businessSlug).eq("ref_code", refCode).maybeSingle();
   if (error) throw new Error(error.message);
   return (data as TrackedOrder | null) ?? null;
 }
 
-const selectorText = (s: Extract<OrderCommand, { kind: "update" }>["selector"]) => (s.type === "ref" ? `#${s.ref.replace(/^O-/, "")}` : s.type === "phone" ? s.digits : s.text);
+const selectorText = (s: Extract<OrderCommand, { kind: "update" }>["selector"]) =>
+  s.type === "ref" ? `#${s.ref.replace(/^O-/, "")}` : s.type === "phone" ? s.digits : s.type === "number" ? String(s.n) : s.text;
 
 export interface OrderCommandArgs extends CommandContext {
   /** Every order command except the ones that propose or settle a proposal (lib/server/aiAgent/orderCorrections.ts). */
@@ -2116,6 +2131,8 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
     await audit(slug, "staff", senderAuth.senderId, "orders.lookup", { type: "chat", id: fromGroup }, { command: "orders", view: command.view.type, shown: view.shown });
     // One at a time, so the parts reach the group in order. The key is the WhatsApp message: a redelivery sends nothing twice.
     const queued: OutboxRow[] = [];
+    // The numbering is stored BEFORE the report is posted: "!order 2" always means what this report showed as 2.
+    await saveOrderList({ businessSlug: slug, groupJid: fromGroup, viewKind: viewKind(command.view), listKey: `ordersview:${slug}:${args.whatsappMessageId}`, numbered: view.numbered });
     for (const [i, part] of view.parts.entries()) {
       queued.push(...(await enqueue([{ businessSlug: slug, chatId: fromGroup, kind: "staff_notice", toJid: fromGroup, body: part.slice(0, 3800), dedupeKey: `ordersview:${slug}:${args.whatsappMessageId}:p${i + 1}`, eventId: args.eventId }], true)));
     }
@@ -2159,6 +2176,8 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
     if (action.type === "reopen" && order.status !== "fulfilled") return reject("no_change", ORDER_REPLY.notCompleted(order));
     if (action.type !== "reopen" && !isOpenStatus(order.status)) return reject("closed", ORDER_REPLY.closed(order));
   }
+  // Named by a report number: only if the order is exactly as that report showed it.
+  if (args.requiredVersion !== undefined && order.version !== args.requiredVersion) return reject("list_stale", NUMBER_REPLY.changed(displayRefText(order)));
   const writtenAt = args.timestamp && !Number.isNaN(Date.parse(args.timestamp)) ? args.timestamp : null;
   if (writtenAt && now.getTime() - Date.parse(writtenAt) > MAX_COMMAND_AGE_MS) {
     return reject("too_old", `⚠️ That command was written more than 2 hours ago, so it was not applied to ${displayRefText(order)}. Send it again if it is still right.`);

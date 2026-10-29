@@ -5,9 +5,11 @@ import { parseAuthorizedSenders } from "@/lib/aiAgent/identity";
 import { validateBatchWindow } from "@/lib/aiAgent/batching";
 import { isValidTimezone } from "@/lib/aiAgent/orders";
 import { normalizeGroupJid } from "@/lib/aiAgent/chatDirectory";
+import { validateMissedCallConfig } from "@/lib/aiAgent/missedCalls";
+import { parseRoutingRules, type RoutedCategory, routedGroups, validateRoutingRules } from "@/lib/aiAgent/routing";
 import { loadBusinessChats } from "@/lib/server/aiAgent/chats";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, ensureSettings, loadSettings, resolveBusinessSlug, SETTINGS_COLUMNS } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, ensureSettings, isMissingColumn, LEGACY_SETTINGS_COLUMNS, loadSettings, NEW_SETTINGS_COLUMNS, resolveBusinessSlug, SETTINGS_COLUMNS } from "@/lib/server/aiAgent/db";
 import { getAiSettings } from "@/lib/server/aiSettings";
 
 // Admin-only (middleware.ts ADMIN_API_PREFIXES + requireAdmin()).
@@ -64,7 +66,21 @@ interface Payload {
   ordersTimezone?: unknown;
   ordersSummaryHour?: unknown;
   ordersCustomerConfirms?: unknown;
+  routingManual?: unknown;
+  routingRules?: unknown;
+  missedCallEnabled?: unknown;
+  missedCallMessage?: unknown;
+  missedCallCooldownMinutes?: unknown;
 }
+
+/** Every group another business already uses (staff, orders or a routing rule): a routed group is never shared across businesses. */
+async function otherBusinessGroups(businessSlug: string): Promise<Set<string>> {
+  const { data, error } = await agentDb().from("ai_agent_settings").select("staff_group_jid, orders_group_jid, routing_rules").neq("business_slug", businessSlug);
+  if (error) throw new Error(error.message);
+  return new Set((data ?? []).flatMap((r) => [r.staff_group_jid, r.orders_group_jid, ...routedGroups({ staff_group_jid: null, routing_rules: r.routing_rules })].filter((g): g is string => Boolean(g))));
+}
+
+type SettingsRow = Awaited<ReturnType<typeof loadSettings>> & { autonomy: number };
 
 function intIn(value: unknown, min: number, max: number): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max ? value : null;
@@ -214,6 +230,40 @@ export async function PUT(request: Request) {
       return jsonError("ordersGroupJid must be a WhatsApp group id (…@g.us)", 400);
     }
   }
+  if (body.routingRules !== undefined) {
+    const current = await loadSettings(businessSlug);
+    const staffGroup = (patch.staff_group_jid as string | null | undefined) !== undefined ? (patch.staff_group_jid as string | null) : (current?.staff_group_jid ?? null);
+    const checked = validateRoutingRules(body.routingRules, staffGroup);
+    if (!checked.ok) return jsonError(checked.error, 400);
+    const ordersGroup = (patch.orders_group_jid as string | null | undefined) !== undefined ? (patch.orders_group_jid as string | null) : (current?.orders_group_jid ?? null);
+    const known = await loadBusinessChats(businessSlug).catch(() => null);
+    const others = await otherBusinessGroups(businessSlug);
+    for (const [category, rule] of Object.entries(checked.rules)) {
+      if (!rule?.group_jid) continue;
+      // The orders group takes order commands only; it can never also be an escalation or approval group.
+      if (ordersGroup && rule.group_jid === ordersGroup) return jsonError(`${category}: that is the Orders group, which only takes order commands — pick a different group`, 400);
+      if (others.has(rule.group_jid)) return jsonError(`${category}: that group is already used by another business`, 400);
+      const before = parseRoutingRules(current?.routing_rules)[category as RoutedCategory];
+      // Same rule as the staff group: a group this business has seen, unless typed in explicitly (the JID is unchanged or flagged manual).
+      if (rule.enabled && before?.group_jid !== rule.group_jid && (body.routingManual as Record<string, unknown> | undefined)?.[category] !== true) {
+        if (!known) return jsonError("Failed to verify the group", 500);
+        if (!known.groups.some((g) => g.chatId.toLowerCase() === rule.group_jid)) {
+          return jsonError(`${category}: that group has no messages for this business — pick a discovered group or enter its JID manually`, 400);
+        }
+      }
+    }
+    patch.routing_rules = checked.rules;
+  }
+  if (body.missedCallEnabled !== undefined) {
+    if (typeof body.missedCallEnabled !== "boolean") return jsonError("missedCallEnabled must be a boolean", 400);
+    patch.missed_call_enabled = body.missedCallEnabled;
+  }
+  if (body.missedCallMessage !== undefined || body.missedCallCooldownMinutes !== undefined) {
+    const checked = validateMissedCallConfig({ message: body.missedCallMessage, cooldownMinutes: body.missedCallCooldownMinutes });
+    if (!checked.ok) return jsonError(checked.error, 400);
+    if (checked.message !== undefined) patch.missed_call_message = checked.message;
+    if (checked.cooldownMinutes !== undefined) patch.missed_call_cooldown_minutes = checked.cooldownMinutes;
+  }
   if (body.staffAuthorizedSenders !== undefined) {
     // Verified WhatsApp identities only: phone numbers or exact …@lid ids — never names.
     const parsed = parseAuthorizedSenders(body.staffAuthorizedSenders);
@@ -234,18 +284,18 @@ export async function PUT(request: Request) {
       patch.batch_quiet_seconds = window.quiet;
       patch.batch_max_wait_seconds = window.maxWait;
     }
-    const { data, error } = await agentDb()
-      .from("ai_agent_settings")
-      .update(patch)
-      .eq("business_slug", businessSlug)
-      .select(SETTINGS_COLUMNS)
-      .single();
+    const write = (columns: string) => agentDb().from("ai_agent_settings").update(patch).eq("business_slug", businessSlug).select(columns).single();
+    let { data, error } = await write(SETTINGS_COLUMNS);
+    // The page keeps working before migration 20261110000000 is run (the new settings simply cannot be saved yet).
+    if (error && isMissingColumn(error) && !Object.keys(patch).some((k) => (NEW_SETTINGS_COLUMNS as readonly string[]).includes(k))) ({ data, error } = await write(LEGACY_SETTINGS_COLUMNS));
     if (error) throw new Error(error.message);
+    if (!data) throw new Error("Settings not found");
     await audit(businessSlug, "admin", admin.userId, "settings.update", { type: "settings", id: businessSlug }, {
       before,
       changes: patch,
     });
-    return NextResponse.json({ settings: data, requiredConfidence: requiredConfidence(data.autonomy) });
+    const saved = data as unknown as SettingsRow;
+    return NextResponse.json({ settings: saved, requiredConfidence: requiredConfidence(saved.autonomy) });
   } catch (err) {
     return jsonError(err instanceof Error ? err.message : "Failed to save settings", 500);
   }

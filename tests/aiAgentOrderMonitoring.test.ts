@@ -588,7 +588,9 @@ describe("Order monitoring of every conversation (real server code, real SQL)", 
     const text = await reportText();
     assert.match(text, /Monello Chicken/);
     assert.match(text, /Dog Treats/);
-    assert.match(text, /📅 \*Fri 30 Oct\* \(2\)/, "grouped under the day they are for, not the day they were written");
+    // Both orders are for the same day (the next Friday): one heading with both, whatever day the suite runs. (On the day before,
+    // that Friday is "tomorrow" and its heading says so.)
+    assert.match(text, /📅 \*(?:TOMORROW — |TODAY — )?Fri \d{1,2} \w{3}\* \(2\)/, "grouped under the day they are for, not the day they were written");
     assert.doesNotMatch(text, /⚠️ May be incomplete|OFF/, "nothing is missing, so nothing is flagged");
     assert.doesNotMatch(text, /selected for the AI/);
   });

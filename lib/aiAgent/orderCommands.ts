@@ -46,7 +46,9 @@ import {
 export type Selector =
   | { type: "ref"; ref: string }
   | { type: "phone"; digits: string }
-  | { type: "name"; text: string };
+  | { type: "name"; text: string }
+  /** The number shown in a !orders report (1–999): resolved against the stored list, never against a fresh query. */
+  | { type: "number"; n: number };
 
 export type UpdateAction =
   | { type: "confirm" }
@@ -79,6 +81,7 @@ const MAX_SELECTOR = 60;
 export function parseSelector(raw: string): Selector | null {
   const text = raw.replace(/^["'“‘]+|["'”’]+$/g, "").replace(/\s+/g, " ").trim();
   if (!text || text.length > MAX_SELECTOR) return null;
+  if (/^\d{1,3}$/.test(text) && Number(text) >= 1) return { type: "number", n: Number(text) };
   const ref = parseOrderRef(text);
   if (ref && /^#|^O-/i.test(text)) return { type: "ref", ref };
   if (/^\+?[\d\s()-]+$/.test(text)) {
@@ -139,28 +142,28 @@ export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: st
     if (teach) {
       const sel = parseSelector(teach[1]);
       const instruction = teach[2].replace(/\s+/g, " ").trim();
-      return sel?.type === "ref" && instruction && instruction.length <= MAX_INSTRUCTION ? { kind: "teach", selector: sel, instruction } : { kind: "help", reason: "teach" };
+      return (sel?.type === "ref" || sel?.type === "number") && instruction && instruction.length <= MAX_INSTRUCTION ? { kind: "teach", selector: sel, instruction } : { kind: "help", reason: "teach" };
     }
     const done = query.match(/^(.*?)\s+(complete|completed|reopen|reopened)$/i);
     if (done) {
       const sel = parseSelector(done[1]);
-      return sel?.type === "ref" ? { kind: "update", selector: sel, action: { type: /^reopen/i.test(done[2]) ? "reopen" : "complete" } } : { kind: "help", reason: "order" };
+      return sel?.type === "ref" || sel?.type === "number" ? { kind: "update", selector: sel, action: { type: /^reopen/i.test(done[2]) ? "reopen" : "complete" } } : { kind: "help", reason: "order" };
     }
     // "!order #QU6U9 confirmed | cancelled | 2 bags | delivery tomorrow": the reference is required (a name could match the wrong order).
     const acting = query.match(/^(\S+)\s+(.+)$/);
     const actingOn = acting ? parseSelector(acting[1]) : null;
-    if (acting && actingOn?.type === "ref") {
+    if (acting && (actingOn?.type === "ref" || actingOn?.type === "number")) {
       const action = parseOrderAction(acting[2]);
       return action ? { kind: "update", selector: actingOn, action } : { kind: "help", reason: "order" };
     }
     const s = parseSelector(query);
-    if (s?.type === "ref") return { kind: "info", selector: s };
+    if (s?.type === "ref" || s?.type === "number") return { kind: "info", selector: s };
     return query.length <= MAX_SELECTOR ? { kind: "search", query } : { kind: "help", reason: "order" };
   }
   m = text.match(/^!more[\s-]*info\b\s*(.*)$/i);
   if (m) {
     const s = m[1].trim() ? parseSelector(m[1]) : null;
-    return s?.type === "ref" ? { kind: "info", selector: s } : null;
+    return s?.type === "ref" || s?.type === "number" ? { kind: "info", selector: s } : null;
   }
   return null;
 }
@@ -200,6 +203,8 @@ function nameMatches(o: TrackedOrder, query: string, names?: OrderNames): boolea
  * active ones, which the caller passes). Several matches are returned as "many", never reduced to one.
  */
 export function resolveSelector(selector: Selector, orders: TrackedOrder[], names?: OrderNames): Resolution {
+  // A number is resolved against the stored report (lib/aiAgent/orderNumbers.ts) before this is ever called.
+  if (selector.type === "number") return { kind: "none" };
   const hits =
     selector.type === "ref"
       ? orders.filter((o) => o.ref_code.toUpperCase() === selector.ref)
@@ -233,6 +238,7 @@ export const ORDER_HELP = [
   "!orders today | tomorrow | 30 Oct | all | overdue | missing | undated | review",
   "!order <name or phone> — find an order",
   "!order #REF — order details (also !moreinfo #REF)",
+  "!order 2 … — the number shown in the latest !orders report works instead of #REF (reply to the report to be sure)",
   "!order #REF confirmed | cancelled | 2 bags | delivery tomorrow — change one order",
   "!order #REF completed — mark done (leaves !orders)",
   "!order #REF reopen — undo a completion",

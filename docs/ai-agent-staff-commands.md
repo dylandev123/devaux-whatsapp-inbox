@@ -70,3 +70,10 @@ See `docs/ai-agent-daily-orders.md` ("Order days and `!orders`"; `!update` was r
 
 * No semantic contradiction check for free-text notes (staff see existing notes in the proposal); no name search; a phone number is
   accepted only if the business has dealt with it. Expiry has no reminder: an unconfirmed proposal simply lapses.
+
+
+## Order numbers (`!order 2 …`)
+
+The number shown in an `!orders` report (or the morning summary) works instead of `#REF`: `!order 2`, `!order 2 completed`,
+`!order 2 cancelled`, `!order 2 teach …`. It always means what that posted report showed; reply to the report to be explicit.
+Expired, changed, ambiguous and unknown numbers change nothing. Details: `docs/ai-agent-missed-calls.md`.

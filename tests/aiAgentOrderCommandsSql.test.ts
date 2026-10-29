@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { register } from "node:module";
 import { pgAvailable, TestPg } from "./helpers/pgHarness.ts";
 import { pgSupabase } from "./helpers/pgSupabase.ts";
+import { stLuciaDay } from "./helpers/dates.ts";
 import { resolveRelativeDay } from "../lib/aiAgent/orderText.ts";
 
 register("./helpers/tsLoader.mjs", import.meta.url, { data: { root: process.cwd() } });
@@ -490,8 +491,10 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
     const o = await makeOrder(JANE, ORDER_TEXT);
     const qty = reply(await groupSays(`!order ${ref(o)} 2 bags`));
     assert.match(qty, new RegExp(`^✅ ${ref(o)} \\(.*\\): quantity 1 → 2`));
-    const when = reply(await groupSays(`!order ${ref(o)} delivery Friday`));
-    assert.match(when, new RegExp(`^✅ ${ref(o)} \\(.*\\): delivery date → Fri 30 Oct \\(Friday\\)`));
+    // A weekday three days ahead resolves to that very day, whatever day the suite runs.
+    const ahead = stLuciaDay(3);
+    const when = reply(await groupSays(`!order ${ref(o)} delivery ${ahead.weekday}`));
+    assert.match(when, new RegExp(`^✅ ${ref(o)} \\(.*\\): delivery date → ${ahead.label} \\(${ahead.weekday}\\)`));
     const confirmed = reply(await groupSays(`!order ${ref(o)} confirmed`));
     assert.match(confirmed, /internal staff confirmation\)\. The customer was not messaged\./);
     const o2 = await makeOrder(MARCUS, ORDER_TEXT);
@@ -754,18 +757,20 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
   });
 
   test("an order-date correction is recorded (who, when, before → after), moves the order between days, and the reply says if no day was read", async () => {
+    // Three days ahead: never today or tomorrow, whatever day the suite runs (the labels come from the clock, not from the test file).
+    const d = stLuciaDay(3);
     const o = await datedOrder(JANE, "tomorrow");
     const before = (await allOrders())[0].requested_for;
-    const moved = await groupSays(`!order ${ref(o)} delivery 30 Oct`);
-    assert.match(reply(moved), /delivery date → Fri 30 Oct \(30 Oct\)\./);
+    const moved = await groupSays(`!order ${ref(o)} delivery ${d.input}`);
+    assert.match(reply(moved), new RegExp(`delivery date → ${d.label} \\(${d.input}\\)\\.`));
     assert.doesNotMatch(reply(moved), /not a date I can read/);
     const [after] = await allOrders();
-    assert.equal(after.requested_for, "Fri 30 Oct (30 Oct)");
+    assert.equal(after.requested_for, `${d.label} (${d.input})`);
     assert.ok(after.manual_locked_fields.includes("requested_for"), "the AI will not overwrite it");
     const last = (await orderEvents(o.id)).at(-1)!;
     assert.deepEqual([last.kind, last.actor_kind, last.actor_id], ["staff_whatsapp_edit", "staff", "17585550001"]);
-    assert.deepEqual(last.changes.requested_for, { before, after: "Fri 30 Oct (30 Oct)" });
-    assert.match(await nextReport("!orders 30 Oct"), new RegExp(ref(o)));
+    assert.deepEqual(last.changes.requested_for, { before, after: `${d.label} (${d.input})` });
+    assert.match(await nextReport(`!orders ${d.input}`), new RegExp(ref(o)));
     assert.doesNotMatch(await nextReport("!orders tomorrow"), new RegExp(ref(o)));
     // "Whenever" names no day: recorded, and the reply names the day the order is now for (without "default" wording).
     const loose = await groupSays(`!order ${ref(o)} delivery whenever you can`);
@@ -779,14 +784,16 @@ describe("WhatsApp order commands (real server code, real SQL)", { skip: !pgAvai
   });
 
   test("a customer who later gives a different day does not overwrite the staff correction; the disagreement is flagged", async () => {
+    // Staff pick a day that is not the Saturday the customer asks for (31 Oct 2026, from the fixed MONDAY below).
+    const d = stLuciaDay(3).label === "Sat 31 Oct" ? stLuciaDay(4) : stLuciaDay(3);
     const o = await datedOrder(JANE, "tomorrow");
-    await groupSays(`!order ${ref(o)} delivery 30 Oct`);
+    await groupSays(`!order ${ref(o)} delivery ${d.input}`);
     modelOrders(draft({ requested_for: "Saturday" }), { order_target: o.ref_code });
     await customerSays(JANE, "actually can you do Saturday instead", { at: MONDAY });
     const [after] = await allOrders();
-    assert.equal(after.requested_for, "Fri 30 Oct (30 Oct)");
+    assert.equal(after.requested_for, `${d.label} (${d.input})`);
     assert.equal(after.field_conflicts.requested_for.proposed, "Sat 31 Oct (Saturday)");
-    assert.match(await nextReport("!orders 30 Oct"), new RegExp(`${ref(o)}[\\s\\S]*Customer asked for a change`));
+    assert.match(await nextReport(`!orders ${d.input}`), new RegExp(`${ref(o)}[\\s\\S]*Customer asked for a change`));
   });
 
   // ── The report ─────────────────────────────────────────────────────────────

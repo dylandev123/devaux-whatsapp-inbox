@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { register } from "node:module";
 import { pgAvailable, TestPg } from "./helpers/pgHarness.ts";
 import { pgSupabase } from "./helpers/pgSupabase.ts";
+import { defaultOrderDay } from "./helpers/dates.ts";
 
 register("./helpers/tsLoader.mjs", import.meta.url, { data: { root: process.cwd() } });
 
@@ -253,7 +254,7 @@ describe("Daily orders (real server code, real SQL)", { skip: !pgAvailable && "P
     await customerSays(JANE, "I want 2 Monello Chicken please, delivery");
     const [o] = await allOrders();
     assert.deepEqual(o.items, [{ product: "Monello Chicken", quantity: "2", variant: null, size: null }]);
-    assert.equal(o.requested_for, "Thu 29 Oct (default)", "the time the model invented is dropped; the business default day is stored, marked as a default");
+    assert.equal(o.requested_for, `${defaultOrderDay().label} (default)`, "the time the model invented is dropped; the business default day is stored, marked as a default");
     assert.equal(o.status, "possible");
     assert.deepEqual(o.missing_fields, ["delivery_address"], "the day is stored (as a default), so it is no longer missing");
   });

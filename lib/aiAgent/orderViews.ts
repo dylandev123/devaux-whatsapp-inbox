@@ -310,8 +310,13 @@ export interface OrdersViewInput {
   addresses?: Record<string, AddressProvenance>;
 }
 
+/** The stored kind of a report: one list per kind (and per date for a specific day) stays current. */
+export const viewKind = (view: OrdersView): string => (view.type === "day" ? `day:${view.date}` : view.type);
+
 export interface OrdersViewResult {
   parts: string[];
+  /** The orders in the order they were numbered in the text (1, 2, 3 …): what "!order 2" means for this report. */
+  numbered: { n: number; order: TrackedOrder }[];
   shown: number;
   counts: OrderCounts;
 }
@@ -325,7 +330,11 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
   const view = input.view;
   const chunks: Chunk[] = [];
   let number = 1;
-  const numbered = (o: TrackedOrder, opts: LineOptions = {}) => orderViewBlock(o, number++, input.names, { timezone: tz, addresses: input.addresses, ...opts });
+  const numberedOrders: { n: number; order: TrackedOrder }[] = [];
+  const numbered = (o: TrackedOrder, opts: LineOptions = {}) => {
+    numberedOrders.push({ n: number, order: o });
+    return orderViewBlock(o, number++, input.names, { timezone: tz, addresses: input.addresses, ...opts });
+  };
 
   /** One day: its heading, then Delivery / Collection / not-stated groups. Numbering continues across days. */
   const dayBlock = (key: string) => {
@@ -451,5 +460,5 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
 
   const packed = pack(title, chunks);
   if (packed.omitted > 0) packed.parts[packed.parts.length - 1] += `\n\n…and ${plural(packed.omitted, "more order")} — see the Orders page in the inbox.`;
-  return { parts: packed.parts, shown: picked.length + (view.type === "default" ? fresh.length : 0), counts };
+  return { parts: packed.parts, numbered: numberedOrders, shown: picked.length + (view.type === "default" ? fresh.length : 0), counts };
 }
