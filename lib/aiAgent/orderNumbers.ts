@@ -109,6 +109,8 @@ export const NUMBER_REPLY = {
   quotedNotList: "⚠️ The message you replied to is not an order list, so I can't tell which number you mean. Reply to the list itself, or use the order #REF. Nothing changed.",
   changed: (ref: string) => `⚠️ ${ref} changed after that list was posted, so I did not apply the command to it. Send !orders again for the current numbers, or use its #REF. Nothing changed.`,
   gone: "⚠️ That order is no longer in this business. Nothing changed.",
+  setupPending: "⚠️ Report numbers are not available yet: the lists they are read from have not been set up (migration 20261110000000). Use the order #REF instead, e.g. !order #QU6U9. Nothing changed.",
+  lookupFailed: "⚠️ I could not read the order list just now, so I did not guess which order that number means. Try again, or use the order #REF. Nothing changed.",
   ambiguous: (n: number, choices: { label: string; ref: string }[]) =>
     [
       `⚠️ Number ${n} means different orders in your recent lists — nothing changed:`,

@@ -24,6 +24,7 @@ import { SenderAuthorization } from "@/lib/aiAgent/identity";
 import {
   moreInfoReply,
   type OrderCommand,
+  NO_BANG_REPLY,
   ORDER_HELP,
   type CorrectionCommand,
   ORDERS_HELP,
@@ -61,7 +62,7 @@ import {
   resolveFromHistory,
   upgradeGenericLines,
 } from "@/lib/aiAgent/orderHistory";
-import { loadStaffLocationSafe } from "@/lib/server/aiAgent/customerStaffMemory";
+import { loadStaffLocationSafe, loadStaffUsualProductSafe } from "@/lib/server/aiAgent/customerStaffMemory";
 import { type AddressEvent, type AddressProvenance, addressProvenance, isInferredAddress, sameAddress } from "@/lib/aiAgent/orderAddress";
 import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote, keepDefaultedDay, nameStated, withCreationDefaults, withDeliveryContact } from "@/lib/aiAgent/orderDefaults";
 import { classifyOrderIntent, INTENT_REASON_CODE, staffRecentlyOfferedDelivery } from "@/lib/aiAgent/orderIntent";
@@ -746,6 +747,9 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   // The product the customer explicitly confirmed in this conversation (a staff question that named it, and their yes): it comes
   // before any statistic from their past orders when a request names no product.
   const confirmedInChat: ConfirmedProduct | null = namesNoProduct ? latestConfirmedProduct(args.recent ?? [], [...reliableHistory(history).flatMap((o) => o.items), ...open.flatMap((o) => o.items)]) : null;
+  // The usual product staff approved for this customer ("!order #REF teach … → !confirm P-CODE") answers "send me a bag" before any statistic.
+  const staffUsualRow = namesNoProduct ? await loadStaffUsualProductSafe(businessSlug, [...(args.phone ? [args.phone] : []), ...(args.chatIds ?? [chatId]).map((id) => `chat:${id}`)]) : null;
+  const staffUsual: OrderLine | null = staffUsualRow ? { product: staffUsualRow.content, quantity: null, variant: null, size: null } : null;
   // The staff-saved default delivery location answers "same place" / "usual location" before any earlier order does.
   // Read-only here: nothing in the order flow can change it (only the staff !location command does).
   const savedLocation = cue.sameLocation || mayFillLocation ? await loadStaffLocationSafe(businessSlug, [...(args.phone ? [args.phone] : []), ...(args.chatIds ?? [chatId]).map((id) => `chat:${id}`)]) : null;
@@ -828,7 +832,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     const productSources: ProductSource[] = [];
     const specificSiblings = grounded.items.some((i) => !isGenericProduct(toLine(i)));
     grounded.items = grounded.items.flatMap((item) => {
-      const res = resolveGenericProduct({ line: toLine(item), held: specificSiblings ? [] : (existing?.items ?? []), confirmed: confirmedInChat, pool });
+      const res = resolveGenericProduct({ line: toLine(item), held: specificSiblings ? [] : (existing?.items ?? []), confirmed: confirmedInChat, pool, staffUsual });
       if (res.kind === "keep") return [item];
       if (res.kind === "unresolved" || specificSiblings) {
         genericUnresolved.push(res.kind === "unresolved" ? res.reason : `items: “${item.product}” names no product`);
@@ -2120,6 +2124,7 @@ export async function handleOrderCommand(args: OrderCommandArgs): Promise<Update
     await audit(slug, "staff", senderAuth.senderId, "orders.command_rejected", { type: "chat", id: fromGroup }, { reason, command: command.kind });
     return reply(body, `cmd_${reason}`);
   };
+  if (command.kind === "help" && command.reason === "no_bang") return reply(NO_BANG_REPLY(command.suggestion), "cmd_no_bang");
   if (command.kind === "help") return reply(command.reason === "orders" ? ORDERS_HELP : command.reason === "teach" ? TEACH_HELP : command.reason === "complete_all" ? BULK_HELP : ORDER_HELP, "cmd_help");
 
   if (command.kind === "orders") {

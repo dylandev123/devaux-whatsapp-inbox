@@ -34,6 +34,7 @@ const MIGRATIONS = [
   "20261108000000_ai_agent_order_update_posts.sql",
   "20261109000000_ai_agent_order_corrections.sql",
   "20261110000000_ai_agent_order_numbers_routing_missed_calls.sql",
+  "20261111000000_ai_agent_teaching_sessions.sql",
 ];
 
 const BOOTSTRAP = `

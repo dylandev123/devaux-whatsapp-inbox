@@ -252,20 +252,20 @@ describe("order corrections and bulk completion (real server code, real SQL)", {
       assert.equal(after.customer_name, "Blondie");
     });
 
-    test("an ambiguous or unsupported instruction changes nothing and creates no proposal", async () => {
+    test("an ambiguous or unsupported instruction changes nothing, creates no proposal, and asks what is missing", async () => {
       const o = await makeOrder(JANE);
       const before = await orderById(o.id);
       const attempts: [object, RegExp][] = [
         [{ items: [{ product: "Monello", quantity: "3", size: null }], ambiguities: ["Chicken or Beef?"] }, /Chicken or Beef\?/],
-        [{ items: [{ product: "Bandit", quantity: "1", size: null }] }, /“Bandit” is not in what you wrote/],
+        [{ items: [{ product: "Bandit", quantity: "1", size: null }] }, /Which product is it\? I could not match “Bandit”/],
         [{ requested_for: "next week" }, /could not read “next week” as one day/],
       ];
       for (const [answer, expected] of attempts) {
         correct = () => answer;
         const text = reply(await teach(o, "make it 3 Monello, deliver next week"));
-        assert.match(text, /could not safely turn that into a change/);
+        assert.match(text, /I need a little more before I change anything/);
         assert.match(text, expected);
-        assert.match(text, /Nothing changed/);
+        assert.match(text, /Nothing has changed/);
       }
       correct = () => "I think they want more food";
       assert.match(reply(await teach(o, "more food")), /could not safely turn that into a change/);

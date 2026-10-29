@@ -373,6 +373,9 @@ export function CustomerPanel({ phoneNumber, isLid = false, displayPhone, busine
                   className="rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 text-sm outline-none focus:border-emerald-500"
                 />
               </div>
+              <p className="-mt-1 text-xs text-zinc-400">
+                The name you enter here is the customer&apos;s display name everywhere (Inbox, orders, AI). It always wins over the WhatsApp profile name and any name synced from the phone, and WhatsApp updates never overwrite it.
+              </p>
               <input
                 type="email"
                 value={form.email ?? ""}

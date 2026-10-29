@@ -328,6 +328,8 @@ export interface MemoryBrief {
   repeat: RepeatResolution;
   /** Staff-saved default delivery location (!location). Absent/null = none saved. Never inferred from orders. */
   defaultLocation?: { value: string; setAt: string | null } | null;
+  /** The usual product staff confirmed for this customer ("!order #REF teach … → !confirm P-CODE"). Never inferred from orders. */
+  usualProduct?: string | null;
   /** Staff-confirmed customer notes (!remember). Kept apart from customer-stated facts and from business knowledge. */
   staffNotes?: string[];
   /** The customer's message points at their saved place ("same place", "usual location"). */
@@ -355,7 +357,7 @@ export function buildMemoryBrief(input: {
   profile: Record<string, string>;
   messageText: string;
   now: Date;
-  staffMemory?: { location: { value: string; setAt: string | null } | null; notes: string[] };
+  staffMemory?: { location: { value: string; setAt: string | null } | null; notes: string[]; usualProduct?: string | null };
 }): MemoryBrief {
   const repeat = resolveRepeatOrder(input.orders, input.messageText);
   const usable = input.orders.filter((o) => !o.excluded).sort(newestFirst);
@@ -389,6 +391,7 @@ export function buildMemoryBrief(input: {
     inferences,
     repeat,
     defaultLocation: input.staffMemory?.location ?? null,
+    usualProduct: input.staffMemory?.usualProduct ?? null,
     staffNotes: (input.staffMemory?.notes ?? []).slice(0, MAX_STAFF_NOTES),
     savedLocationCue: detectSavedLocationCue(input.messageText),
   };
@@ -419,6 +422,9 @@ export function renderMemoryBrief(brief: MemoryBrief): string {
   }
   if (brief.staffNotes?.length) {
     lines.push("STAFF NOTES ABOUT THIS CUSTOMER (confirmed by staff; internal, do not quote them to the customer):", brief.staffNotes.map((n) => `- ${n}`).join("\n"));
+  }
+  if (brief.usualProduct) {
+    lines.push(`USUAL PRODUCT (confirmed by staff, verified): ${brief.usualProduct}`, "Use it only when the customer says the usual / same as always or names no product; say it back so they can confirm. A different product they name is for this order only.");
   }
   if (brief.defaultLocation) {
     lines.push(

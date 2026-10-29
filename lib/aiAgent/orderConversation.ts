@@ -298,6 +298,7 @@ export function isGenericProduct(line: Pick<OrderLine, "product" | "variant" | "
 export type ProductSource =
   | { source: "open_order"; product: string }
   | { source: "conversation_confirmed"; product: string; staffMessage: string; staffAt: string; staffMessageId: string | null; customerText: string }
+  | { source: "staff_saved"; product: string }
   | { source: "order_history"; product: string; ref: string };
 
 export type GenericResolution = { kind: "keep" } | { kind: "resolved"; line: OrderLine; source: ProductSource } | { kind: "unresolved"; reason: string };
@@ -306,11 +307,11 @@ const productName = (l: Pick<OrderLine, "product" | "size">) => `${l.product}${l
 
 /**
  * Resolves a request that names no product. Order of trust: the one product already on this order; the product the customer
- * explicitly confirmed in this conversation; the customer's only verified product. Several plausible products is never a choice:
+ * explicitly confirmed in this conversation; the usual product staff saved for the customer; the customer's only verified product. Several plausible products is never a choice:
  * it is unresolved and a person looks. Quotations, cancelled orders and unconfirmed drafts are not in `pool` (see isReliableOrder).
  */
-export function resolveGenericProduct(args: { line: OrderLine; held: OrderLine[]; confirmed: ConfirmedProduct | null; pool: HistoryOrder[] }): GenericResolution {
-  const { line, held, confirmed, pool } = args;
+export function resolveGenericProduct(args: { line: OrderLine; held: OrderLine[]; confirmed: ConfirmedProduct | null; pool: HistoryOrder[]; staffUsual?: OrderLine | null }): GenericResolution {
+  const { line, held, confirmed, pool, staffUsual } = args;
   if (!isGenericProduct(line)) return { kind: "keep" };
   const keepQuantity = (l: OrderLine): OrderLine => ({ ...l, quantity: line.quantity });
   if (held.length === 1) return { kind: "resolved", line: keepQuantity(held[0]), source: { source: "open_order", product: productName(held[0]) } };
@@ -322,6 +323,8 @@ export function resolveGenericProduct(args: { line: OrderLine; held: OrderLine[]
       source: { source: "conversation_confirmed", product: productName(confirmed.line), staffMessage: confirmed.staff.text, staffAt: confirmed.staff.at, staffMessageId: confirmed.staff.id, customerText: confirmed.customerText },
     };
   }
+  // The product staff themselves confirmed as this customer's usual, ahead of any statistic from their past orders.
+  if (staffUsual) return { kind: "resolved", line: keepQuantity(staffUsual), source: { source: "staff_saved", product: productName(staffUsual) } };
   const stats = lineStats(pool);
   if (stats.length === 0) return { kind: "unresolved", reason: `items: “${line.product}” names no product and there is no verified earlier order` };
   if (stats.length === 1) return { kind: "resolved", line: keepQuantity(stats[0].line), source: { source: "order_history", product: productName(stats[0].line), ref: stats[0].ref } };

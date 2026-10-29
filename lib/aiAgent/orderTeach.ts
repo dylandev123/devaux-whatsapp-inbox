@@ -35,19 +35,19 @@ export const BULK_TTL_MS = 10 * 60_000;
 export const CLAIM_RETRY_MS = 2 * 60_000;
 export const MAX_INSTRUCTION = 600;
 
-export type ProposalKind = "correction" | "bulk_complete";
+export type ProposalKind = "correction" | "bulk_complete" | "customer_preference";
 
-const PROPOSAL_CODE = /^#?([CB])-([A-HJ-NP-Z2-9]{5})$/i;
+const PROPOSAL_CODE = /^#?([CBP])-([A-HJ-NP-Z2-9]{5})$/i;
 
-/** "C-ABCDE" (a correction) or "B-ABCDE" (a bulk completion). Knowledge codes (K-), notes (M-) and requests (E-) are not ours. */
+/** "C-ABCDE" (a correction), "B-ABCDE" (a bulk completion) or "P-ABCDE" (a customer preference). Knowledge codes (K-), notes (M-) and requests (E-) are not ours. */
 export function parseProposalCode(token: string): { kind: ProposalKind; code: string } | null {
   const m = token.trim().replace(/[.!]+$/, "").match(PROPOSAL_CODE);
-  return m ? { kind: m[1].toUpperCase() === "C" ? "correction" : "bulk_complete", code: `${m[1].toUpperCase()}-${m[2].toUpperCase()}` } : null;
+  return m ? { kind: ({ C: "correction", B: "bulk_complete", P: "customer_preference" } as const)[m[1].toUpperCase() as "C" | "B" | "P"], code: `${m[1].toUpperCase()}-${m[2].toUpperCase()}` } : null;
 }
 
 const clip = (v: string, n: number) => (v.length > n ? `${v.slice(0, n - 1)}…` : v);
 /** Staff or customer text in a group message: one line, never one that reads as a command. */
-const safe = (v: string | null | undefined, n: number) => clip((v ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim(), n).replace(/^[!/]+/, "");
+export const safe = (v: string | null | undefined, n: number) => clip((v ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim(), n).replace(/^[!/]+/, "");
 
 // ── What the model returns ───────────────────────────────────────────────────
 
@@ -130,16 +130,16 @@ export function parseCorrectionProposal(raw: string | null | undefined): Correct
 // ── Checking the proposal against the instruction ────────────────────────────
 
 const STOP = new Set(["the", "and", "for", "with", "that", "this", "from", "into", "his", "her", "their", "its", "are", "was", "has", "have", "will", "wants", "want", "food", "order", "bag", "bags"]);
-const words = (s: string): string[] => normalizeText(s).split(" ").filter((w) => w.length >= 2 && !STOP.has(w));
+export const words = (s: string): string[] => normalizeText(s).split(" ").filter((w) => w.length >= 2 && !STOP.has(w));
 const NUMBER_WORDS: Record<string, string> = { one: "1", two: "2", three: "3", four: "4", five: "5", six: "6", seven: "7", eight: "8", nine: "9", ten: "10" };
 
 /** Fraction of `value`'s significant words that the instruction contains (1 = all of them, 0 = none or nothing to check). */
-function overlap(instructionWords: Set<string>, value: string): number {
+export function overlap(instructionWords: Set<string>, value: string): number {
   const w = words(value);
   return w.length === 0 ? 0 : w.filter((x) => instructionWords.has(x)).length / w.length;
 }
 
-function quantityStated(instruction: string, quantity: string): boolean {
+export function quantityStated(instruction: string, quantity: string): boolean {
   const q = quantity.trim().toLowerCase();
   const tokens = normalizeText(instruction).split(" ");
   if (tokens.includes(q)) return true;
@@ -150,7 +150,7 @@ function quantityStated(instruction: string, quantity: string): boolean {
 const COLLECT = /\b(collect(?:s|ed|ing|ion)?|pick(?:s|ed|ing)?[\s-]?up|pickup|come(?:s|ing)?\s+(?:to\s+)?(?:get|collect|pick)|will\s+get\s+it|fetch(?:es|ing)?)\b/i;
 const DELIVER = /\b(deliver(?:s|ed|ing|y)?|bring(?:s|ing)?|drop(?:s|ped|ping)?[\s-]?off|send(?:s|ing)?|courier)\b/i;
 /** Wording that makes a correction a statement about the whole thing being reusable, never a one-off. */
-const GENERAL_CUE = /\b(always|usually|every(?:\s+(?:time|week|day|order))?|each\s+time|whenever|normally|from\s+now\s+on|as\s+usual|never|typically)\b/i;
+export const GENERAL_CUE = /\b(always|usually|every(?:\s+(?:time|week|day|order))?|each\s+time|whenever|normally|from\s+now\s+on|as\s+usual|never|typically)\b/i;
 
 const lineKey = (l: OrderLine) => normalizeText(orderItemText(l));
 const sameItems = (a: OrderLine[], b: OrderLine[]) => a.length === b.length && a.every((l, i) => lineKey(l) === lineKey(b[i]));

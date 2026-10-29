@@ -24,7 +24,7 @@ import {
   primaryMemoryKey,
 } from "@/lib/aiAgent/memory";
 import { agentDb } from "@/lib/server/aiAgent/db";
-import { loadStaffLocationSafe, loadStaffNotesSafe } from "@/lib/server/aiAgent/customerStaffMemory";
+import { loadStaffLocationSafe, loadStaffNotesSafe, loadStaffUsualProductSafe } from "@/lib/server/aiAgent/customerStaffMemory";
 
 const ORDER_COLUMNS =
   "id, order_seq, chat_id, summary, order_status, source_message_at, details, delivery_address, ai_memory_excluded";
@@ -95,12 +95,13 @@ export async function loadMemoryBrief(businessSlug: string, identity: ChatIdenti
   const keys = memoryKeysFor(identity);
   // Staff-saved memory (!location, !remember) is READ whatever customer_memory_enabled says: that switch only gates
   // what the AI captures by itself. A missing table (migration not yet run) is "nothing saved".
-  const [orders, facts, profile, staffLocation, staffNotes] = await Promise.all([
+  const [orders, facts, profile, staffLocation, staffNotes, staffUsual] = await Promise.all([
     loadOrders(businessSlug, identity),
     loadFacts(businessSlug, identity),
     loadProfile(businessSlug, identity),
     loadStaffLocationSafe(businessSlug, keys),
     loadStaffNotesSafe(businessSlug, keys),
+    loadStaffUsualProductSafe(businessSlug, keys),
   ]);
   // Even with nothing on record "same as last time" is resolved, so an empty
   // history escalates instead of being guessed.
@@ -110,7 +111,7 @@ export async function loadMemoryBrief(businessSlug: string, identity: ChatIdenti
     profile,
     messageText,
     now: new Date(),
-    staffMemory: { location: staffLocation ? { value: staffLocation.content, setAt: staffLocation.created_at } : null, notes: staffNotes.map((n) => n.content) },
+    staffMemory: { location: staffLocation ? { value: staffLocation.content, setAt: staffLocation.created_at } : null, notes: staffNotes.map((n) => n.content), usualProduct: staffUsual?.content ?? null },
   });
 }
 

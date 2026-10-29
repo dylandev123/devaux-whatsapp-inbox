@@ -69,7 +69,9 @@ export type OrderCommand =
   | { kind: "bulk_complete" }
   /** `!confirm C-ABCDE` / `!discard B-ABCDE` */
   | { kind: "proposal"; action: "confirm" | "discard"; code: string; proposalKind: ProposalKind }
-  | { kind: "help"; reason: "order" | "moreinfo" | "orders" | "teach" | "complete_all" };
+  | { kind: "help"; reason: "order" | "moreinfo" | "orders" | "teach" | "complete_all" }
+  /** "order #REF teach …" typed without the "!": answered with the corrected command, never acted on. */
+  | { kind: "help"; reason: "no_bang"; suggestion: string };
 
 /** The commands that propose or settle a proposal (handled by lib/server/aiAgent/orderCorrections.ts). */
 export type CorrectionCommand = Extract<OrderCommand, { kind: "teach" | "bulk_complete" | "proposal" }>;
@@ -118,7 +120,11 @@ function parseOrderAction(body: string): UpdateAction | null {
  * (#QU6U9); "!moreinfo" alone, or with an escalation code (#E-AB12C), stays with the escalation logic.
  */
 export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: string | null } = {}): OrderCommand | null {
-  const text = raw.replace(/\s+/g, " ").trim();
+  // "! order #REF …" (a space after the bang) is the same command.
+  const text = raw.replace(/\s+/g, " ").trim().replace(/^!\s+(?=orders?\b|more[\s-]*info\b|confirm\b|discard\b)/i, "!");
+  // "order #QU6U9 teach …" / "order 3 completed" without the "!": staff chatter is left alone unless it is unmistakably this command.
+  const bangless = text.match(/^(orders?)\s+(#?[A-HJ-NP-Z2-9]{5}|#[A-Z0-9]{3,8}|\d{1,3})\s+(teach|confirm\w*|cancel\w*|complete\w*|reopen\w*|delivery|deliver)\b/i);
+  if (bangless && (bangless[2].startsWith("#") || /\d/.test(bangless[2]))) return { kind: "help", reason: "no_bang", suggestion: `!${text}`.slice(0, 160) };
   // "!confirm C-ABCDE" / "!discard B-ABCDE": only OUR codes. K- (knowledge), M- (notes) and E- (requests) stay with their own
   // commands, so "!confirm K-7QX2" never reaches an order and "!confirm C-ABCDE" never reaches the knowledge flow.
   let m = text.match(/^!(confirm|discard)\s+(\S+)$/i);
@@ -138,7 +144,8 @@ export function parseOrderCommand(raw: string, opts: { now?: Date; timezone?: st
     const query = m[1].trim();
     if (!query) return { kind: "help", reason: "order" };
     // Teaching, completing or reopening needs an order REFERENCE: a name or phone could match the wrong order.
-    const teach = query.match(/^(\S+)\s+teach\b\s*(.*)$/i);
+    // "!order teach #REF …" is the same as "!order #REF teach …".
+    const teach = query.match(/^(\S+)\s+teach\b[\s:,-]*(.*)$/i) ?? query.match(/^teach\b[\s:,-]*(\S+)\s*(.*)$/i);
     if (teach) {
       const sel = parseSelector(teach[1]);
       const instruction = teach[2].replace(/\s+/g, " ").trim();
@@ -232,6 +239,9 @@ const itemsOneLine = (o: TrackedOrder) => (o.items.length > 0 ? o.items.map(orde
 
 const STATUS_NAME: Record<string, string> = { possible: "possible", awaiting_confirmation: "awaiting confirmation", confirmed: "confirmed", fulfilled: "completed", cancelled: "cancelled" };
 
+export const NO_BANG_REPLY = (suggestion: string) =>
+  `ℹ️ Commands start with “!”. I did not change anything. Did you mean:\n${suggestion}`;
+
 export const ORDER_HELP = [
   "ℹ️ Order commands:",
   "!orders — outstanding orders for today and tomorrow",
@@ -242,9 +252,10 @@ export const ORDER_HELP = [
   "!order #REF confirmed | cancelled | 2 bags | delivery tomorrow — change one order",
   "!order #REF completed — mark done (leaves !orders)",
   "!order #REF reopen — undo a completion",
-  "!order #REF teach <what is wrong> — fix an order in your own words (previewed first)",
+  "!order #REF teach <what is wrong> — fix an order in your own words; I ask if something is missing, and you reply to my question (previewed first)",
+  "  also: say “usually / always …” or “call him …” to save a customer preference (separate !confirm P-CODE)",
   "!orders complete all — complete today's outstanding orders (previewed first)",
-  "!confirm C-CODE / B-CODE — apply a proposal · !discard C-CODE / B-CODE — drop it",
+  "!confirm C-CODE / B-CODE / P-CODE — apply a proposal · !discard … — drop it",
   "#REF is the code shown in the lists, e.g. #QU6U9.",
 ].join("\n");
 
@@ -412,6 +423,7 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
   const sources = events.flatMap((e) => (Array.isArray(e.changes?.product_source?.after) ? (e.changes.product_source.after as { source?: string; product?: string; ref?: string; staffMessage?: string; customerText?: string }[]) : []));
   for (const x of sources.slice(0, 3)) {
     if (x.source === "conversation_confirmed") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the customer confirmed it in this chat (staff asked “${clip(x.staffMessage ?? "", 60)}”, they replied “${clip(x.customerText ?? "", 40)}”)`);
+    else if (x.source === "staff_saved") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the usual product staff saved for this customer`);
     else if (x.source === "order_history") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the customer's only verified purchase (${x.ref ? displayRef(x.ref) : "earlier order"})`);
     else if (x.source === "open_order") lines.push(`ℹ️ Product chosen: ${clip(x.product ?? "", 50)} — the product already on this order`);
   }

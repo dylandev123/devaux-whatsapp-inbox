@@ -67,6 +67,74 @@ export async function loadStaffLocationSafe(businessSlug: string, keys: string[]
   }
 }
 
+export interface StaffUsualProduct {
+  id: string;
+  content: string;
+  set_by: string | null;
+  created_at: string;
+}
+
+/** The customer's staff-confirmed usual product, if any. Throws if the table/kind is not available yet (use the Safe variant to read). */
+export async function loadStaffUsualProduct(businessSlug: string, keys: string[]): Promise<StaffUsualProduct | null> {
+  if (keys.length === 0) return null;
+  const { data, error } = await agentDb()
+    .from("ai_agent_customer_staff_memory")
+    .select("id, content, set_by, created_at")
+    .eq("business_slug", businessSlug)
+    .eq("kind", "usual_product")
+    .eq("status", "active")
+    .in("customer_key", keys)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return ((data ?? []) as StaffUsualProduct[])[0] ?? null;
+}
+
+/** For read paths: a missing kind or table (migration 20261111000000 not yet run) is "nothing saved", never a failure. */
+export async function loadStaffUsualProductSafe(businessSlug: string, keys: string[]): Promise<StaffUsualProduct | null> {
+  try {
+    return await loadStaffUsualProduct(businessSlug, keys);
+  } catch (err) {
+    console.error("[aiAgent] loadStaffUsualProduct", err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+export interface UsualProductChange {
+  result: "created" | "updated" | "unchanged" | "replayed";
+  id: string;
+  previous: string | null;
+}
+
+/** Saves or replaces the usual product in one transaction (set_ai_agent_customer_usual_product); the old row stays as history. */
+export async function saveStaffUsualProduct(args: {
+  businessSlug: string;
+  keys: CustomerKeys;
+  product: string;
+  setBy: string | null;
+  messageId: string | null;
+  eventId: string | null;
+  chatId: string;
+  label: string;
+}): Promise<UsualProductChange> {
+  const { data, error } = await agentDb().rpc("set_ai_agent_customer_usual_product", {
+    p_business_slug: args.businessSlug,
+    p_customer_key: args.keys.primary,
+    p_keys: args.keys.all,
+    p_product: args.product,
+    p_fingerprint: locationFingerprint(args.product),
+    p_set_by: args.setBy,
+    p_source_message_id: args.messageId,
+    p_source_event_id: args.eventId,
+    p_source_chat_id: args.chatId,
+    p_customer_label: args.label,
+  });
+  if (error) throw new Error(error.message);
+  const row = (Array.isArray(data) ? data[0] : data) as { result: UsualProductChange["result"]; id: string; previous_product: string | null } | undefined;
+  if (!row) throw new Error("set_ai_agent_customer_usual_product returned nothing");
+  return { result: row.result, id: row.id, previous: row.previous_product };
+}
+
 export async function loadStaffNotes(businessSlug: string, keys: string[], statuses: ("active" | "proposed")[] = ["active"]): Promise<StaffNote[]> {
   if (keys.length === 0) return [];
   const { data, error } = await agentDb()

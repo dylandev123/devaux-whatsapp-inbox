@@ -18,8 +18,6 @@
 // saved location or knowledge is written; an approved correction is only recorded as feedback (ai_agent_order_feedback), and
 // a reusable fact is offered as a command for staff to run themselves (!remember / !teach), never saved here.
 
-import { randomBytes } from "node:crypto";
-import { generateRefCode } from "@/lib/aiAgent/engine";
 import { type CorrectionCommand, isCorrectionCommand, type OrderCommand } from "@/lib/aiAgent/orderCommands";
 import {
   BULK_REPLY,
@@ -34,25 +32,23 @@ import {
   CORRECTION_TTL_MS,
   type CorrectionPlan,
   orderDay,
-  parseCorrectionProposal,
   type PlannedChange,
-  planCorrection,
   type ProposalKind,
   type ReusableSuggestion,
 } from "@/lib/aiAgent/orderTeach";
-import { NUMBER_REPLY } from "@/lib/aiAgent/orderNumbers";
-import { dayContext, dayLabel } from "@/lib/aiAgent/orderViews";
+import { dayContext } from "@/lib/aiAgent/orderViews";
 import { ORDER_REPLY } from "@/lib/aiAgent/orderCommands";
+import { NUMBER_REPLY } from "@/lib/aiAgent/orderNumbers";
 import { isOpenStatus, type TrackedOrder } from "@/lib/aiAgent/orders";
-import { agentDb, audit, loadActiveKnowledge } from "@/lib/server/aiAgent/db";
-import { proposeOrderCorrection } from "@/lib/server/aiAgent/model";
+import { agentDb, audit } from "@/lib/server/aiAgent/db";
+import { createProposal, move, type ProposalRow, proposalByCode, proposalBySource, supersedePending } from "@/lib/server/aiAgent/orderProposals";
 import { resolveNumberedTarget } from "@/lib/server/aiAgent/orderNumberTarget";
+import { applyPreference, isSchemaPending, startTeaching } from "@/lib/server/aiAgent/teachSessions";
 import {
   type CommandContext,
   groupReply,
   guardOrderCommand,
   handleOrderCommand,
-  loadOrderByRef,
   loadOrderNames,
   loadOutstandingOrders,
   MAX_COMMAND_AGE_MS,
@@ -81,7 +77,17 @@ export async function runOrderCommand(args: Omit<CorrectionCommandArgs, "command
     // Who may use commands, and where, is decided before anything about a list is revealed or looked up.
     const refused = await guardOrderCommand(args);
     if (refused) return refused;
-    const target = await resolveNumberedTarget(args, command.selector.n, command.kind !== "info", args.now ?? new Date());
+    let target: Awaited<ReturnType<typeof resolveNumberedTarget>>;
+    try {
+      target = await resolveNumberedTarget(args, command.selector.n, command.kind !== "info", args.now ?? new Date());
+    } catch (err) {
+      // The stored reports could not be read (typically: migration 20261110000000 was never run). Say so, and change nothing:
+      // a number is never guessed against a fresh list.
+      const detail = err instanceof Error ? err.message : "unknown error";
+      console.error("[aiAgent] order number lookup failed", detail);
+      await audit(args.settings.business_slug, "staff", args.senderAuth.senderId, "orders.command_rejected", { type: "chat", id: args.fromGroup }, { reason: "number_lookup_failed", error: clip(detail, 200), number: command.selector.n });
+      return groupReply(args.settings, args.fromGroup, args.eventId, isSchemaPending(err) ? NUMBER_REPLY.setupPending : NUMBER_REPLY.lookupFailed, "staff_notice", "orders:cmd_number_lookup_failed");
+    }
     if (!target.ok) return target.result;
     command = { ...command, selector: { type: "ref", ref: target.ref } } as OrderCommand;
     if (command.kind !== "info") requiredVersion = target.version;
@@ -91,107 +97,6 @@ export async function runOrderCommand(args: Omit<CorrectionCommandArgs, "command
 }
 
 const clip = (v: string, n: number) => (v.length > n ? `${v.slice(0, n - 1)}…` : v);
-
-// ── Proposals ────────────────────────────────────────────────────────────────
-
-type Status = "pending" | "applying" | "applied" | "partial" | "discarded" | "expired" | "superseded" | "stale" | "failed";
-
-interface ProposalRow {
-  id: string;
-  business_slug: string;
-  kind: ProposalKind;
-  code: string;
-  status: Status;
-  group_jid: string;
-  created_by: string | null;
-  source_message_id: string;
-  order_id: string | null;
-  order_version: number | null;
-  instruction: string | null;
-  payload: Record<string, unknown>;
-  result: Record<string, unknown> | null;
-  expires_at: string;
-  claimed_at: string | null;
-}
-
-const PROPOSAL_COLUMNS = "id, business_slug, kind, code, status, group_jid, created_by, source_message_id, order_id, order_version, instruction, payload, result, expires_at, claimed_at";
-
-async function proposalBySource(slug: string, messageId: string, kind: ProposalKind): Promise<ProposalRow | null> {
-  const { data, error } = await agentDb().from("ai_agent_order_proposals").select(PROPOSAL_COLUMNS).eq("business_slug", slug).eq("source_message_id", messageId).eq("kind", kind).maybeSingle();
-  if (error) throw new Error(error.message);
-  return (data as ProposalRow | null) ?? null;
-}
-
-/** Always filtered by business: another business's code is "unknown", never "somebody else's". */
-async function proposalByCode(slug: string, code: string): Promise<ProposalRow | null> {
-  const { data, error } = await agentDb().from("ai_agent_order_proposals").select(PROPOSAL_COLUMNS).eq("business_slug", slug).eq("code", code).maybeSingle();
-  if (error) throw new Error(error.message);
-  return (data as ProposalRow | null) ?? null;
-}
-
-/** Conditional status change: true only when this call made it (the row was in one of `from`). */
-async function move(row: ProposalRow, from: Status[], to: Status, patch: Record<string, unknown> = {}): Promise<boolean> {
-  const { data, error } = await agentDb()
-    .from("ai_agent_order_proposals")
-    .update({ status: to, ...patch })
-    .eq("business_slug", row.business_slug)
-    .eq("id", row.id)
-    .in("status", from)
-    .select("id");
-  if (error) throw new Error(error.message);
-  return (data ?? []).length > 0;
-}
-
-/** A new proposal replaces any still-pending one it makes obsolete, so only the newest code can be confirmed. */
-async function supersedePending(slug: string, kind: ProposalKind, orderId: string | null): Promise<void> {
-  let q = agentDb().from("ai_agent_order_proposals").update({ status: "superseded", resolved_at: new Date().toISOString() }).eq("business_slug", slug).eq("kind", kind).eq("status", "pending");
-  if (orderId) q = q.eq("order_id", orderId);
-  const { error } = await q;
-  if (error) throw new Error(error.message);
-}
-
-const newCode = (kind: ProposalKind) => generateRefCode(randomBytes(8)).replace(/^E-/, kind === "correction" ? "C-" : "B-");
-
-async function createProposal(args: {
-  slug: string;
-  kind: ProposalKind;
-  groupJid: string;
-  createdBy: string | null;
-  messageId: string;
-  orderId: string | null;
-  orderVersion: number | null;
-  instruction: string | null;
-  payload: (code: string) => Record<string, unknown>;
-  ttlMs: number;
-  now: Date;
-}): Promise<{ row: ProposalRow; existing: boolean }> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const code = newCode(args.kind);
-    const { data, error } = await agentDb()
-      .from("ai_agent_order_proposals")
-      .insert({
-        business_slug: args.slug,
-        kind: args.kind,
-        code,
-        group_jid: args.groupJid,
-        created_by: args.createdBy,
-        source_message_id: args.messageId,
-        order_id: args.orderId,
-        order_version: args.orderVersion,
-        instruction: args.instruction,
-        payload: args.payload(code),
-        expires_at: new Date(args.now.getTime() + args.ttlMs).toISOString(),
-      })
-      .select(PROPOSAL_COLUMNS)
-      .single();
-    if (!error && data) return { row: data as ProposalRow, existing: false };
-    if (error?.code !== "23505") throw new Error(error?.message ?? "insert failed");
-    // A unique violation is the same WhatsApp message arriving twice at once, or (rarely) a code collision.
-    const same = await proposalBySource(args.slug, args.messageId, args.kind);
-    if (same) return { row: same, existing: true };
-  }
-  throw new Error("Could not allocate a proposal code");
-}
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
@@ -215,7 +120,7 @@ export async function handleCorrectionCommand(args: CorrectionCommandArgs): Prom
     if (writtenAt && now.getTime() - writtenAt.getTime() > MAX_COMMAND_AGE_MS) {
       return reject("too_old", "⚠️ That command was written more than 2 hours ago, so nothing was started. Send it again if it is still right.");
     }
-    return command.kind === "teach" ? await handleTeach(ctx, command, writtenAt ?? now) : await handleBulk(ctx, now);
+    return command.kind === "teach" ? await startTeaching(ctx, command, writtenAt ?? now) : await handleBulk(ctx, now);
   } catch (err) {
     console.error("[aiAgent] order correction", err instanceof Error ? err.message : err);
     return reject("failed", ORDER_REPLY.failed());
@@ -225,38 +130,7 @@ export async function handleCorrectionCommand(args: CorrectionCommandArgs): Prom
 type Ctx = CorrectionCommandArgs & { say: (body: string, outcome: string, key?: string) => UpdateCommandResult; reject: (reason: string, body: string, key?: string) => Promise<UpdateCommandResult> };
 
 // ── !order #REF teach ────────────────────────────────────────────────────────
-
-/** Short, structured examples of what staff taught before. They steer wording only; their values are never reused. */
-async function recentCorrections(slug: string): Promise<{ instruction: string; fields: string[] }[]> {
-  try {
-    const { data } = await agentDb().from("ai_agent_order_feedback").select("instruction, fields").eq("business_slug", slug).order("created_at", { ascending: false }).limit(5);
-    return ((data ?? []) as { instruction: string; fields: string[] }[]).map((f) => ({ instruction: clip(f.instruction, 200), fields: f.fields }));
-  } catch {
-    return [];
-  }
-}
-
-async function productKnowledge(slug: string): Promise<{ title: string; content: string }[]> {
-  try {
-    return (await loadActiveKnowledge(slug))
-      .filter((k) => ["product", "price", "delivery"].includes(k.kind))
-      .slice(0, 60)
-      .map((k) => ({ title: clip(k.title, 80), content: clip(k.content, 200) }));
-  } catch {
-    return [];
-  }
-}
-
-const orderForModel = (o: TrackedOrder) => ({
-  ref: o.ref_code,
-  status: o.status,
-  customer_name: o.customer_name,
-  items: o.items.map((i) => ({ product: i.product, quantity: i.quantity, variant: i.variant, size: i.size })),
-  fulfilment_method: o.fulfilment_method ?? "delivery (default)",
-  delivery_address: o.delivery_address,
-  requested_for: o.requested_for,
-  notes: o.notes,
-});
+// The conversation itself lives in teachSessions.ts.
 
 const STORED_STATUS_REPLY = (row: ProposalRow, order: TrackedOrder | null): string => {
   switch (row.status) {
@@ -275,71 +149,6 @@ const STORED_STATUS_REPLY = (row: ProposalRow, order: TrackedOrder | null): stri
       return CORRECTION_REPLY.busy(row.code);
   }
 };
-
-async function handleTeach(ctx: Ctx, command: Extract<CorrectionCommand, { kind: "teach" }>, writtenAt: Date): Promise<UpdateCommandResult> {
-  const { settings, senderAuth } = ctx;
-  const slug = settings.business_slug;
-  const tz = tzOf(settings);
-
-  // The same WhatsApp message again: the proposal it made is shown again, and the model is not asked twice.
-  const repeated = await proposalBySource(slug, ctx.whatsappMessageId, "correction");
-  if (repeated) {
-    const preview = typeof repeated.payload.preview === "string" ? repeated.payload.preview : null;
-    return ctx.say(repeated.status === "pending" && preview ? preview : STORED_STATUS_REPLY(repeated, null), "teach_repeated", `ordercorr:${slug}:${ctx.whatsappMessageId}:preview`);
-  }
-
-  const order = await loadOrderByRef(slug, command.selector.type === "ref" ? command.selector.ref : "");
-  if (!order) return ctx.reject("not_found", ORDER_REPLY.noRef(command.selector.type === "ref" ? command.selector.ref : ""));
-  if (!isOpenStatus(order.status)) return ctx.reject("closed", CORRECTION_REPLY.closed(order));
-  // Named by a report number: only if the order is exactly as that report showed it.
-  if (ctx.requiredVersion !== undefined && order.version !== ctx.requiredVersion) return ctx.reject("list_stale", NUMBER_REPLY.changed(`#${order.ref_code.replace(/^O-/, "")}`));
-  const names = await loadOrderNames(slug, [order]);
-
-  const today = dayContext(writtenAt, tz).today;
-  const answer = await proposeOrderCorrection({
-    businessSlug: slug,
-    instruction: command.instruction,
-    order: orderForModel(order),
-    today: `${dayLabel(today)} (${today})`,
-    knowledge: await productKnowledge(slug),
-    recentCorrections: await recentCorrections(slug),
-  });
-  const proposal = answer.text ? parseCorrectionProposal(answer.text) : null;
-  if (!proposal) {
-    await audit(slug, "staff", senderAuth.senderId, "orders.teach_unreadable", { type: "order", id: order.id }, { error: answer.error ? clip(answer.error, 200) : "unparseable" });
-    return ctx.reject(answer.error ? "model_unavailable" : "not_understood", answer.error ? CORRECTION_REPLY.unavailable() : CORRECTION_REPLY.ambiguous(order, names, ["I could not read that."]));
-  }
-
-  const plan: CorrectionPlan = planCorrection(order, proposal, { instruction: command.instruction, at: writtenAt, timezone: tz });
-  if (plan.ambiguities.length > 0) {
-    await audit(slug, "staff", senderAuth.senderId, "orders.teach_unclear", { type: "order", id: order.id }, { ambiguities: plan.ambiguities });
-    return ctx.reject("ambiguous", CORRECTION_REPLY.ambiguous(order, names, plan.ambiguities));
-  }
-  if (plan.changes.length === 0) return ctx.reject("no_change", CORRECTION_REPLY.nothing(order, names));
-
-  await supersedePending(slug, "correction", order.id);
-  const created = await createProposal({
-    slug,
-    kind: "correction",
-    groupJid: ctx.fromGroup,
-    createdBy: senderAuth.senderId,
-    messageId: ctx.whatsappMessageId,
-    orderId: order.id,
-    orderVersion: order.version,
-    instruction: command.instruction,
-    payload: (code) => ({
-      ref: order.ref_code,
-      patch: plan.patch,
-      changes: plan.changes.map((c) => ({ field: c.field, label: c.label, before: c.before, after: c.after, beforeValue: c.beforeValue, afterValue: c.afterValue, wasLocked: c.wasLocked })),
-      reusable: plan.reusable,
-      preview: CORRECTION_REPLY.preview(order, names, plan, code, command.instruction),
-    }),
-    ttlMs: CORRECTION_TTL_MS,
-    now: ctx.now ?? new Date(),
-  });
-  if (!created.existing) await audit(slug, "staff", senderAuth.senderId, "orders.teach_proposed", { type: "order", id: order.id }, { code: created.row.code, fields: plan.changes.map((c) => c.field), version: order.version });
-  return ctx.say(String(created.row.payload.preview), created.existing ? "teach_repeated" : "teach_proposed", `ordercorr:${slug}:${ctx.whatsappMessageId}:preview`);
-}
 
 // ── !order … / !orders complete all ──────────────────────────────────────────
 
@@ -396,9 +205,9 @@ async function handleReview(ctx: Ctx, command: Extract<CorrectionCommand, { kind
   if (command.action === "discard") {
     if (row.status === "pending") {
       if (await move(row, ["pending"], "discarded", { resolved_at: now.toISOString(), resolved_by: senderAuth.senderId })) {
-        await audit(slug, "staff", senderAuth.senderId, `orders.${row.kind === "correction" ? "teach" : "bulk_complete"}_discarded`, { type: "order_proposal", id: row.id }, { code: row.code });
+        await audit(slug, "staff", senderAuth.senderId, `orders.${row.kind === "correction" ? "teach" : row.kind === "customer_preference" ? "preference" : "bulk_complete"}_discarded`, { type: "order_proposal", id: row.id }, { code: row.code });
       }
-      return speak(row.kind === "correction" ? CORRECTION_REPLY.discarded(row.code) : BULK_REPLY.discarded(row.code), "proposal_discarded");
+      return speak(row.kind === "correction" ? CORRECTION_REPLY.discarded(row.code) : row.kind === "customer_preference" ? `🗑 ${row.code} discarded. Nothing was saved about the customer.` : BULK_REPLY.discarded(row.code), "proposal_discarded");
     }
     return speak(row.status === "discarded" ? CORRECTION_REPLY.alreadyDiscarded(row.code) : `ℹ️ ${row.code} is already ${row.status === "applied" || row.status === "partial" ? "applied — use !order #REF reopen to undo" : row.status}. Nothing to discard.`, "proposal_discard_noop");
   }
@@ -406,8 +215,9 @@ async function handleReview(ctx: Ctx, command: Extract<CorrectionCommand, { kind
   // Confirm: a pending proposal that has run out of time can never be applied, even if nobody has marked it expired yet.
   if (row.status === "pending" && Date.parse(row.expires_at) <= now.getTime()) {
     await move(row, ["pending"], "expired", { resolved_at: now.toISOString() });
-    return speak(row.kind === "correction" ? CORRECTION_REPLY.expired(row.code) : BULK_STATE_REPLY.expired(row.code), "proposal_expired");
+    return speak(row.kind === "bulk_complete" ? BULK_STATE_REPLY.expired(row.code) : CORRECTION_REPLY.expired(row.code), "proposal_expired");
   }
+  if (row.kind === "customer_preference") return applyPreference(ctx, row, speak, (r) => STORED_STATUS_REPLY(r, null));
   return row.kind === "correction" ? applyCorrection(ctx, row, speak) : applyBulk(ctx, row, speak);
 }
 

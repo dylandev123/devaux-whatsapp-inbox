@@ -127,6 +127,7 @@ import type { TrackedOrder } from "@/lib/aiAgent/orders";
 import { refineOrderDraft } from "@/lib/aiAgent/orderText";
 import { historyForModel, type HistoryOrder } from "@/lib/aiAgent/orderHistory";
 import { runOrderCommand } from "@/lib/server/aiAgent/orderCorrections";
+import { maybeHandleTeachReply } from "@/lib/server/aiAgent/teachSessions";
 import { loadCustomerHistory, loadOpenOrders, ordersForModel, trackOrders } from "@/lib/server/aiAgent/orders";
 import { monitorCustomerTurn, monitorStaffMessage } from "@/lib/server/aiAgent/orderMonitor";
 import { processStaffGroupMessage, reportStaffFailure } from "@/lib/server/aiAgent/staffGroup";
@@ -325,7 +326,22 @@ export async function processBridgeMessage(raw: BridgeMessageInput): Promise<Bri
 /** A message in the separate Orders group: only the order commands do anything; it never reaches the escalation logic. */
 async function processOrdersGroupMessage(input: BridgeMessageInput, settings: AgentSettings, eventId: string): Promise<Outcome> {
   const command = parseOrderCommand(input.text, { timezone: settings.orders_timezone });
-  if (!command) return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
+  if (!command) {
+    // Not a command: it may still answer one of our teaching questions.
+    const taught = await maybeHandleTeachReply({
+      settings,
+      fromGroup: input.chatId,
+      text: input.text,
+      quotedMessageId: input.quotedMessageId,
+      senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone ?? null),
+      senderJid: input.senderJid,
+      eventId,
+      whatsappMessageId: input.whatsappMessageId,
+      timestamp: input.timestamp,
+    });
+    if (taught) return { decision: "NO_REPLY", reasons: [taught.outcome], outbox: taught.outbox, queued: taught.queued };
+    return { decision: "NO_REPLY", reasons: ["orders_group_ignored"], outbox: [] };
+  }
   const result = await runOrderCommand({
     settings,
     fromGroup: input.chatId,

@@ -45,6 +45,7 @@ import { parseOrderCommand } from "@/lib/aiAgent/orderCommands";
 import { parseCustomerCommand } from "@/lib/aiAgent/customerCommands";
 import { handleCustomerCommand } from "@/lib/server/aiAgent/customerCommands";
 import { runOrderCommand } from "@/lib/server/aiAgent/orderCorrections";
+import { maybeHandleTeachReply } from "@/lib/server/aiAgent/teachSessions";
 import { agentDb, audit, loadActiveKnowledge, loadSettings } from "@/lib/server/aiAgent/db";
 import { customerGate, planCustomerSend, sha } from "@/lib/server/aiAgent/customerSend";
 import {
@@ -209,6 +210,22 @@ export async function processStaffGroupMessage(input: StaffGroupMessage): Promis
       timestamp: input.timestamp,
     });
     return { outbox: result.outbox, queued: result.queued, outcome: result.outcome, escalationId: null };
+  }
+  // A reply to one of our teaching questions ("!order #REF teach …" asked something): bound to its conversation by the quoted
+  // question or by the sender having exactly one open conversation. Anything else returns null and carries on below.
+  if (!orderCommand) {
+    const taught = await maybeHandleTeachReply({
+      settings,
+      fromGroup: groupJid,
+      text: input.text,
+      quotedMessageId: input.quotedMessageId,
+      senderAuth: authorizeStaffSender(settings.staff_authorized_senders, input.senderJid, input.senderPhone),
+      senderJid: input.senderJid,
+      eventId: input.eventId,
+      whatsappMessageId: input.whatsappMessageId,
+      timestamp: input.timestamp,
+    });
+    if (taught) return { outbox: taught.outbox, queued: taught.queued, outcome: taught.outcome, escalationId: null };
   }
   // Customer commands ("!rules", "!help", "!customer", "!location", "!remember"): handled before any escalation matching, for
   // the same reason as the order commands. A reply to a customer's notice with "!location Cap Estate" is a location, never
