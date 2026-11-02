@@ -65,30 +65,72 @@ describe("Google OAuth and API calls", () => {
     ];
     for (const [status, json, kind] of kinds) {
       const c = docsClient("AT", stub(() => ({ status, json })).impl);
-      await assert.rejects(c.getDocument("doc"), (e: unknown) => e instanceof GoogleApiError && e.kind === kind, `${status} → ${kind}`);
+      await assert.rejects(c.batchUpdate("doc", []), (e: unknown) => e instanceof GoogleApiError && e.kind === kind, `${status} → ${kind}`);
     }
     const down = (async () => {
       throw new Error("ECONNRESET");
     }) as unknown as typeof fetch;
-    await assert.rejects(docsClient("AT", down).getDocument("doc"), (e: unknown) => e instanceof GoogleApiError && e.kind === "network");
+    await assert.rejects(docsClient("AT", down).findTags("doc", ["E-AAAAA"]), (e: unknown) => e instanceof GoogleApiError && e.kind === "network");
   });
 
-  test("document calls: bearer token, id escaped, revision guard sent, edit capability read from Drive", async () => {
+  test("document calls: bearer token, id escaped, edit capability read from Drive metadata only, no revision guard on writes", async () => {
     const f = stub((c) => {
       if (c.url.includes("/drive/v3/files/")) return { json: { id: "d", name: "Orders", mimeType: "application/vnd.google-apps.document", capabilities: { canEdit: true } } };
       if (c.url.endsWith(":batchUpdate")) return { json: {} };
-      return { json: { documentId: "d", title: "Orders", revisionId: "r1", body: { content: [] } } };
+      return { json: {} };
     });
     const c = docsClient("AT", f.impl);
     assert.deepEqual(await c.getFile("d/../x"), { id: "d", name: "Orders", mimeType: "application/vnd.google-apps.document", trashed: false, canEdit: true });
-    assert.equal((await c.getDocument("d")).revisionId, "r1");
-    await c.batchUpdate("d", [{ insertText: { location: { index: 1 }, text: "x" } }], "r1");
-    await c.batchUpdate("d", [], undefined);
+    await c.batchUpdate("d", [{ insertText: { location: { index: 1 }, text: "x\n" } }]);
     assert.ok(f.calls.every((x) => x.headers.Authorization === "Bearer AT"));
     assert.ok(f.calls[0].url.includes("d%2F..%2Fx") && f.calls[0].url.includes("supportsAllDrives=true"));
-    assert.deepEqual(JSON.parse(f.calls[2].body!).writeControl, { requiredRevisionId: "r1" });
-    assert.equal(JSON.parse(f.calls[3].body!).writeControl, undefined);
-    assert.ok(f.calls[2].url.startsWith("https://docs.googleapis.com/v1/documents/d:batchUpdate"));
+    const fields = new URL(f.calls[0].url).searchParams.get("fields")!;
+    assert.equal(fields, "id,name,mimeType,trashed,capabilities(canEdit)", "metadata only: no content, no export");
+    assert.ok(f.calls[1].url.startsWith("https://docs.googleapis.com/v1/documents/d:batchUpdate"));
+    assert.deepEqual(Object.keys(JSON.parse(f.calls[1].body!)), ["requests"], "no writeControl: an insert at index 1 does not depend on the document's revision");
+  });
+
+  test("the access test never downloads a document: the Docs API probe asks for an id that cannot exist and only needs a 'not found' answer", async () => {
+    const f = stub(() => ({ status: 404, json: { error: { message: "Requested entity was not found.", status: "NOT_FOUND" } } }));
+    await docsClient("AT", f.impl).probeDocsApi();
+    assert.equal(f.calls.length, 1);
+    const url = new URL(f.calls[0].url);
+    assert.equal(url.host, "docs.googleapis.com");
+    assert.match(url.pathname, /^\/v1\/documents\/devaux-docs-api-availability-check$/);
+    assert.equal(url.searchParams.get("fields"), "documentId");
+    assert.equal(f.calls[0].method, "GET");
+  });
+
+  test("the Docs API probe separates 'API off', 'missing permission scope', 'revoked' and 'Google down' from a healthy answer", async () => {
+    const outcome = async (status: number, error: unknown) => (await docsClient("AT", stub(() => ({ status, json: { error } })).impl).probeDocsApi().then(() => "available", (e: GoogleApiError) => e.kind));
+    assert.equal(await outcome(404, { message: "Requested entity was not found." }), "available");
+    assert.equal(await outcome(403, { message: "The caller does not have permission", status: "PERMISSION_DENIED" }), "available");
+    assert.equal(await outcome(400, { message: "Invalid document id" }), "available");
+    assert.equal(await outcome(403, { message: "Google Docs API has not been used in project 1 before or it is disabled.", details: [{ reason: "SERVICE_DISABLED" }] }), "api_disabled");
+    assert.equal(await outcome(403, { message: "Request had insufficient authentication scopes.", details: [{ reason: "ACCESS_TOKEN_SCOPE_INSUFFICIENT" }] }), "insufficient_scope");
+    assert.equal(await outcome(401, { message: "Invalid Credentials" }), "invalid_grant");
+    assert.equal(await outcome(503, { message: "backend" }), "server");
+    assert.equal(await outcome(429, { message: "slow down" }), "rate_limited");
+  });
+
+  test("recovery reads text only: a field mask, the first tab (no includeTabsContent), and finds the asked tags", async () => {
+    const f = stub(() => ({ json: { body: { content: [{ paragraph: { elements: [{ textRun: { content: "Jane — x ⟨E-AAAAA⟩\n" } }] } }, { paragraph: { elements: [{ textRun: { content: "other\n" } }] } }] } } }));
+    const found = await docsClient("AT", f.impl).findTags("doc1", ["E-AAAAA", "E-BBBBB"]);
+    assert.deepEqual([...found], ["E-AAAAA"]);
+    const url = new URL(f.calls[0].url);
+    assert.equal(url.searchParams.get("fields"), "body(content(paragraph(elements(textRun(content)))))");
+    assert.equal(url.searchParams.has("includeTabsContent"), false);
+  });
+
+  test("a lost write answer is flagged as outcome-unknown; a refusal is not", async () => {
+    const kinds: [number, boolean][] = [[500, true], [503, true], [400, false], [403, false], [404, false], [429, false]];
+    for (const [status, unknown] of kinds) {
+      const err = await docsClient("AT", stub(() => ({ status, json: { error: { message: "x" } } })).impl).batchUpdate("d", []).catch((e) => e);
+      assert.equal(err.outcomeUnknown, unknown, `${status}`);
+      assert.equal(err.op, "Docs write");
+    }
+    const timeout = (async () => { throw Object.assign(new Error("t"), { name: "TimeoutError" }); }) as unknown as typeof fetch;
+    assert.equal(((await docsClient("AT", timeout).batchUpdate("d", []).catch((e) => e)) as GoogleApiError).outcomeUnknown, true);
   });
 
   test("account email and revocation", async () => {
@@ -140,7 +182,8 @@ describe("Google call timeouts and network failures", () => {
     const impl = (async () => { throw timeoutErr(); }) as unknown as typeof fetch;
     const c = docsClient("AT", impl);
     assert.equal(((await c.getFile("doc1").catch((e) => e)) as GoogleApiError).op, "Drive metadata");
-    assert.equal(((await c.getDocument("doc1").catch((e) => e)) as GoogleApiError).op, "Docs read");
+    assert.equal(((await c.probeDocsApi().catch((e) => e)) as GoogleApiError).op, "Docs API check");
+    assert.equal(((await c.batchUpdate("doc1", []).catch((e) => e)) as GoogleApiError).op, "Docs write");
   });
 
   test("a fast connection failure on a read is retried once; a write never is", async () => {

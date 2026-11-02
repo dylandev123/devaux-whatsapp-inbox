@@ -683,13 +683,10 @@ export interface GoogleDocsProblem {
   id: string;
   orderId: string;
   ref: string;
-  state: "conflict" | "pending_review" | "missing" | "failed" | "synced";
+  state: "failed" | "unconfirmed";
   customer: string | null;
   orderStatus: string | null;
-  reason: string | null;
-  pendingText: string | null;
-  foundText: string | null;
-  lastText: string | null;
+  reason: string;
   attempts: number;
   error: string | null;
   updatedAt: string;
@@ -709,15 +706,10 @@ export type GoogleDocsDashboard =
         canEdit: boolean;
         accessVerifiedAt: string | null;
         format: import("@/lib/aiAgent/gdocFormat").FormatConfig;
-        insertion: import("@/lib/aiAgent/gdocDocument").Insertion;
-        onCompleted: "leave" | "mark" | "remove";
-        onCancelled: "leave" | "mark" | "remove";
-        onCorrected: "update" | "review";
         includeIncomplete: boolean;
         syncSince: string | null;
-        sectionCreatedAt: string | null;
         lastSyncAt: string | null;
-        health: "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "insufficient_scope" | "section_problem" | "error";
+        health: "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "insufficient_scope" | "document_problem" | "error";
         lastError: string | null;
       };
       counts: Record<string, number>;
@@ -730,18 +722,14 @@ export interface GoogleDocsAccess {
   title: string;
   canEdit: boolean;
   account: string;
-  section: "none" | "found" | "broken";
-  sectionMessage: string | null;
-  position: { ok: true; where: string } | { ok: false; reason: string } | null;
-  lineCount: number;
+  docsApi: true;
 }
 
 export interface GoogleDocsSyncResult {
   status: string;
   inserted: number;
-  updated: number;
-  removed: number;
-  held: number;
+  confirmed: number;
+  unconfirmed: number;
   failed: number;
   message?: string;
 }
@@ -764,7 +752,7 @@ export const googleDocsApi = {
   syncNow: (b: string) => gdocs<{ result: GoogleDocsSyncResult }>(b, "sync_now"),
   importPreview: (b: string) => gdocs<{ preview: GoogleDocsImportPreview }>(b, "import_preview"),
   importCommit: (b: string, orderIds: string[]) => gdocs<{ result: GoogleDocsSyncResult }>(b, "import_commit", { orderIds, confirm: true }),
-  resolve: (b: string, lineId: string, resolution: "overwrite" | "keep" | "readd" | "ignore" | "retry") => gdocs<{ result: GoogleDocsSyncResult | { status: "ok" } }>(b, "resolve", { lineId, resolution }),
+  resolve: (b: string, lineId: string, resolution: "present" | "again" | "skip") => gdocs<{ result: GoogleDocsSyncResult | { status: "ok" } }>(b, "resolve", { lineId, resolution }),
   retryAll: (b: string) => gdocs<{ result: GoogleDocsSyncResult }>(b, "retry_all"),
   disconnect: (b: string) => gdocs<{ ok: true }>(b, "disconnect"),
 };

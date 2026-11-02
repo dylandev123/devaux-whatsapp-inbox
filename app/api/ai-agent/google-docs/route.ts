@@ -8,7 +8,7 @@ import {
   importCommit,
   importPreview,
   resolveLine,
-  retryAllFailed,
+  retryNow,
   saveConfig,
   setDocument,
   setEnabled,
@@ -19,11 +19,12 @@ import { runSync } from "@/lib/server/aiAgent/googleDocs/sync";
 
 // Admin-only (middleware.ts ADMIN_API_PREFIXES + requireAdmin()), like every /api/ai-agent route. Every action is scoped to
 // one business slug and uses that business's own stored document. Nothing here can message a customer. Only sync_now,
-// import_commit and resolve (overwrite / readd / retry) ever write to the Google Doc, and only when sync is enabled.
+// retry_all, import_commit and resolve (again) ever write to the Google Doc — one new line at the top — and only when sync is
+// enabled. The access test (set_document / test_access) reads Drive metadata only and never downloads the document.
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const RESOLUTIONS: Resolution[] = ["overwrite", "keep", "readd", "ignore", "retry"];
+const RESOLUTIONS: Resolution[] = ["present", "again", "skip"];
 
 export async function GET(request: Request) {
   const admin = await requireAdmin();
@@ -72,7 +73,7 @@ export async function POST(request: Request) {
         await setEnabled(businessSlug, body.enabled, admin.userId);
         return NextResponse.json({ ok: true });
       case "sync_now": {
-        const result = await runSync(businessSlug);
+        const result = await runSync(businessSlug, { manual: true });
         if (result.status === "disabled") return jsonError("Turn sync on first.", 409);
         return NextResponse.json({ result });
       }
@@ -89,7 +90,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ result: await resolveLine(businessSlug, body.lineId, body.resolution as Resolution, admin.userId) });
       }
       case "retry_all":
-        return NextResponse.json({ result: await retryAllFailed(businessSlug, admin.userId) });
+        return NextResponse.json({ result: await retryNow(businessSlug) });
       case "disconnect":
         await disconnectGoogle(businessSlug, admin.userId);
         return NextResponse.json({ ok: true });

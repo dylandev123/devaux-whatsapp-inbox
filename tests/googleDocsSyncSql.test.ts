@@ -1,8 +1,9 @@
-// Google Docs order sync, end to end: the app's REAL server code (admin actions → sync engine → store) against the REAL
-// migration in a throwaway Postgres, with an in-memory Google Doc standing in for Google. Proves: nothing is written while
-// disabled, enabling lists only NEW orders, retries / concurrency / crashes never duplicate a line, a person's edits are
-// never overwritten, revoked access blocks cleanly, businesses are isolated, and no WhatsApp message is ever queued.
-// Skips itself when no Postgres binaries are installed.
+// Google Docs order sync (append-only at the top), end to end: the app's REAL server code (admin actions → sync engine →
+// store) against the REAL migrations in a throwaway Postgres, with an in-memory Google Doc standing in for Google. Proves:
+// nothing is written while disabled, the access test and normal sync never download the document, enabling lists only NEW
+// orders, existing content and later order changes are never touched, retries / concurrency / lost answers / crashes never
+// duplicate a line, Google failures are reported and retried, revoked access blocks cleanly, businesses are isolated, historical
+// orders are never modified, and no WhatsApp message is ever queued. Skips itself when no Postgres binaries are installed.
 
 import { after, before, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
@@ -30,7 +31,6 @@ let dbmod: typeof import("../lib/server/aiAgent/db.ts");
 let sync: typeof import("../lib/server/aiAgent/googleDocs/sync.ts");
 let admin: typeof import("../lib/server/aiAgent/googleDocs/admin.ts");
 let store: typeof import("../lib/server/aiAgent/googleDocs/store.ts");
-let ordersMod: typeof import("../lib/server/aiAgent/orders.ts");
 
 let docs: Record<string, FakeGoogleDoc>;
 let client: ReturnType<typeof fakeClient>;
@@ -43,6 +43,10 @@ async function rows<T = Record<string, any>>(sql: string): Promise<T[]> {
   return JSON.parse((await pg.run(`select coalesce(json_agg(t), '[]'::json) from (${sql}) t;`)) || "[]");
 }
 const count = async (sql: string) => Number(await pg.run(`select count(*) from (${sql}) t;`));
+
+function snapshotDoc(doc: FakeGoogleDoc) {
+  return JSON.parse(JSON.stringify(doc.paragraphs())) as ReturnType<FakeGoogleDoc["paragraphs"]>;
+}
 
 function staffDoc(title = "Staff orders") {
   return new FakeGoogleDoc(title, [
@@ -64,6 +68,8 @@ async function addOrder(slug: string, over: { ref?: string; name?: string; statu
 }
 const changeOrder = (ref: string, set: string) => pg.run(`update public.ai_agent_orders set ${set}, version = version + 1 where ref_code = ${lit(ref)};`);
 const linesOf = (doc: FakeGoogleDoc) => doc.lines().filter((l) => l.includes("⟨E-"));
+/** Make the in-flight attempts old enough to be judged (the settle period is two minutes). */
+const ageAttempts = () => pg.run(`update public.ai_agent_gdoc_lines set attempt_started_at = now() - interval '10 minutes', last_verify_at = null;`);
 const lineRows = (slug = A) => rows<Record<string, any>>(`select * from public.ai_agent_gdoc_lines where business_slug = ${lit(slug)} order by created_at, id`);
 const settingsRow = async (slug = A) => (await rows<Record<string, any>>(`select * from public.ai_agent_gdoc_settings where business_slug = ${lit(slug)}`))[0];
 
@@ -81,7 +87,6 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     sync = await import("../lib/server/aiAgent/googleDocs/sync.ts");
     admin = await import("../lib/server/aiAgent/googleDocs/admin.ts");
     store = await import("../lib/server/aiAgent/googleDocs/store.ts");
-    ordersMod = await import("../lib/server/aiAgent/orders.ts");
     sync.setDocsClientFactoryForTests(async () => {
       factoryCalls += 1;
       if (blocked) throw blocked;
@@ -105,14 +110,21 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
   // Whatever a test does, the integration must never queue a WhatsApp message.
   const noWhatsapp = async () => assert.equal(await count(`select 1 from public.ai_agent_outbox`), 0, "no WhatsApp message was queued");
 
-  test("the migration is idempotent and keeps credentials away from dashboard roles", async () => {
-    const sql = readFileSync(join(process.cwd(), "supabase/migrations/20261112000000_ai_agent_google_docs_sync.sql"), "utf8");
-    await pg.run(sql);
-    await pg.run(sql);
+  test("the migrations are idempotent, keep credentials away from dashboard roles, and the claim function is service-role only", async () => {
+    for (const f of ["20261112000000_ai_agent_google_docs_sync.sql", "20261113000000_ai_agent_gdocs_append_only.sql"]) {
+      const sql = readFileSync(join(process.cwd(), "supabase/migrations", f), "utf8");
+      await pg.run(sql);
+      await pg.run(sql);
+    }
     assert.equal(await pg.run(`select has_table_privilege('authenticated', 'public.ai_agent_google_connections', 'select');`), "f");
     assert.equal(await pg.run(`select has_table_privilege('anon', 'public.ai_agent_gdoc_lines', 'select');`), "f");
     assert.equal(await pg.run(`select has_table_privilege('authenticated', 'public.ai_agent_gdoc_settings', 'select');`), "t");
     assert.equal(await pg.run(`select has_function_privilege('authenticated', 'public.claim_gdoc_sync(text,text,integer)', 'execute');`), "f");
+    assert.equal(await pg.run(`select has_function_privilege('authenticated', 'public.claim_gdoc_line(text,text,uuid,text,uuid)', 'execute');`), "f");
+    assert.equal(await pg.run(`select has_function_privilege('service_role', 'public.claim_gdoc_line(text,text,uuid,text,uuid)', 'execute');`), "t");
+    // The new states are accepted, an invented one is not.
+    await pg.run(`insert into public.ai_agent_gdoc_settings (business_slug) values ('x') on conflict do nothing;`);
+    await assert.rejects(pg.run(`insert into public.ai_agent_gdoc_lines (business_slug, document_id, order_id, tag, state) values ('x','d','${"0".repeat(8)}-0000-0000-0000-000000000001','E-X','bogus');`));
   });
 
   test("synchronization is OFF by default: nothing is read or written, however many orders arrive", async () => {
@@ -130,50 +142,57 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     await noWhatsapp();
   });
 
-  test("a Google timeout or outage during the access test gives a distinct message, a 504 for timeouts, and saves nothing", async () => {
-    const slow = { ...client, getDocument: async () => { throw new GoogleApiError("timeout", 0, "x", [], "Docs read"); } };
-    client = slow as never;
+  test("the access test uses Drive metadata and an API probe only: it never downloads the document, even one too large to download", async () => {
+    docs[DOC_A] = new FakeGoogleDoc("Orders book", Array.from({ length: 4000 }, (_, i) => ({ text: `Order ${i} ${"x".repeat(60)}` })));
+    docs[DOC_A].maxReadableChars = 1000; // any body download would time out
+    const report = await admin.setDocument(A, LINK_A, USER);
+    assert.deepEqual([report.title, report.canEdit, report.account, report.docsApi], ["Orders book", true, "staff@example.com", true]);
+    assert.deepEqual([...new Set(client.calls.map((c) => c.split(":")[0]))].sort(), ["getFile", "probeDocsApi"]);
+    assert.equal(docs[DOC_A].textReads, 0);
+    assert.equal(docs[DOC_A].batches.length, 0, "no write");
+    const again = await admin.testStoredDocument(A);
+    assert.equal(again.account, "staff@example.com");
+    assert.equal(docs[DOC_A].textReads, 0);
+    assert.equal((await settingsRow()).enabled, false);
+  });
+
+  test("access test failures are told apart: timeout (504), network, Docs API off, missing scope, not found, no edit access, not a Doc", async () => {
+    const withFailure = (patch: Record<string, unknown>) => (client = { ...fakeClient(docs), ...patch } as never);
+    withFailure({ getFile: async () => { throw new GoogleApiError("timeout", 0, "x", [], "Drive metadata"); } });
     const t = await admin.setDocument(A, LINK_A, USER).catch((e: any) => e);
     assert.equal(t.status, 504);
-    assert.match(t.message, /too long.*Docs read timed out.*Nothing was changed/);
-    client = { ...fakeClient(docs), getFile: async () => { throw new GoogleApiError("network", 0, "x", [], "Drive metadata"); } } as never;
+    assert.match(t.message, /too long.*Drive metadata timed out.*try again/i);
+    withFailure({ getFile: async () => { throw new GoogleApiError("network", 0, "x", [], "Drive metadata"); } });
     const n = await admin.setDocument(A, LINK_A, USER).catch((e: any) => e);
     assert.equal(n.status, 400);
     assert.match(n.message, /Could not reach Google.*Drive metadata/);
-    assert.equal((await settingsRow())?.document_id ?? null, null, "a failed test saves no document");
-  });
-
-  test("pasting a link tests access WITHOUT writing; a view-only or non-Doc file is refused for sync", async () => {
-    const report = await admin.setDocument(A, LINK_A, USER);
-    assert.equal(report.title, "Dog food orders");
-    assert.equal(report.canEdit, true);
-    assert.equal(report.section, "none");
-    assert.equal(docs[DOC_A].batches.length, 0, "no write");
-    assert.equal((await settingsRow()).enabled, false);
-
-    const again = await admin.testStoredDocument(A);
-    assert.equal(again.account, "staff@example.com");
-    assert.equal(docs[DOC_A].batches.length, 0);
-
-    await assert.rejects(admin.setDocument(A, "https://example.com/x", USER), /Only docs\.google\.com/);
+    withFailure({ probeDocsApi: async () => { throw new GoogleApiError("api_disabled", 403, "off", ["SERVICE_DISABLED"], "Docs API check"); } });
+    assert.match((await admin.setDocument(A, LINK_A, USER).catch((e: any) => e)).message, /Docs or Google Drive API is not enabled/);
+    withFailure({ probeDocsApi: async () => { throw new GoogleApiError("insufficient_scope", 403, "scope", [], "Docs API check"); } });
+    assert.match((await admin.setDocument(A, LINK_A, USER).catch((e: any) => e)).message, /missing a required permission/);
+    withFailure({ probeDocsApi: async () => { throw new GoogleApiError("timeout", 0, "x", [], "Docs API check"); } });
+    assert.match((await admin.setDocument(A, LINK_A, USER).catch((e: any) => e)).message, /Docs API check timed out/);
+    client = fakeClient(docs);
     await assert.rejects(admin.setDocument(A, `https://docs.google.com/document/d/${"z".repeat(30)}/edit`, USER), /cannot find this document/);
-
+    await assert.rejects(admin.setDocument(A, "https://example.com/x", USER), /Only docs\.google\.com/);
+    docs[DOC_A].mimeType = "application/vnd.google-apps.spreadsheet";
+    await assert.rejects(admin.setDocument(A, LINK_A, USER), /not a Google Docs document/);
+    docs[DOC_A].mimeType = "application/vnd.google-apps.document";
+    docs[DOC_A].trashed = true;
+    await assert.rejects(admin.setDocument(A, LINK_A, USER), /in the trash/);
+    docs[DOC_A].trashed = false;
+    assert.equal((await settingsRow())?.document_id ?? null, null, "a failed test saves no document");
     docs[DOC_A].canEdit = false;
     await admin.setDocument(A, LINK_A, USER);
     await assert.rejects(admin.setEnabled(A, true, USER), /only view/);
     assert.equal((await settingsRow()).enabled, false);
-    docs[DOC_A].canEdit = true;
-
-    docs[DOC_A].mimeType = "application/vnd.google-apps.spreadsheet";
-    await assert.rejects(admin.setDocument(A, LINK_A, USER), /not a Google Docs document/);
     await noWhatsapp();
   });
 
-  test("enabling lists only NEW orders; the existing outstanding ones wait for the explicit import", async () => {
+  test("enabling lists only NEW orders: the existing outstanding ones wait for the explicit import, and enabling writes nothing", async () => {
     const old = await addOrder(A, { ref: "E-OLD01", at: new Date(Date.now() - 3 * 86400_000).toISOString() });
     await admin.setDocument(A, LINK_A, USER);
-    assert.equal(docs[DOC_A].batches.length, 0);
-    const before = JSON.parse(JSON.stringify(docs[DOC_A].paragraphs()));
+    const before = snapshotDoc(docs[DOC_A]);
     await admin.setEnabled(A, true, USER);
     assert.equal(docs[DOC_A].batches.length, 0, "enabling does not write by itself");
     const fresh = await addOrder(A, { ref: "E-NEW01", name: "Jane" });
@@ -184,31 +203,13 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     const lines = linesOf(docs[DOC_A]);
     assert.equal(lines.length, 1);
     assert.ok(lines[0].includes(`⟨${fresh}⟩`) && !lines.some((l) => l.includes(old)));
-
-    // Pre-existing content untouched, in order, with formatting.
-    const after = docs[DOC_A].paragraphs();
-    for (const p of before) {
-      const same = after.find((a) => a.text === p.text);
-      assert.ok(same, p.text);
-      assert.deepEqual(same.para, p.para);
-      assert.deepEqual(same.styles, p.styles);
-    }
-    assert.equal(docs[DOC_A].lines()[0].startsWith("▼ AI ORDERS [dog_food]"), true, "section at the top by default");
+    assert.match(lines[0], /^Jane — \+1758555\d+ — Rodney Bay — 2 × Chicken ⟨E-NEW01⟩$/);
+    assert.equal(docs[DOC_A].lines()[0], lines[0], "the new line is the very first paragraph of the document");
+    assert.deepEqual(docs[DOC_A].paragraphs().slice(1), before, "every existing paragraph is still there, in order, with its styles");
+    assert.equal(docs[DOC_A].textReads, 0, "no document download on the normal path");
+    assert.deepEqual([...new Set(client.calls.map((c) => c.split(":")[0]))].sort(), ["batchUpdate", "getFile", "probeDocsApi"]);
     assert.equal((await store.loadGdocSettings(A))?.health, "ok");
     await noWhatsapp();
-  });
-
-  test("the chosen insertion position is used (after a heading), and a bad one is refused before anything is written", async () => {
-    await admin.setDocument(A, LINK_A, USER);
-    await admin.saveConfig(A, { insertion: { kind: "after_text", text: "no such text" } }, USER);
-    await assert.rejects(admin.setEnabled(A, true, USER), /No paragraph contains/);
-    await admin.saveConfig(A, { insertion: { kind: "after_text", text: "Gate code" } }, USER);
-    await admin.setEnabled(A, true, USER);
-    await addOrder(A);
-    await sync.runSync(A);
-    const l = docs[DOC_A].lines();
-    assert.equal(l[l.indexOf("Gate code 1234") + 2].startsWith("▼ AI ORDERS"), true);
-    assert.equal(l.at(-1), "Remember to restock");
   });
 
   test("newest first, one paragraph per order, and a second run changes nothing (idempotent)", async () => {
@@ -221,12 +222,14 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     const lines = linesOf(docs[DOC_A]);
     assert.deepEqual(lines.map((x) => x.match(/⟨(E-[A-Z0-9]+)⟩/)![1]), [third, second, first]);
     assert.ok(lines[0].startsWith("Cara") && lines[2].startsWith("Alice"));
+    assert.equal(docs[DOC_A].lines()[3], "DELIVERIES");
 
     const batches = docs[DOC_A].batches.length;
     const again = await sync.runSync(A);
-    assert.deepEqual([again.inserted, again.updated, again.removed], [0, 0, 0]);
+    assert.deepEqual([again.inserted, again.confirmed, again.unconfirmed, again.failed], [0, 0, 0, 0]);
     assert.equal(docs[DOC_A].batches.length, batches, "no document write on a no-op run");
     assert.equal((await lineRows()).length, 3);
+    assert.ok((await lineRows()).every((l) => l.state === "synced" && l.attempts === 1));
   });
 
   test("orders that might not be orders are not synced; they appear once staff confirm them", async () => {
@@ -242,203 +245,403 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     assert.ok(lines[0].includes(maybe) && !lines[0].includes(empty));
   });
 
-  test("a corrected order updates its own line in place; completed and cancelled follow the settings", async () => {
+  test("append-only: later order changes, completion, cancellation and staff edits or deletions never touch an inserted line", async () => {
     await setUp();
     const a = await addOrder(A, { name: "Alice", address: "Rodney Bay" });
     const b = await addOrder(A, { name: "Bob" });
     const c = await addOrder(A, { name: "Cara" });
+    const d = await addOrder(A, { name: "Dina" });
     await sync.runSync(A);
+    assert.equal(linesOf(docs[DOC_A]).length, 4);
 
-    await changeOrder(a, "delivery_address = 'Gros Islet'");
+    docs[DOC_A].appendToParagraph(a, " — gate is BLUE, call first");
+    docs[DOC_A].deleteParagraph(d);
+    const staffView = docs[DOC_A].lines();
+    const batches = docs[DOC_A].batches.length;
+
+    await changeOrder(a, "delivery_address = 'Gros Islet', notes = 'changed'");
     await changeOrder(b, "status = 'fulfilled'");
     await changeOrder(c, "status = 'cancelled'");
-    await admin.saveConfig(A, { onCancelled: "remove" }, USER);
-    const r = await sync.runSync(A);
-    assert.equal(r.updated, 2);
-    assert.equal(r.removed, 1);
-    const lines = linesOf(docs[DOC_A]);
-    assert.equal(lines.length, 2);
-    assert.ok(lines.some((l) => l.startsWith("Alice") && l.includes("Gros Islet") && !l.includes("Rodney Bay")));
-    assert.ok(lines.some((l) => l.startsWith("[COMPLETED] Bob")));
-    assert.ok(!lines.some((l) => l.includes("Cara")));
-    const bob = docs[DOC_A].paragraphs().find((p) => p.text.startsWith("[COMPLETED] Bob"))!;
-    assert.equal(bob.styles[0].strikethrough, true);
-    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1, "still one line per order");
-  });
-
-  test("corrections can wait for approval: nothing is written until a person approves", async () => {
-    await setUp();
-    await admin.saveConfig(A, { onCorrected: "review" }, USER);
-    const a = await addOrder(A, { name: "Alice", address: "Rodney Bay" });
-    await sync.runSync(A);
-    await changeOrder(a, "delivery_address = 'Gros Islet'");
-    await sync.runSync(A);
-    assert.ok(linesOf(docs[DOC_A])[0].includes("Rodney Bay"));
-    const [line] = await lineRows();
-    assert.equal(line.state, "pending_review");
-    assert.match(line.pending_text, /Gros Islet/);
-    const dash = await admin.getDashboard(A);
-    if (!dash.setupPending) assert.equal(dash.problems[0].state, "pending_review");
-
-    await admin.resolveLine(A, line.id, "overwrite", USER);
-    assert.ok(linesOf(docs[DOC_A])[0].includes("Gros Islet"));
-    assert.equal((await lineRows())[0].state, "synced");
-  });
-
-  test("a line a person edited is never overwritten: the change is held, shown in the dashboard, and resolved by choice", async () => {
-    await setUp();
-    const a = await addOrder(A, { name: "Alice", address: "Rodney Bay" });
-    await sync.runSync(A);
-    docs[DOC_A].appendToParagraph(a, " — gate is BLUE, call first");
-    const edited = docs[DOC_A].lines().find((l) => l.includes(a))!;
-
-    await changeOrder(a, "delivery_address = 'Gros Islet'");
-    const r = await sync.runSync(A);
-    assert.equal(r.updated, 0);
-    assert.equal(docs[DOC_A].lines().find((l) => l.includes(a)), edited, "the person's text is untouched");
-    const [line] = await lineRows();
-    assert.equal(line.state, "conflict");
-    assert.match(line.found_text, /gate is BLUE/);
-    assert.match(line.pending_text, /Gros Islet/);
-
-    // Further order changes and further runs still never touch it.
-    await changeOrder(a, "notes = 'later note'");
-    await sync.runSync(A);
-    await sync.runSync(A);
-    assert.equal(docs[DOC_A].lines().find((l) => l.includes(a)), edited);
-
-    const dash = await admin.getDashboard(A);
-    assert.ok(!dash.setupPending && dash.problems.length === 1 && dash.problems[0].state === "conflict");
-
-    // "Keep the staff version": adopted as the baseline, nothing written, no repeat conflict until the order changes again.
-    const before = docs[DOC_A].batches.length;
-    await admin.resolveLine(A, line.id, "keep", USER);
-    assert.equal(docs[DOC_A].batches.length, before);
-    assert.equal((await lineRows())[0].state, "synced");
-    await sync.runSync(A);
-    assert.equal(docs[DOC_A].lines().find((l) => l.includes(a)), edited);
-    await changeOrder(a, "notes = 'newest note'");
-    await sync.runSync(A);
-    assert.equal((await lineRows())[0].state, "conflict", "still protected after keeping: the baseline is the person's text");
-
-    // "Use the app's version" replaces it — only because a person asked.
-    await admin.resolveLine(A, (await lineRows())[0].id, "overwrite", USER);
-    const final = docs[DOC_A].lines().find((l) => l.includes(a))!;
-    assert.ok(!final.includes("BLUE") && final.includes("Gros Islet") && final.includes("newest note"));
-    assert.equal((await lineRows())[0].state, "synced");
+    for (let i = 0; i < 3; i += 1) assert.equal((await sync.runSync(A)).inserted, 0);
+    assert.deepEqual(docs[DOC_A].lines(), staffView, "the document is exactly as staff left it");
+    assert.equal(docs[DOC_A].batches.length, batches, "no write at all");
+    assert.equal(docs[DOC_A].textReads, 0, "and the document was never read");
+    assert.ok((await lineRows()).every((l) => l.state === "synced"), "a deleted line is not re-added, nothing is flagged");
     await noWhatsapp();
   });
 
-  test("a line a person deleted is not re-added automatically; 'add again' puts it back once", async () => {
+  test("a format change affects lines added from now on only", async () => {
     await setUp();
-    const a = await addOrder(A, { name: "Alice" });
+    await addOrder(A, { name: "Alice" });
     await sync.runSync(A);
-    docs[DOC_A].deleteParagraph(a);
-    await changeOrder(a, "notes = 'x'");
+    const first = docs[DOC_A].lines()[0];
+    await admin.saveConfig(A, { format: { fields: [{ key: "name", enabled: true }, { key: "items", enabled: true }], separator: " | ", placeholders: true } }, USER);
+    await addOrder(A, { name: "Bob" });
     await sync.runSync(A);
+    assert.match(docs[DOC_A].lines()[0], /^Bob \| 2 × Chicken ⟨E-/);
+    assert.equal(docs[DOC_A].lines()[1], first, "the earlier line is untouched");
+  });
+
+  test("historical orders are never modified by sync, and only orders created after activation are inserted", async () => {
+    const day = 86400_000;
+    for (let i = 0; i < 5; i += 1) await addOrder(A, { at: new Date(Date.now() - (i + 2) * day).toISOString(), status: i % 2 ? "fulfilled" : "confirmed" });
+    const digest = () => pg.run(`select md5(coalesce(json_agg(o order by id)::text, '')) from public.ai_agent_orders o;`);
+    const before = await digest();
+    await setUp();
     await sync.runSync(A);
+    await sync.runDueGoogleDocSyncs();
+    await sync.triggerOrderSync(A);
     assert.equal(linesOf(docs[DOC_A]).length, 0);
-    const [line] = await lineRows();
-    assert.equal(line.state, "missing");
-    await admin.resolveLine(A, line.id, "readd", USER);
-    assert.equal(linesOf(docs[DOC_A]).length, 1);
+    assert.equal(await digest(), before, "not a single order column changed");
+    assert.equal((await lineRows()).length, 0);
+    // Off and on again: orders created while it was off are history too.
+    await admin.setEnabled(A, false, USER);
+    await addOrder(A, { name: "WhileOff" });
+    await new Promise((r) => r(null));
+    await admin.setEnabled(A, true, USER);
     await sync.runSync(A);
-    assert.equal(linesOf(docs[DOC_A]).length, 1);
+    assert.equal(linesOf(docs[DOC_A]).length, 0, "an order created while sync was off needs the explicit import");
+    const live = await addOrder(A, { name: "Live", at: new Date(Date.now() + 5000).toISOString() });
+    await sync.runSync(A);
+    assert.ok(linesOf(docs[DOC_A]).length === 1 && linesOf(docs[DOC_A])[0].includes(live));
   });
 
   test("concurrent runs (message trigger + cron + button) add each order exactly once", async () => {
     await setUp();
     for (let i = 0; i < 4; i += 1) await addOrder(A, { name: `Customer ${i}` });
-    const results = await Promise.all([1, 2, 3, 4, 5, 6].map(() => sync.runSync(A)));
+    const results = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => (i % 2 ? sync.runSync(A) : sync.triggerOrderSync(A).then(() => sync.runSync(A)))));
     assert.ok(results.some((r) => r.status === "busy") || results.filter((r) => r.inserted > 0).length === 1);
     await sync.runSync(A);
     const lines = linesOf(docs[DOC_A]);
     assert.equal(lines.length, 4);
     assert.equal(new Set(lines.map((l) => l.match(/⟨(E-[A-Z0-9]+)⟩/)![1])).size, 4);
     assert.equal((await lineRows()).length, 4);
-    assert.equal(docs[DOC_A].lines().filter((l) => l.startsWith("▼ AI ORDERS")).length, 1, "one section");
   });
 
-  test("a Google failure mid-sync leaves the document intact and a retry adds the line once", async () => {
+  test("even with no lease at all, the database lets only ONE caller start an insert for an order", async () => {
+    await setUp();
+    const ref = await addOrder(A, { name: "Alice" });
+    const [order] = await sync.ordersByIds(A, (await rows<{ id: string }>(`select id from public.ai_agent_orders where ref_code = ${lit(ref)}`)).map((r) => r.id));
+    const claims = await Promise.all(Array.from({ length: 12 }, () => store.claimLine(A, DOC_A, order, crypto.randomUUID())));
+    assert.equal(claims.filter(Boolean).length, 1, "exactly one winner");
+    assert.equal((await lineRows()).length, 1);
+    assert.equal((await lineRows())[0].state, "inserting");
+    // While that attempt is open nobody can claim it again, and a run (which does not hold that attempt) writes nothing.
+    assert.equal(await store.claimLine(A, DOC_A, order, crypto.randomUUID()), false);
+    const r = await sync.runSync(A);
+    assert.equal(r.inserted, 0);
+    assert.equal(linesOf(docs[DOC_A]).length, 0);
+  });
+
+  test("two real runs racing on the same order (lease bypassed) still write it once", async () => {
+    await setUp();
+    await addOrder(A, { name: "Alice" });
+    await pg.run(`update public.ai_agent_gdoc_settings set lock_until = null;`);
+    // Make the first writer slow so the second reaches the claim while the first is mid-write.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const real = client.batchUpdate;
+    let first = true;
+    client.batchUpdate = async (...args) => {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return real.apply(client, args);
+    };
+    const slow = sync.runSync(A);
+    await new Promise((r) => setImmediate(r));
+    await pg.run(`update public.ai_agent_gdoc_settings set lock_until = null, lock_token = null;`); // a second run gets in
+    const fast = await sync.runSync(A);
+    assert.equal(fast.inserted, 0, "the second run does not write the order the first one owns");
+    release();
+    const done = await slow;
+    client.batchUpdate = real;
+    assert.equal(done.inserted, 1);
+    assert.equal(linesOf(docs[DOC_A]).length, 1);
+  });
+
+  test("Google refuses the write (403): nothing changes, the failure is shown, the backoff holds automatic retries, and a later run adds the line once", async () => {
     await setUp();
     const a = await addOrder(A, { name: "Alice" });
-    docs[DOC_A].failNextBatch = new FakeApiError("server", 503, "backend error");
+    docs[DOC_A].failNextBatch = new FakeApiError("forbidden", 403, "The caller does not have permission");
     const failed = await sync.runSync(A);
     assert.equal(failed.status, "error");
+    assert.equal(failed.health, "no_access");
+    assert.equal(failed.failed, 1);
     assert.equal(linesOf(docs[DOC_A]).length, 0);
-    assert.equal((await settingsRow()).health, "error");
+    assert.equal((await settingsRow()).health, "no_access");
+    const [row] = await lineRows();
+    assert.equal(row.state, "failed", "a refusal proves the document is unchanged → safe to retry");
+    assert.match(row.last_error, /permission/);
     const dash = await admin.getDashboard(A);
-    // The section may or may not exist yet (the failed batch can be the section creation); either way no duplicate.
-    const retry = await sync.runSync(A);
+    assert.ok(!dash.setupPending && dash.problems.length === 1 && dash.problems[0].state === "failed" && dash.problems[0].ref === a);
+
+    // The cron tick and order triggers wait out the backoff after a failure …
+    assert.equal((await sync.runSync(A, { backoff: true })).status, "waiting");
+    assert.equal(docs[DOC_A].batches.length, 0);
+    // … and a retry once the backoff has passed (or a person pressing the button) puts it in exactly once.
+    await pg.run(`update public.ai_agent_gdoc_settings set last_attempt_at = now() - interval '10 minutes';`);
+    const retry = await sync.runSync(A, { backoff: true });
     assert.equal(retry.status, "ok");
+    assert.equal(retry.inserted, 1);
     assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1);
-    assert.equal(docs[DOC_A].lines().filter((l) => l.startsWith("▼ AI ORDERS")).length, 1);
+    const [after] = await lineRows();
+    assert.deepEqual([after.state, after.attempts], ["synced", 2]);
     assert.equal((await settingsRow()).health, "ok");
     assert.equal((await settingsRow()).last_error, null);
-    assert.ok(!dash.setupPending);
   });
 
-  test("a failed LINE write is recorded, shown with its error, and 'retry' fixes it", async () => {
+  test("Google fails with a 5xx BEFORE applying: the outcome is unknown, so the order is not re-sent blindly; after the settle period it is checked, found absent, and added once", async () => {
     await setUp();
-    await addOrder(A, { name: "Alice" });
-    await sync.runSync(A); // creates the section and the line
-    const b = await addOrder(A, { name: "Bob" });
+    const a = await addOrder(A, { name: "Alice" });
     docs[DOC_A].failNextBatch = new FakeApiError("server", 503, "backend error");
+    const r = await sync.runSync(A);
+    assert.equal(r.status, "error");
+    assert.equal(r.unconfirmed, 1);
+    assert.equal((await lineRows())[0].state, "unconfirmed");
+    // Immediately afterwards (inside the settle period) nothing is re-sent and the document is not even read.
+    const again = await sync.runSync(A);
+    assert.equal(again.inserted, 0);
+    assert.equal(docs[DOC_A].batches.length, 0);
+    assert.equal(docs[DOC_A].textReads, 0, "no verification read inside the settle period");
+    // After the settle period the app looks for the order's tag; it is absent, so the attempt is declared failed and retried.
+    await ageAttempts();
+    const fixed = await sync.runSync(A);
+    assert.equal(docs[DOC_A].textReads, 1, "one text-only verification read");
+    assert.equal(fixed.status, "ok");
+    assert.equal(fixed.inserted, 1);
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1);
+    assert.equal((await lineRows())[0].state, "synced");
+  });
+
+  test("the answer to a write is LOST after Google applied it (timeout): the order is never added twice — the tag is found and it is simply marked done", async () => {
+    await setUp();
+    const a = await addOrder(A, { name: "Alice" });
+    docs[DOC_A].applyThenFail = new FakeApiError("timeout", 0, "the answer never arrived");
+    const lost = await sync.runSync(A);
+    assert.equal(lost.status, "error");
+    assert.match(lost.message!, /took too long/);
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1, "Google did apply it");
+    assert.equal((await lineRows())[0].state, "unconfirmed");
+    // Retrying inside the settle period does nothing.
     await sync.runSync(A);
-    const failed = (await lineRows()).find((l) => l.tag === b)!;
-    assert.equal(failed.state, "failed");
-    assert.equal(failed.attempts, 1);
-    assert.match(failed.last_error, /Google error/);
+    assert.equal(linesOf(docs[DOC_A]).length, 1);
+
+    await ageAttempts();
+    const settled = await sync.runSync(A);
+    assert.equal(settled.confirmed, 1);
+    assert.equal(settled.inserted, 0);
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1, "still exactly one line");
+    assert.equal((await lineRows())[0].state, "synced");
+    assert.equal((await settingsRow()).health, "ok");
+    for (let i = 0; i < 3; i += 1) await sync.runSync(A);
+    assert.equal(linesOf(docs[DOC_A]).length, 1);
+  });
+
+  test("when the document is too large to verify, an unknown line is never guessed: it stays for a person, who picks 'it is there', 'add it again' or 'leave it out'", async () => {
+    await setUp();
+    const a = await addOrder(A, { name: "Alice" });
+    const b = await addOrder(A, { name: "Bob", at: new Date(Date.now() + 1000).toISOString() });
+    const c = await addOrder(A, { name: "Cara", at: new Date(Date.now() + 2000).toISOString() });
+    docs[DOC_A].applyThenFail = new FakeApiError("timeout", 0, "lost");
+    await sync.runSync(A); // Alice is written but unrecorded; the run stops there
+    assert.equal(linesOf(docs[DOC_A]).length, 1);
+    docs[DOC_A].maxReadableChars = 10; // verification reads now time out
+    await ageAttempts();
+    const stuck = await sync.runSync(A);
+    assert.equal(stuck.unconfirmed, 1);
+    assert.equal(stuck.inserted, 2, "the other orders are not held up");
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1, "Alice is not added again");
+    const [stuckRow] = (await lineRows()).filter((l) => l.tag === a);
+    assert.equal([stuckRow.state, stuckRow.verify_attempts].join(), "unconfirmed,1");
+
     const dash = await admin.getDashboard(A);
-    assert.ok(!dash.setupPending && dash.problems.some((p) => p.ref === b && p.state === "failed"));
-    await admin.resolveLine(A, failed.id, "retry", USER);
+    assert.ok(!dash.setupPending && dash.problems.length === 1 && dash.problems[0].state === "unconfirmed" && dash.problems[0].ref === a);
+    assert.match(dash.problems[0].reason, /may or may not/);
+
+    // The automatic cooldown holds further downloads …
+    const reads = docs[DOC_A].textReads;
+    await sync.runSync(A);
+    assert.equal(docs[DOC_A].textReads, reads);
+    // … and a person settles it. "It is there":
+    await admin.resolveLine(A, stuckRow.id, "present", USER);
+    assert.equal((await lineRows()).find((l) => l.tag === a)!.state, "synced");
+    assert.equal(linesOf(docs[DOC_A]).length, 3);
+
+    // "Add it again" (the person checked and it is not there): written once, then settled.
+    docs[DOC_A].deleteParagraph(b);
+    await pg.run(`update public.ai_agent_gdoc_lines set state = 'unconfirmed' where tag = ${lit(b)};`);
+    const rowB = (await lineRows()).find((l) => l.tag === b)!;
+    const res = (await admin.resolveLine(A, rowB.id, "again", USER)) as { inserted: number };
+    assert.equal(res.inserted, 1);
     assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(b)).length, 1);
     assert.equal((await lineRows()).find((l) => l.tag === b)!.state, "synced");
+
+    // "Leave it out".
+    await pg.run(`update public.ai_agent_gdoc_lines set state = 'unconfirmed' where tag = ${lit(c)};`);
+    await admin.resolveLine(A, (await lineRows()).find((l) => l.tag === c)!.id, "skip", USER);
+    assert.equal((await lineRows()).find((l) => l.tag === c)!.state, "skipped");
+    const lengthNow = linesOf(docs[DOC_A]).length;
+    await sync.runSync(A);
+    assert.equal(linesOf(docs[DOC_A]).length, lengthNow);
+    await assert.rejects(admin.resolveLine(A, (await lineRows()).find((l) => l.tag === a)!.id, "skip", USER), /already settled/);
   });
 
-  test("a crash between the document write and the database write cannot create a duplicate", async () => {
+  test("a verification that cannot reach the document counts its tries and is left to a person after the limit", async () => {
+    await setUp();
+    const a = await addOrder(A, { name: "Alice" });
+    docs[DOC_A].applyThenFail = new FakeApiError("timeout", 0, "lost");
+    await sync.runSync(A);
+    docs[DOC_A].maxReadableChars = 10;
+    for (let i = 0; i < 9; i += 1) {
+      await ageAttempts();
+      await sync.runSync(A);
+    }
+    const [row] = await lineRows();
+    assert.equal(row.state, "unconfirmed");
+    assert.equal(row.verify_attempts, sync.MAX_VERIFY_ATTEMPTS, "stops downloading the document after the limit");
+    assert.equal(docs[DOC_A].textReads, sync.MAX_VERIFY_ATTEMPTS);
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1);
+    // The "Retry now" button still tries once more.
+    docs[DOC_A].maxReadableChars = null;
+    await ageAttempts();
+    const manual = await admin.retryNow(A);
+    assert.equal(manual.confirmed, 1);
+    assert.equal((await lineRows())[0].state, "synced");
+  });
+
+  test("CRASH after Google applied the write but before the database recorded it: the next run finds the tag and does not add a second line", async () => {
     await setUp();
     const a = await addOrder(A, { name: "Alice" });
     await sync.runSync(A);
     assert.equal(linesOf(docs[DOC_A]).length, 1);
-    await pg.run(`truncate public.ai_agent_gdoc_lines;`); // the write reached Google but the record was lost
-    await sync.runSync(A);
+    // What a process death at that instant leaves behind: the line is in the document, the row still says 'inserting'.
+    await pg.run(`update public.ai_agent_gdoc_lines set state = 'inserting', last_text = null, last_synced_at = null;`);
+    await ageAttempts();
+    const next = await sync.runSync(A);
+    assert.equal(next.confirmed, 1);
+    assert.equal(next.inserted, 0);
     assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1);
     assert.equal((await lineRows())[0].state, "synced");
-    // Reconnecting / re-saving the same link changes nothing either.
-    await admin.setDocument(A, LINK_A, USER);
-    await admin.setEnabled(A, true, USER);
-    await sync.runSync(A);
-    assert.equal(linesOf(docs[DOC_A]).length, 1);
+    // Until it is old enough to judge, the row is left alone (it may be a live run's attempt).
+    await pg.run(`update public.ai_agent_gdoc_lines set state = 'inserting', attempt_started_at = now();`);
+    assert.equal((await sync.runSync(A)).confirmed, 0);
+    assert.equal(docs[DOC_A].textReads, 1);
   });
 
-  test("a person typing in the document during a sync: the write is retried against the fresh text, content preserved", async () => {
+  test("CRASH after claiming but before the write reached Google: the next run finds no tag and writes the line once", async () => {
+    await setUp();
+    const a = await addOrder(A, { name: "Alice" });
+    const [order] = await sync.ordersByIds(A, (await rows<{ id: string }>(`select id from public.ai_agent_orders where ref_code = ${lit(a)}`)).map((r) => r.id));
+    assert.equal(await store.claimLine(A, DOC_A, order, crypto.randomUUID()), true); // the dying run's claim
+    assert.equal(linesOf(docs[DOC_A]).length, 0);
+    assert.equal((await sync.runSync(A)).inserted, 0, "inside the settle period it stays untouched");
+    await ageAttempts();
+    const r = await sync.runSync(A);
+    assert.equal(r.inserted, 1);
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(a)).length, 1);
+    const [row] = await lineRows();
+    assert.equal([row.state, row.attempts].join(), "synced,2");
+  });
+
+  test("the database blips right after Google's write: recording is retried at once; if it keeps failing the line is still found later, never duplicated", async () => {
+    await setUp();
+    const real = pgSupabase(pg);
+    let failSyncedUpdates = 0;
+    const failing: any = new Proxy({}, { get: (_t, prop) => (prop === "then" ? (ok: (v: unknown) => unknown) => ok({ data: null, error: { message: "db down" } }) : () => failing) });
+    dbmod.setAgentDbForTests({
+      ...real,
+      from: (table: string) => {
+        const q: any = (real as any).from(table);
+        if (table !== "ai_agent_gdoc_lines") return q;
+        const update = q.update.bind(q);
+        q.update = (patch: Record<string, unknown>) => (patch.state === "synced" && failSyncedUpdates > 0 ? (failSyncedUpdates--, failing) : update(patch));
+        return q;
+      },
+      rpc: (...args: unknown[]) => (real as any).rpc(...args),
+    } as never);
+    try {
+      // Two failed attempts are absorbed by the immediate retries.
+      const a = await addOrder(A, { name: "Alice", at: new Date(Date.now() + 1000).toISOString() });
+      failSyncedUpdates = 2;
+      const ok = await sync.runSync(A);
+      assert.equal(ok.inserted, 1);
+      assert.equal((await lineRows()).find((l) => l.tag === a)!.state, "synced");
+
+      // Three failures: the write happened, the record did not. The run reports it; nothing else is written.
+      const b = await addOrder(A, { name: "Bob", at: new Date(Date.now() + 2000).toISOString() });
+      failSyncedUpdates = 3;
+      const bad = await sync.runSync(A);
+      assert.equal(bad.status, "error");
+      assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(b)).length, 1);
+      assert.equal((await lineRows()).find((l) => l.tag === b)!.state, "inserting");
+      await sync.runSync(A);
+      assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(b)).length, 1, "not re-sent");
+      await ageAttempts();
+      const healed = await sync.runSync(A);
+      assert.equal(healed.confirmed, 1);
+      assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(b)).length, 1);
+      assert.equal((await lineRows()).find((l) => l.tag === b)!.state, "synced");
+    } finally {
+      dbmod.setAgentDbForTests(pgSupabase(pg) as never);
+    }
+  });
+
+  test("if Google refuses the styling requests the bare line is still inserted; a document that cannot take text at the top is reported, not worked around", async () => {
+    await setUp();
+    const a = await addOrder(A, { name: "Alice" });
+    const real = client.batchUpdate;
+    let seen = 0;
+    client.batchUpdate = async (id, requests, t) => {
+      seen += 1;
+      if (requests.length > 1) throw new GoogleApiError("bad_request", 400, "Invalid requests[3].updateTextStyle", [], "Docs write");
+      return real.call(client, id, requests, t);
+    };
+    assert.equal((await sync.runSync(A)).inserted, 1);
+    assert.equal(seen, 2, "styled attempt, then the bare insert");
+    assert.equal(docs[DOC_A].lines()[0].includes(a), true);
+    client.batchUpdate = real;
+
+    const b = await addOrder(A, { name: "Bob", at: new Date(Date.now() + 1000).toISOString() });
+    docs[DOC_A].startsWithTable = true;
+    const refused = await sync.runSync(A);
+    assert.equal(refused.status, "error");
+    assert.equal(refused.health, "document_problem");
+    assert.match(refused.message!, /very start of the first tab.*table.*empty paragraph/);
+    assert.equal((await lineRows()).find((l) => l.tag === b)!.state, "failed");
+    docs[DOC_A].startsWithTable = false; // staff fix the top of the document
+    await pg.run(`update public.ai_agent_gdoc_settings set last_attempt_at = now() - interval '10 minutes';`);
+    assert.equal((await sync.runSync(A, { backoff: true })).inserted, 1);
+    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(b)).length, 1);
+  });
+
+  test("Google calls stay out of the order flow: orders.ts never awaits the sync, and a down Google never breaks it", async () => {
+    const source = readFileSync(join(process.cwd(), "lib/server/aiAgent/orders.ts"), "utf8");
+    assert.doesNotMatch(source, /await\s+triggerOrderSync/);
+    assert.equal((source.match(/void triggerOrderSync\(/g) ?? []).length, 2);
     await setUp();
     await addOrder(A, { name: "Alice" });
-    await sync.runSync(A); // section exists
-    const b = await addOrder(A, { name: "Bob" });
-    let raced = false;
-    const real = client.getDocument;
-    client.getDocument = async (id) => {
-      const doc = await real(id);
-      if (!raced) {
-        raced = true;
-        docs[DOC_A].appendToParagraph("Gate code", " (changed 5pm)");
-      }
-      return doc;
-    };
-    const r = await sync.runSync(A);
-    client.getDocument = real;
-    assert.equal(r.status, "ok");
-    assert.ok(docs[DOC_A].lines().includes("Gate code 1234 (changed 5pm)"), "the person's edit survived");
-    assert.equal(linesOf(docs[DOC_A]).filter((l) => l.includes(b)).length, 1);
+    await sync.triggerOrderSync(A);
+    assert.equal(linesOf(docs[DOC_A]).length, 1);
+    blocked = new Error("network down");
+    await addOrder(A, { name: "Bob" });
+    await assert.doesNotReject(sync.triggerOrderSync(A));
+    assert.equal(linesOf(docs[DOC_A]).length, 1);
+    // The cron tick is the retry mechanism: once Google is back (and the backoff has passed) the order goes in.
+    blocked = null;
+    await pg.run(`update public.ai_agent_gdoc_settings set last_attempt_at = now() - interval '10 minutes';`);
+    const due = await sync.runDueGoogleDocSyncs();
+    assert.deepEqual(due.results, { [A]: "ok" });
+    assert.equal(linesOf(docs[DOC_A]).length, 2);
+    const slow = await sync.runDueGoogleDocSyncs(10, 1_000);
+    assert.equal(slow.businesses, 0, "no time left in the cron function → Google is not started");
   });
 
   test("revoked or expired Google access blocks sync clearly, writes nothing, and recovers after reconnecting", async () => {
     await setUp();
     await addOrder(A, { name: "Alice" });
-    const { SyncBlocked } = sync;
-    blocked = new SyncBlocked("needs_reconnect", "Google access was revoked or expired. Reconnect the Google account.");
+    blocked = new sync.SyncBlocked("needs_reconnect", "Google access was revoked or expired. Reconnect the Google account.");
     const r = await sync.runSync(A);
     assert.equal(r.status, "blocked");
     assert.equal(r.health, "needs_reconnect");
@@ -453,7 +656,7 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     assert.equal((await settingsRow()).health, "ok");
   });
 
-  test("the real credential path: stored token is encrypted, a revoked grant marks the connection and blocks sync, a refreshed token is used", async () => {
+  test("the real credential path: stored token is encrypted, a revoked grant marks the connection and blocks sync, a refreshed token is used, and no document is downloaded", async () => {
     const crypto = await import("../lib/server/aiAgent/googleDocs/crypto.ts");
     const env = { ...process.env };
     process.env.GOOGLE_OAUTH_CLIENT_ID = "cid";
@@ -468,23 +671,22 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
       assert.ok(!stored.includes("REFRESH") && stored.startsWith("v1."), "only ciphertext is stored");
 
       sync.setDocsClientFactoryForTests(null); // use the real openClient
-      const seen: string[] = [];
+      const seen: { url: string; method: string }[] = [];
       let grant: "revoked" | "ok" = "revoked";
       globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
         const u = String(url);
-        seen.push(u);
+        seen.push({ url: u, method: init?.method ?? "GET" });
         const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
         if (u === "https://oauth2.googleapis.com/token") return grant === "revoked" ? json(400, { error: "invalid_grant" }) : json(200, { access_token: "AT-FRESH" });
-        // Docs / Drive: serve from the in-memory document and check the refreshed token is what is sent.
         assert.equal((init?.headers as Record<string, string>).Authorization, "Bearer AT-FRESH");
         const id = decodeURIComponent(u.match(/(?:files|documents)\/([^/?:]+)/)![1]);
         if (u.includes("/drive/v3/")) return json(200, await client.getFile(id).then((f) => ({ ...f, capabilities: { canEdit: f.canEdit } })));
-        if (u.endsWith(":batchUpdate")) {
-          const body = JSON.parse(String(init!.body));
-          await client.batchUpdate(id, body.requests, body.writeControl?.requiredRevisionId);
+        if (id === "devaux-docs-api-availability-check") return json(404, { error: { message: "Requested entity was not found.", status: "NOT_FOUND" } });
+        if (u.includes(":batchUpdate")) {
+          await client.batchUpdate(id, JSON.parse(String(init!.body)).requests);
           return json(200, {});
         }
-        return json(200, await client.getDocument(id));
+        throw new Error(`unexpected Google call ${u}`);
       }) as typeof fetch;
 
       const revoked = await sync.runSync(A);
@@ -492,20 +694,21 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
       assert.equal(revoked.health, "needs_reconnect");
       assert.equal((await store.loadConnection(A))?.status, "revoked");
       assert.equal(docs[DOC_A].batches.length, 0);
-      // Still revoked: no further token calls are even attempted until the admin reconnects.
       const tokenCalls = seen.length;
       assert.equal((await sync.runSync(A)).health, "needs_reconnect");
-      assert.equal(seen.length, tokenCalls);
+      assert.equal(seen.length, tokenCalls, "no further token calls until the admin reconnects");
 
-      // Reconnect (new grant) → works with the refreshed access token.
       await store.saveConnection({ business_slug: A, account_email: "staff@example.com", refresh_token_enc: crypto.encryptSecret("1//REFRESH2", A), scopes: [], connected_by: USER });
       grant = "ok";
       const ok = await sync.runSync(A);
       assert.equal(ok.status, "ok");
       assert.equal(linesOf(docs[DOC_A]).length, 1);
-      assert.ok(seen.some((u) => u.includes("docs.googleapis.com")));
+      assert.ok(seen.some((c) => c.url.includes(":batchUpdate") && c.method === "POST"));
+      assert.ok(!seen.some((c) => c.url.includes("docs.googleapis.com") && c.method === "GET"), "a normal sync makes no Docs GET");
+      const access = await admin.testStoredDocument(A);
+      assert.equal(access.docsApi, true);
+      assert.ok(seen.filter((c) => c.url.includes("docs.googleapis.com") && c.method === "GET").every((c) => c.url.includes("devaux-docs-api-availability-check")), "the only Docs GET is the availability probe");
 
-      // A credential that does not belong to this business does not decrypt (copied row).
       await store.saveConnection({ business_slug: A, account_email: "staff@example.com", refresh_token_enc: crypto.encryptSecret("1//X", B), scopes: [], connected_by: USER });
       assert.equal((await sync.runSync(A)).health, "needs_reconnect");
     } finally {
@@ -521,28 +724,16 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
 
   test("losing edit permission or the document is reported, not retried blindly", async () => {
     await setUp();
-    await addOrder(A);
+    const a = await addOrder(A);
     docs[DOC_A].canEdit = false; // permission removed after enabling
     const r = await sync.runSync(A);
     assert.equal(r.status, "error");
     assert.equal(r.health, "no_access");
     assert.equal(linesOf(docs[DOC_A]).length, 0);
+    assert.equal((await lineRows()).find((l) => l.tag === a)!.state, "failed");
     delete docs[DOC_A];
     const gone = await sync.runSync(A);
     assert.equal(gone.health, "doc_not_found");
-  });
-
-  test("damaged section markers stop all writes with an explanation", async () => {
-    await setUp();
-    await addOrder(A, { name: "Alice" });
-    await sync.runSync(A);
-    docs[DOC_A].deleteParagraph("END OF AI ORDERS");
-    await addOrder(A, { name: "Bob" });
-    const r = await sync.runSync(A);
-    assert.equal(r.status, "blocked");
-    assert.equal(r.health, "section_problem");
-    assert.match(r.message!, /markers/);
-    assert.equal(linesOf(docs[DOC_A]).length, 1);
   });
 
   test("two businesses never touch each other's document, lines or connection", async () => {
@@ -557,8 +748,6 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     assert.ok(linesOf(docs[DOC_B]).every((l) => l.includes(b)) && linesOf(docs[DOC_B]).length === 1);
     assert.equal((await lineRows(A)).length, 1);
     assert.equal((await lineRows(B)).length, 1);
-    assert.equal(docs[DOC_A].lines().some((l) => l.includes("[pool_shop]")), false);
-    // Disabling one leaves the other running.
     await admin.setEnabled(B, false, USER);
     await addOrder(A, { name: "Anna" });
     await addOrder(B, { name: "Ben" });
@@ -577,19 +766,18 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     const s = await settingsRow();
     assert.equal(s.enabled, false);
     assert.equal(s.document_id, DOC_B);
-    assert.equal(s.section_created_at, null);
     assert.equal(s.sync_since, null);
     assert.equal((await sync.runSync(A)).status, "disabled");
     assert.deepEqual(linesOf(docs[DOC_A]), oldLines);
     await admin.setEnabled(A, true, USER);
     await sync.runSync(A);
     assert.equal(linesOf(docs[DOC_B]).length, 0, "the new document starts empty: earlier orders only come in through the explicit import");
-    const later = await addOrder(A, { name: "Later" });
+    const later = await addOrder(A, { name: "Later", at: new Date(Date.now() + 5000).toISOString() });
     await sync.runSync(A);
     assert.ok(linesOf(docs[DOC_B]).length === 1 && linesOf(docs[DOC_B])[0].includes(later));
   });
 
-  test("the one-time import previews first (no write), then adds only the chosen orders, oldest first so the newest ends on top", async () => {
+  test("the one-time import previews first (no write, no read), then adds only the chosen orders, oldest first so the newest ends on top", async () => {
     const day = 86400_000;
     const o1 = await addOrder(A, { name: "Old1", at: new Date(Date.now() - 3 * day).toISOString() });
     const o2 = await addOrder(A, { name: "Old2", at: new Date(Date.now() - 2 * day).toISOString() });
@@ -602,6 +790,7 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     const batches = docs[DOC_A].batches.length;
     const preview = await admin.importPreview(A);
     assert.equal(docs[DOC_A].batches.length, batches, "preview wrote nothing");
+    assert.equal(docs[DOC_A].textReads, 0);
     assert.deepEqual(preview.items.map((i) => i.ref), [o3, o2, o1], "preview lists newest first, as they will read");
     assert.match(preview.items[0].line, /\(no phone\)/);
     assert.deepEqual(preview.items[0].missing, ["Phone"]);
@@ -613,22 +802,9 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     const lines = linesOf(docs[DOC_A]);
     assert.equal(lines.length, 2);
     assert.ok(lines[0].includes(o3) && lines[1].includes(o1));
-    // Importing again offers only what is left; importing the same ids again adds nothing.
     assert.deepEqual((await admin.importPreview(A)).items.map((i) => i.ref), [o2]);
     await assert.rejects(admin.importCommit(A, ids, USER), /None of the selected/);
     assert.equal(linesOf(docs[DOC_A]).length, 2);
-  });
-
-  test("the order flow triggers a sync after a change, and a Google failure never breaks the order flow", async () => {
-    await setUp();
-    const a = await addOrder(A, { name: "Alice" });
-    await sync.triggerOrderSync(A);
-    assert.equal(linesOf(docs[DOC_A]).length, 1);
-    blocked = new Error("network down");
-    await addOrder(A, { name: "Bob" });
-    await assert.doesNotReject(sync.triggerOrderSync(A));
-    assert.equal(linesOf(docs[DOC_A]).length, 1);
-    assert.ok(typeof ordersMod.trackOrders === "function" && a);
   });
 
   test("disconnecting stops sync, removes the stored credential, and leaves the document and settings in place", async () => {

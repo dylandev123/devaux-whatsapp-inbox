@@ -3,7 +3,7 @@
 // A line is the enabled fields in the configured order, joined by the configured separator, followed by the order's stable
 // tag. A detail the order does not have yet is shown as a visible placeholder ("(no phone)") — never guessed, never
 // silently dropped — unless the administrator turned placeholders off. Customer-written text is flattened to one line and
-// stripped of the characters the sync uses as markers, so an order can never forge a section marker or another order's tag.
+// stripped of the characters the tag uses, so an order can never forge another order's tag.
 
 import type { OrderLine } from "./orders.ts";
 import { formatLine } from "./orders.ts";
@@ -68,7 +68,7 @@ export function normalizeFormat(raw: unknown): FormatConfig {
 export function sanitizeSeparator(value: unknown): string {
   if (typeof value !== "string") return DEFAULT_SEPARATOR;
   // One line, no control characters, no marker characters, at most 8 characters. Spaces around it are kept as typed.
-  const cleaned = value.replace(/[\u0000-\u001f\u007f\u2028\u2029▼▲⟨⟩]/g, "").slice(0, 8);
+  const cleaned = value.replace(/[\u0000-\u001f\u007f\u2028\u2029⟨⟩]/g, "").slice(0, 8);
   return cleaned.trim() === "" ? DEFAULT_SEPARATOR : cleaned;
 }
 
@@ -93,13 +93,13 @@ export const STATUS_LABELS: Record<string, string> = {
   cancelled: "Cancelled",
 };
 
-const MARKER_CHARS = /[▼▲⟨⟩]/g;
+const TAG_CHARS = /[⟨⟩]/g;
 const FIELD_MAX = 160;
 const LINE_MAX = 600;
 
 /** One line of plain text: no control characters or line breaks, no marker characters, clipped. */
 export function flatten(value: string | null | undefined, max = FIELD_MAX): string {
-  const t = (value ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(MARKER_CHARS, "").replace(/\s+/g, " ").trim();
+  const t = (value ?? "").replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(TAG_CHARS, "").replace(/\s+/g, " ").trim();
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
@@ -167,40 +167,15 @@ export function formatOrderLine(order: LineOrder, format: FormatConfig): Formatt
   return { text, missing };
 }
 
-// ── Stable tag and status marking ────────────────────────────────────────────
+// ── Stable tag ───────────────────────────────────────────────────────────────
+// The small marker ending every line. It is what lets the app recognise its own line after a crash or a lost response
+// without reading the whole document on every insertion. Customer text cannot contain the brackets (see flatten).
 
 export const TAG_OPEN = "⟨";
 export const TAG_CLOSE = "⟩";
-const TAG_ANYWHERE = /\s*⟨([A-Za-z0-9-]{3,24})⟩/g;
 
 export const tagFor = (refCode: string): string => `${TAG_OPEN}${refCode}${TAG_CLOSE}`;
 export const withTag = (text: string, refCode: string): string => `${text} ${tagFor(refCode)}`;
-
-/** Every order tag in a paragraph. Customer text cannot contain the tag brackets, so these are the app's own. */
-export function tagsIn(paragraph: string): string[] {
-  return [...paragraph.matchAll(TAG_ANYWHERE)].map((m) => m[1]);
-}
-
-/**
- * Splits a paragraph into its text (the tag removed, wherever a person has left it — they may type after it) and its first
- * tag (null when there is none).
- */
-export function splitTag(paragraph: string): { text: string; tag: string | null } {
-  const tags = tagsIn(paragraph);
-  return { text: paragraph.replace(TAG_ANYWHERE, "").trim(), tag: tags[0] ?? null };
-}
-
-export const COMPLETED_PREFIX = "[COMPLETED] ";
-export const CANCELLED_PREFIX = "[CANCELLED] ";
-
-/** The line for a finished order under the "mark" policy. */
-export function markedText(text: string, status: "fulfilled" | "cancelled"): string {
-  return `${status === "fulfilled" ? COMPLETED_PREFIX : CANCELLED_PREFIX}${text}`;
-}
-
-/** Compares document text with what was written, ignoring only whitespace runs and the non-breaking space Docs may use. */
-export const sameText = (a: string | null | undefined, b: string | null | undefined): boolean =>
-  (a ?? "").replace(/[\s ]+/g, " ").trim() === (b ?? "").replace(/[\s ]+/g, " ").trim();
 
 /** A representative order for the live preview when no real order is at hand. */
 export const SAMPLE_ORDER: LineOrder = {

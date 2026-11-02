@@ -21,21 +21,16 @@ const HEALTH_TEXT: Record<Settings["health"], string> = {
   no_access: "No edit access to the document",
   doc_not_found: "Document not found",
   insufficient_scope: "Google permission missing — reconnect",
-  section_problem: "AI section needs attention",
+  document_problem: "Document start cannot take text",
   error: "Last sync failed",
 };
 
-const FINISHED_OPTIONS = [
-  { value: "mark", label: "Keep the line, label it and cross it out" },
-  { value: "leave", label: "Leave the line exactly as it is" },
-  { value: "remove", label: "Remove the line" },
-] as const;
-
 const describeSync = (r: GoogleDocsSyncResult): string => {
   if (r.status === "busy") return "Another sync is already running — try again in a moment.";
+  if (r.status === "waiting") return r.message ? `Waiting before the next attempt. Last error: ${r.message}` : "Waiting before the next attempt.";
   if (r.status === "blocked" || r.status === "error" || r.status === "not_ready") return r.message ?? "Sync could not run.";
-  const parts = [r.inserted && `${r.inserted} added`, r.updated && `${r.updated} updated`, r.removed && `${r.removed} removed`, r.held && `${r.held} held for you`, r.failed && `${r.failed} failed`].filter(Boolean);
-  return parts.length ? `Synced: ${parts.join(", ")}.` : "Everything is already up to date.";
+  const parts = [r.inserted && `${r.inserted} added`, r.confirmed && `${r.confirmed} confirmed already in the document`, r.unconfirmed && `${r.unconfirmed} need checking`, r.failed && `${r.failed} failed`].filter(Boolean);
+  return parts.length ? `Synced: ${parts.join(", ")}.` : "Nothing new to add.";
 };
 
 export function GoogleDocsPanel({ businessSlug }: { businessSlug: string }) {
@@ -90,7 +85,7 @@ export function GoogleDocsPanel({ businessSlug }: { businessSlug: string }) {
   if (data.setupPending) {
     return (
       <Notice tone="warn">
-        Setup pending: run the SQL migration <b>20261112000000_ai_agent_google_docs_sync.sql</b> in the Supabase SQL editor, then reload this page. Nothing else changes until you do.
+        Setup pending: run the SQL migration <b>20261112000000_ai_agent_google_docs_sync.sql</b> and then <b>20261113000000_ai_agent_gdocs_append_only.sql</b> in the Supabase SQL editor, then reload this page. Nothing else changes until you do.
       </Notice>
     );
   }
@@ -103,7 +98,7 @@ export function GoogleDocsPanel({ businessSlug }: { businessSlug: string }) {
       <DocumentCard key={`${d.settings.documentId}:${d.settings.accessVerifiedAt}`} d={d} businessSlug={businessSlug} busy={busy} run={run} />
       {d.settings.documentId && (
         <>
-          <FormatCard key={`fmt:${JSON.stringify(d.settings.format)}:${d.settings.onCompleted}${d.settings.onCancelled}${d.settings.onCorrected}`} d={d} businessSlug={businessSlug} busy={busy} run={run} />
+          <FormatCard key={`fmt:${JSON.stringify(d.settings.format)}:${d.settings.includeIncomplete}`} d={d} businessSlug={businessSlug} busy={busy} run={run} />
           <SyncCard d={d} businessSlug={businessSlug} busy={busy} run={run} />
           <PendingCard d={d} businessSlug={businessSlug} busy={busy} run={run} />
           {d.settings.enabled && <ImportCard businessSlug={businessSlug} busy={busy} run={run} onDone={load} />}
@@ -185,14 +180,10 @@ function AccessSummary({ a }: { a: GoogleDocsAccess }) {
       <Notice tone={a.canEdit ? "ok" : "error"}>
         “{a.title}” — {a.canEdit ? `${a.account} can edit this document.` : `${a.account} can only view this document. Share it with edit access, then test again.`}
       </Notice>
-      {a.section === "broken" && <Notice tone="error">{a.sectionMessage}</Notice>}
-      {a.section === "found" && <Notice tone="info">The AI section already exists ({a.lineCount} lines). New orders go under its first line.</Notice>}
-      {a.section === "none" && a.position && (a.position.ok ? <Notice tone="info">No AI section yet. It will be created {positionText(a.position.where)} when the first order syncs — nothing else in the document is changed.</Notice> : <Notice tone="error">{a.position.reason}</Notice>)}
+      <Notice tone="info">Google Docs is reachable. The document itself was not opened or changed, so this works for documents of any size.</Notice>
     </div>
   );
 }
-
-const positionText = (where: string) => (where === "top" ? "at the top of the document" : where === "end" ? "at the end of the document" : "under the heading you chose");
 
 function DocumentCard({ d, businessSlug, busy, run }: CardProps) {
   const s = d.settings;
@@ -200,20 +191,20 @@ function DocumentCard({ d, businessSlug, busy, run }: CardProps) {
   const [access, setAccess] = useState<GoogleDocsAccess | null>(null);
   const connected = d.connection?.status === "connected";
   return (
-    <Card title="2 · Your existing Google Doc" subtitle="Paste the link (or document id). The app never replaces the document: it adds its own clearly marked section and leaves everything else as it is.">
+    <Card title="2 · Your existing Google Doc" subtitle="Paste the link (or document id). The app never replaces or rewrites the document: it only adds one new line at the very top for each new order, pushing everything else down.">
       <div className="flex flex-wrap gap-2">
         <input className={`${inputClass} min-w-72 flex-1`} placeholder="https://docs.google.com/document/d/…/edit" value={input} onChange={(e) => setInput(e.target.value)} disabled={!connected} />
         <button
           type="button"
           className={primaryButton}
           disabled={!connected || busy !== null || !input.trim()}
-          onClick={() => run("setdoc", async () => setAccess((await googleDocsApi.setDocument(businessSlug, input)).access), () => "Link saved. Access was checked without changing the document.")}
+          onClick={() => run("setdoc", async () => setAccess((await googleDocsApi.setDocument(businessSlug, input)).access), () => "Link saved. Access was checked without opening or changing the document.")}
         >
           {s.documentId ? "Change document & test" : "Save & test access"}
         </button>
         {s.documentId && (
-          <button type="button" className={secondaryButton} disabled={!connected || busy !== null} onClick={() => run("test", async () => setAccess((await googleDocsApi.testAccess(businessSlug)).access), () => "Access checked — nothing was written.")}>
-            Test access (no writing)
+          <button type="button" className={secondaryButton} disabled={!connected || busy !== null} onClick={() => run("test", async () => setAccess((await googleDocsApi.testAccess(businessSlug)).access), () => "Access checked — the document was not opened or changed.")}>
+            Test access
           </button>
         )}
       </div>
@@ -234,10 +225,6 @@ function DocumentCard({ d, businessSlug, busy, run }: CardProps) {
 function FormatCard({ d, businessSlug, busy, run }: CardProps) {
   const s = d.settings;
   const [format, setFormat] = useState<FormatConfig>(() => normalizeFormat(s.format));
-  const [insertion, setInsertion] = useState(s.insertion);
-  const [onCompleted, setOnCompleted] = useState(s.onCompleted);
-  const [onCancelled, setOnCancelled] = useState(s.onCancelled);
-  const [onCorrected, setOnCorrected] = useState(s.onCorrected);
   const [includeIncomplete, setIncomplete] = useState(s.includeIncomplete);
   const [custom, setCustom] = useState(!(SEPARATOR_PRESETS as readonly string[]).includes(format.separator));
 
@@ -259,7 +246,7 @@ function FormatCard({ d, businessSlug, busy, run }: CardProps) {
   );
 
   return (
-    <Card title="3 · What each order line looks like" subtitle="One paragraph per order, newest first, ending with a small grey order id the app uses to find its own line.">
+    <Card title="3 · What each order line looks like" subtitle="One paragraph per order at the very top of the first tab, newest first, ending with a small grey order id the app uses to recognise its own line after an interruption.">
       <div className="grid gap-6 md:grid-cols-2">
         <div className="flex flex-col gap-2">
           {format.fields.map((f, i) => (
@@ -315,70 +302,27 @@ function FormatCard({ d, businessSlug, busy, run }: CardProps) {
               </div>
             ))}
           </div>
-          <p className="mt-2 text-xs text-zinc-500">Format changes apply to new lines. Existing lines are only rewritten when their order changes.</p>
+          <p className="mt-2 text-xs text-zinc-500">Format changes apply to lines added from now on. Lines already in the document are never changed by the app — edit them in Google Docs.</p>
         </div>
       </div>
 
-      <div className="mt-6 grid gap-4 md:grid-cols-2">
-        <label className="flex flex-col gap-1 text-sm text-zinc-700">
-          Where the AI section goes (first time only)
-          <select
-            className={inputClass}
-            value={insertion.kind}
-            onChange={(e) => setInsertion(e.target.value === "after_text" ? { kind: "after_text", text: insertion.kind === "after_text" ? insertion.text : "" } : { kind: e.target.value as "top" | "end" })}
-            disabled={s.sectionCreatedAt !== null}
-          >
-            <option value="top">At the top of the document</option>
-            <option value="end">At the end of the document</option>
-            <option value="after_text">Directly after a heading / line I name</option>
-          </select>
-          {insertion.kind === "after_text" && (
-            <input className={inputClass} placeholder="Text of the heading, e.g. Daily deliveries" value={insertion.text} onChange={(e) => setInsertion({ kind: "after_text", text: e.target.value })} disabled={s.sectionCreatedAt !== null} />
-          )}
-          {s.sectionCreatedAt && <span className="text-xs text-zinc-500">The section already exists; new orders go directly under its first line.</span>}
+      <div className="mt-6 text-sm text-zinc-700">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={includeIncomplete} onChange={(e) => setIncomplete(e.target.checked)} />
+          Also add orders that still miss details (gaps are shown, never guessed). A line is never updated afterwards, so turn this off to wait until an order is complete.
         </label>
-        <div className="flex flex-col gap-2 text-sm text-zinc-700">
-          <FinishedSelect label="Completed orders" value={onCompleted} onChange={setOnCompleted} />
-          <FinishedSelect label="Cancelled orders" value={onCancelled} onChange={setOnCancelled} />
-          <label className="flex flex-col gap-1">
-            Corrected orders
-            <select className={inputClass} value={onCorrected} onChange={(e) => setOnCorrected(e.target.value as "update" | "review")}>
-              <option value="update">Update the line automatically (unless a person edited it)</option>
-              <option value="review">Hold the change for my approval</option>
-            </select>
-          </label>
-          <label className="flex items-center gap-2">
-            <input type="checkbox" checked={includeIncomplete} onChange={(e) => setIncomplete(e.target.checked)} />
-            Also list orders that still miss details (gaps are shown, never guessed)
-          </label>
-        </div>
       </div>
       <div className="mt-4">
         <button
           type="button"
           className={primaryButton}
           disabled={busy !== null}
-          onClick={() => run("save", () => googleDocsApi.saveConfig(businessSlug, { format, insertion, onCompleted, onCancelled, onCorrected, includeIncomplete }), () => "Saved.")}
+          onClick={() => run("save", () => googleDocsApi.saveConfig(businessSlug, { format, includeIncomplete }), () => "Saved.")}
         >
-          Save format & rules
+          Save format
         </button>
       </div>
     </Card>
-  );
-}
-
-function FinishedSelect({ label, value, onChange }: { label: string; value: "leave" | "mark" | "remove"; onChange: (v: "leave" | "mark" | "remove") => void }) {
-  return (
-    <label className="flex flex-col gap-1">
-      {label}
-      <select className={inputClass} value={value} onChange={(e) => onChange(e.target.value as "leave" | "mark" | "remove")}>
-        {FINISHED_OPTIONS.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }
 
@@ -386,13 +330,13 @@ function SyncCard({ d, businessSlug, busy, run }: CardProps) {
   const s = d.settings;
   const total = Object.values(d.counts).reduce((a, b) => a + b, 0);
   return (
-    <Card title="4 · Synchronization" subtitle="Off by default. When on, new actionable WhatsApp orders are added automatically; orders from before it was turned on are not touched unless you import them below.">
+    <Card title="4 · Synchronization" subtitle="Off by default. When on, each new actionable WhatsApp order is added as one line at the top of the document. Orders from before it was turned on are not added unless you import them below. Lines are never edited, moved or removed by the app.">
       <div className="flex flex-wrap items-center gap-3 text-sm">
         <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${s.enabled ? "bg-emerald-600 text-white" : "bg-zinc-200 text-zinc-600"}`}>{s.enabled ? "ON" : "OFF"}</span>
         <span className={s.health === "ok" ? "text-zinc-600" : "font-medium text-red-600"}>{HEALTH_TEXT[s.health]}</span>
         <span className="text-xs text-zinc-500">Last sync: {formatWhen(s.lastSyncAt)}</span>
         {s.syncSince && <span className="text-xs text-zinc-500">Listing orders created since {formatWhen(s.syncSince)}</span>}
-        <span className="text-xs text-zinc-500">{total} order lines tracked</span>
+        <span className="text-xs text-zinc-500">{total} orders tracked</span>
       </div>
       {s.lastError && (
         <div className="mt-2">
@@ -429,23 +373,20 @@ function SyncCard({ d, businessSlug, busy, run }: CardProps) {
 
 function PendingCard({ d, businessSlug, busy, run }: CardProps) {
   const problems = d.problems;
-  const failed = problems.filter((p) => p.state === "failed").length;
   if (problems.length === 0) {
     return (
       <Card title="5 · Needs your attention">
-        <p className="text-sm text-zinc-500">Nothing is waiting. Conflicts with manual edits, held corrections and failed writes show up here.</p>
+        <p className="text-sm text-zinc-500">Nothing is waiting. Failed writes and lines whose result is unknown show up here.</p>
       </Card>
     );
   }
   return (
-    <Card title={`5 · Needs your attention (${problems.length})`} subtitle="The app never overwrites a line a person edited. Each item shows both versions so you decide.">
-      {failed > 0 && (
-        <div className="mb-3">
-          <button type="button" className={secondaryButton} disabled={busy !== null || !d.settings.enabled} onClick={() => run("retryall", () => googleDocsApi.retryAll(businessSlug), (r) => describeSync(r.result))}>
-            Retry all failed ({failed})
-          </button>
-        </div>
-      )}
+    <Card title={`5 · Needs your attention (${problems.length})`} subtitle="Failed writes are retried automatically. When Google may or may not have added a line, the app checks the document for its order id before ever adding it again; if it cannot, you decide.">
+      <div className="mb-3">
+        <button type="button" className={secondaryButton} disabled={busy !== null || !d.settings.enabled} onClick={() => run("retryall", () => googleDocsApi.retryAll(businessSlug), (r) => describeSync(r.result))}>
+          Retry now
+        </button>
+      </div>
       <ul className="flex flex-col gap-3">
         {problems.map((p) => (
           <ProblemRow key={p.id} p={p} enabled={d.settings.enabled} businessSlug={businessSlug} busy={busy} run={run} />
@@ -456,15 +397,12 @@ function PendingCard({ d, businessSlug, busy, run }: CardProps) {
 }
 
 const STATE_LABEL: Record<GoogleDocsProblem["state"], string> = {
-  conflict: "Edited in the document",
-  pending_review: "Correction waiting for approval",
-  missing: "Removed from the document",
-  failed: "Failed to write",
-  synced: "Synced",
+  unconfirmed: "Result unknown",
+  failed: "Not added yet",
 };
 
 function ProblemRow({ p, enabled, businessSlug, busy, run }: { p: GoogleDocsProblem; enabled: boolean; businessSlug: string; busy: string | null; run: RunFn }) {
-  const act = (resolution: "overwrite" | "keep" | "readd" | "ignore" | "retry", done: string) => run(`${p.id}:${resolution}`, () => googleDocsApi.resolve(businessSlug, p.id, resolution), () => done);
+  const act = (resolution: "present" | "again" | "skip", done: string) => run(`${p.id}:${resolution}`, () => googleDocsApi.resolve(businessSlug, p.id, resolution), () => done);
   return (
     <li className="rounded-md border border-zinc-200 p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
@@ -477,48 +415,20 @@ function ProblemRow({ p, enabled, businessSlug, busy, run }: { p: GoogleDocsProb
         </span>
         <span className="ml-auto text-xs text-zinc-400">{formatWhen(p.updatedAt)}</span>
       </div>
-      {p.reason && <p className="mt-1 text-zinc-600">{p.reason}</p>}
+      <p className="mt-1 text-zinc-600">{p.reason}</p>
       {p.error && <p className="mt-1 text-red-600">{p.error} (attempt {p.attempts})</p>}
-      {p.foundText && (
-        <p className="mt-2 rounded bg-zinc-50 p-2">
-          <span className="text-xs font-medium uppercase text-zinc-500">In the document now</span>
-          <br />
-          {p.foundText}
-        </p>
-      )}
-      {p.pendingText && (
-        <p className="mt-2 rounded bg-emerald-50 p-2">
-          <span className="text-xs font-medium uppercase text-emerald-700">What the app would write</span>
-          <br />
-          {p.pendingText}
-        </p>
-      )}
       <div className="mt-2 flex flex-wrap gap-2">
-        {(p.state === "conflict" || p.state === "pending_review") && (
-          <>
-            <button type="button" className={primaryButton} disabled={busy !== null || !enabled} onClick={() => act("overwrite", "Line updated in the document.")}>
-              {p.state === "pending_review" ? "Approve & update line" : "Use the app's version"}
-            </button>
-            <button type="button" className={secondaryButton} disabled={busy !== null} onClick={() => act("keep", "Kept the document's version.")}>
-              {p.state === "pending_review" ? "Reject (leave the line)" : "Keep the document's version"}
-            </button>
-          </>
-        )}
-        {p.state === "missing" && (
-          <>
-            <button type="button" className={primaryButton} disabled={busy !== null || !enabled} onClick={() => act("readd", "Line added again at the top.")}>
-              Add it again
-            </button>
-            <button type="button" className={secondaryButton} disabled={busy !== null} onClick={() => act("ignore", "Ignored.")}>
-              Leave it out
-            </button>
-          </>
-        )}
-        {p.state === "failed" && (
-          <button type="button" className={primaryButton} disabled={busy !== null || !enabled} onClick={() => act("retry", "Retried.")}>
-            Retry
+        {p.state === "unconfirmed" && (
+          <button type="button" className={primaryButton} disabled={busy !== null} onClick={() => act("present", "Marked as already in the document.")}>
+            It is in the document
           </button>
         )}
+        <button type="button" className={p.state === "failed" ? primaryButton : secondaryButton} disabled={busy !== null || !enabled} onClick={() => act("again", "Added to the top of the document.")}>
+          {p.state === "failed" ? "Add now" : "It is not there — add it"}
+        </button>
+        <button type="button" className={secondaryButton} disabled={busy !== null} onClick={() => act("skip", "Left out of the document.")}>
+          Leave it out
+        </button>
       </div>
     </li>
   );
@@ -528,7 +438,7 @@ function ImportCard({ businessSlug, busy, run, onDone }: { businessSlug: string;
   const [preview, setPreview] = useState<GoogleDocsImportPreview | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   return (
-    <Card title="6 · Import existing outstanding orders (one time)" subtitle="Optional. Preview first — nothing is written to the document until you confirm. Oldest are added first, so the newest ends up on top.">
+    <Card title="6 · Import existing outstanding orders (one time)" subtitle="Optional and never automatic. Preview first — nothing is written to the document until you confirm. Oldest are added first, so the newest ends up on top.">
       <button
         type="button"
         className={secondaryButton}

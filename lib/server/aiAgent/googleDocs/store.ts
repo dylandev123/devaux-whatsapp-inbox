@@ -5,8 +5,6 @@
 import { randomUUID } from "crypto";
 import { agentDb } from "@/lib/server/aiAgent/db";
 import { defaultFormat, normalizeFormat, type FormatConfig } from "@/lib/aiAgent/gdocFormat";
-import { normalizeInsertion, type Insertion } from "@/lib/aiAgent/gdocDocument";
-import type { LinePatch, LineRecord, OnCorrected, OnFinished } from "@/lib/aiAgent/gdocPlan";
 
 export function isSchemaPending(err: unknown): boolean {
   const e = err as { code?: string; message?: string } | null;
@@ -14,7 +12,7 @@ export function isSchemaPending(err: unknown): boolean {
   return ["42P01", "42883", "PGRST205", "PGRST202"].includes(e?.code ?? "") || m.includes("could not find the table") || m.includes("could not find the function") || m.includes("does not exist") || m.includes("schema cache");
 }
 
-export type Health = "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "insufficient_scope" | "section_problem" | "error";
+export type Health = "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "insufficient_scope" | "document_problem" | "error";
 
 export interface GdocSettings {
   business_slug: string;
@@ -24,13 +22,8 @@ export interface GdocSettings {
   can_edit: boolean;
   access_verified_at: string | null;
   format: FormatConfig;
-  insertion: Insertion;
-  on_completed: OnFinished;
-  on_cancelled: OnFinished;
-  on_corrected: OnCorrected;
   include_incomplete: boolean;
   sync_since: string | null;
-  section_created_at: string | null;
   last_sync_at: string | null;
   last_attempt_at: string | null;
   health: Health;
@@ -38,10 +31,10 @@ export interface GdocSettings {
 }
 
 const SETTINGS_COLUMNS =
-  "business_slug, enabled, document_id, document_title, can_edit, access_verified_at, format, insertion, on_completed, on_cancelled, on_corrected, include_incomplete, sync_since, section_created_at, last_sync_at, last_attempt_at, health, last_error";
+  "business_slug, enabled, document_id, document_title, can_edit, access_verified_at, format, include_incomplete, sync_since, last_sync_at, last_attempt_at, health, last_error";
 
 function hydrate(row: Record<string, unknown>): GdocSettings {
-  return { ...(row as unknown as GdocSettings), format: normalizeFormat(row.format), insertion: normalizeInsertion(row.insertion) };
+  return { ...(row as unknown as GdocSettings), format: normalizeFormat(row.format) };
 }
 
 export const defaultSettings = (businessSlug: string): GdocSettings => ({
@@ -52,13 +45,8 @@ export const defaultSettings = (businessSlug: string): GdocSettings => ({
   can_edit: false,
   access_verified_at: null,
   format: defaultFormat(),
-  insertion: { kind: "top" },
-  on_completed: "mark",
-  on_cancelled: "mark",
-  on_corrected: "update",
   include_incomplete: true,
   sync_since: null,
-  section_created_at: null,
   last_sync_at: null,
   last_attempt_at: null,
   health: "ok",
@@ -125,21 +113,30 @@ export async function deleteConnection(businessSlug: string): Promise<void> {
 }
 
 // ── Lines ────────────────────────────────────────────────────────────────────
-export interface LineRow extends LineRecord {
+// One row per (business, document, order). The unique index on that triple is what makes "one order, one line" a database
+// guarantee: claim_gdoc_line() hands the single insert attempt to exactly one caller.
+export type LineState = "synced" | "inserting" | "unconfirmed" | "failed" | "skipped" | "pending_review" | "conflict" | "missing";
+
+export interface LineRow {
   id: string;
   business_slug: string;
   document_id: string;
-  pending_text: string | null;
-  pending_action: string | null;
-  pending_reason: string | null;
-  found_text: string | null;
+  order_id: string;
+  tag: string;
+  state: LineState;
+  last_text: string | null;
+  attempts: number;
+  attempt_id: string | null;
+  attempt_started_at: string | null;
+  verify_attempts: number;
+  last_verify_at: string | null;
   last_error: string | null;
   last_synced_at: string | null;
   updated_at: string;
 }
 
 const LINE_COLUMNS =
-  "id, business_slug, document_id, order_id, tag, state, last_text, synced_version, synced_status, pending_text, pending_action, pending_reason, found_text, attempts, last_error, last_synced_at, updated_at";
+  "id, business_slug, document_id, order_id, tag, state, last_text, attempts, attempt_id, attempt_started_at, verify_attempts, last_verify_at, last_error, last_synced_at, updated_at";
 
 export async function loadLines(businessSlug: string, documentId: string): Promise<LineRow[]> {
   const { data, error } = await agentDb().from("ai_agent_gdoc_lines").select(LINE_COLUMNS).eq("business_slug", businessSlug).eq("document_id", documentId).limit(5000);
@@ -150,7 +147,21 @@ export async function loadLines(businessSlug: string, documentId: string): Promi
   return (data ?? []) as LineRow[];
 }
 
-export async function loadLinesByState(businessSlug: string, documentId: string, states: string[]): Promise<LineRow[]> {
+/** The rows for just these orders (what a run needs to decide who is still to be written). */
+export async function loadLinesForOrders(businessSlug: string, documentId: string, orderIds: string[]): Promise<LineRow[]> {
+  const out: LineRow[] = [];
+  for (let i = 0; i < orderIds.length; i += 100) {
+    const { data, error } = await agentDb().from("ai_agent_gdoc_lines").select(LINE_COLUMNS).eq("business_slug", businessSlug).eq("document_id", documentId).in("order_id", orderIds.slice(i, i + 100));
+    if (error) {
+      if (isSchemaPending(error)) return [];
+      throw new Error(error.message);
+    }
+    out.push(...((data ?? []) as LineRow[]));
+  }
+  return out;
+}
+
+export async function loadLinesByState(businessSlug: string, documentId: string, states: LineState[]): Promise<LineRow[]> {
   const { data, error } = await agentDb().from("ai_agent_gdoc_lines").select(LINE_COLUMNS).eq("business_slug", businessSlug).eq("document_id", documentId).in("state", states).order("updated_at", { ascending: false }).limit(200);
   if (error) {
     if (isSchemaPending(error)) return [];
@@ -165,19 +176,43 @@ export async function loadLine(businessSlug: string, documentId: string, lineId:
   return (data as LineRow | null) ?? null;
 }
 
-/** Create or update the order's line row. A successful write clears the attempt counter and the error. */
-export async function upsertLine(businessSlug: string, documentId: string, order: { id: string; ref_code: string }, patch: LinePatch, extra: { attempts?: number; last_error?: string | null; wrote?: boolean } = {}): Promise<void> {
-  const row: Record<string, unknown> = {
-    business_slug: businessSlug,
-    document_id: documentId,
-    order_id: order.id,
-    tag: order.ref_code,
-    ...patch,
-    attempts: extra.attempts ?? 0,
-    last_error: extra.last_error ?? null,
-  };
-  if (extra.wrote) row.last_synced_at = new Date().toISOString();
-  const { error } = await agentDb().from("ai_agent_gdoc_lines").upsert(row, { onConflict: "business_slug,document_id,order_id" });
+/**
+ * Start the single insert attempt for an order. True = this caller owns it and may write; false = another run owns it or the
+ * order is already in the document (or in an unknown state that only verification / a person may settle).
+ */
+export async function claimLine(businessSlug: string, documentId: string, order: { id: string; ref_code: string }, attemptId: string): Promise<boolean> {
+  const { data, error } = await agentDb().rpc("claim_gdoc_line", { p_business_slug: businessSlug, p_document_id: documentId, p_order_id: order.id, p_tag: order.ref_code, p_attempt_id: attemptId });
+  if (error) throw new Error(error.message);
+  return data === true;
+}
+
+interface LineKey {
+  businessSlug: string;
+  documentId: string;
+  orderId: string;
+}
+
+/** Record the outcome of an attempt. Guarded by the attempt id, so a late or zombie run can never overwrite a newer attempt. */
+export async function finishAttempt(key: LineKey, attemptId: string, patch: { state: "synced" | "failed" | "unconfirmed"; last_text?: string | null; last_error?: string | null }): Promise<void> {
+  const row: Record<string, unknown> = { ...patch, last_error: patch.last_error ?? null };
+  if (patch.state === "synced") row.last_synced_at = new Date().toISOString();
+  const { error } = await agentDb().from("ai_agent_gdoc_lines").update(row).eq("business_slug", key.businessSlug).eq("document_id", key.documentId).eq("order_id", key.orderId).eq("attempt_id", attemptId).in("state", ["inserting", "unconfirmed"]);
+  if (error) throw new Error(error.message);
+}
+
+/** Outcome of a verification read for a row whose insert outcome was unknown. */
+export async function settleLine(key: LineKey, patch: { state: "synced" | "failed" | "unconfirmed"; last_error?: string | null; verify_attempts: number }): Promise<void> {
+  const row: Record<string, unknown> = { ...patch, last_error: patch.last_error ?? null, last_verify_at: new Date().toISOString() };
+  if (patch.state === "synced") row.last_synced_at = new Date().toISOString();
+  const { error } = await agentDb().from("ai_agent_gdoc_lines").update(row).eq("business_slug", key.businessSlug).eq("document_id", key.documentId).eq("order_id", key.orderId).in("state", ["inserting", "unconfirmed"]);
+  if (error) throw new Error(error.message);
+}
+
+/** A person's decision about a line (dashboard): any state to synced / failed (insert again) / skipped. */
+export async function setLineState(key: LineKey, state: "synced" | "failed" | "skipped"): Promise<void> {
+  const row: Record<string, unknown> = { state, last_error: null, attempt_id: null };
+  if (state === "synced") row.last_synced_at = new Date().toISOString();
+  const { error } = await agentDb().from("ai_agent_gdoc_lines").update(row).eq("business_slug", key.businessSlug).eq("document_id", key.documentId).eq("order_id", key.orderId);
   if (error) throw new Error(error.message);
 }
 

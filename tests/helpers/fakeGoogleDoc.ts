@@ -1,10 +1,11 @@
 // An in-memory Google Doc that applies documents.batchUpdate requests the way the real API does for the request types the
 // sync uses (insertText, deleteContentRange, updateTextStyle, updateParagraphStyle, deleteParagraphBullets), including the
 // parts that make index arithmetic matter: UTF-16 indices that start at 1, text styles inherited from the preceding
-// character, a paragraph's style living on its closing line break, the undeletable final line break, and the
-// writeControl.requiredRevisionId guard. Tests drive the app's real sync code against it; the real Google is never touched.
+// character, a paragraph's style living on its closing line break, the undeletable final line break, and document tabs
+// (an insert without a tabId lands in the FIRST tab; a document that starts with a table refuses text at index 1).
+// Tests drive the app's real sync code against it; the real Google is never touched.
 
-import type { DocRequest, GoogleDocument } from "../../lib/aiAgent/gdocDocument.ts";
+import type { DocRequest, TextRunDocument } from "../../lib/aiAgent/gdocInsert.ts";
 
 type Style = Record<string, unknown>;
 interface Ch {
@@ -41,8 +42,19 @@ export class FakeGoogleDoc {
   trashed = false;
   /** Every batchUpdate that reached "Google", for assertions. */
   batches: DocRequest[][] = [];
+  /** The next batch is refused before anything is applied (an explicit Google error). */
   failNextBatch: FakeApiError | null = null;
-  reads = 0;
+  /** The next batch IS applied, then the answer is lost / errors (timeout, 5xx): the outcome is unknown to the caller. */
+  applyThenFail: FakeApiError | null = null;
+  /** Body downloads (text reads of the first tab). The normal sync path must keep this at 0. */
+  textReads = 0;
+  /** Reads of more than this many characters time out, like a document too large to download in time. null = no limit. */
+  maxReadableChars: number | null = null;
+  /** The first tab's id; other tabs are never touched by an insert that carries no tabId. */
+  firstTabId = "t.0";
+  otherTabs: { id: string; paragraphs: string[] }[] = [];
+  /** The first body element is a table: Google refuses text at index 1. */
+  startsWithTable = false;
 
   constructor(title: string, paragraphs: SeedParagraph[]) {
     this.title = title;
@@ -89,36 +101,31 @@ export class FakeGoogleDoc {
     return this.paragraphs().map((p) => p.text);
   }
 
-  toDocument(): GoogleDocument {
-    this.reads += 1;
-    const content: Record<string, unknown>[] = [{ endIndex: 1, sectionBreak: {} }];
-    let index = 1;
+  /** What documents.get returns for the first tab with the text-only field mask the app uses. Counts as a body download. */
+  readText(): TextRunDocument {
+    this.textReads += 1;
+    if (this.maxReadableChars !== null && this.chars.length > this.maxReadableChars) throw new FakeApiError("timeout", 0, "reading the document took too long");
+    const content: NonNullable<TextRunDocument["body"]>["content"] = [];
     let cur = "";
-    let start = index;
     for (const c of this.chars) {
       cur += c.ch;
-      index += c.ch.length;
       if (c.ch === "\n") {
-        content.push({ startIndex: start, endIndex: index, paragraph: { elements: [{ startIndex: start, endIndex: index, textRun: { content: cur } }] } });
+        content!.push({ paragraph: { elements: [{ textRun: { content: cur } }] } });
         cur = "";
-        start = index;
       }
     }
-    return { documentId: "fake", title: this.title, revisionId: `rev-${this.revision}`, body: { content: content as never } };
+    return { body: { content } };
   }
 
   // ── Writing (what the sync sends) ──────────────────────────────────────────
-  applyBatch(requests: DocRequest[], requiredRevisionId?: string): void {
+  applyBatch(requests: DocRequest[]): void {
     if (this.failNextBatch) {
       const err = this.failNextBatch;
       this.failNextBatch = null;
       throw err;
     }
-    if (requiredRevisionId && requiredRevisionId !== `rev-${this.revision}`) {
-      throw new FakeApiError("precondition", 400, "The required revision ID does not match the document's current revision");
-    }
     // A batch is atomic: apply to a copy and swap only if every request is valid.
-    const before = JSON.parse(JSON.stringify(this.chars)) as Ch[];
+    const before = this.chars.map((c) => ({ ...c, text: { ...c.text }, ...(c.para ? { para: { ...c.para } } : {}) }));
     try {
       for (const r of requests) this.applyOne(r);
     } catch (err) {
@@ -127,6 +134,11 @@ export class FakeGoogleDoc {
     }
     this.batches.push(requests);
     this.revision += 1;
+    if (this.applyThenFail) {
+      const err = this.applyThenFail;
+      this.applyThenFail = null;
+      throw err;
+    }
   }
 
   private applyOne(r: DocRequest) {
@@ -136,6 +148,9 @@ export class FakeGoogleDoc {
       case "insertText": {
         const index: number = body.location.index;
         const text: string = body.text;
+        const tabId: string | undefined = body.location.tabId;
+        if (tabId !== undefined && tabId !== this.firstTabId) throw new FakeApiError("bad_request", 400, `This request targets tab ${tabId}, which is not the first tab`);
+        if (this.startsWithTable && index <= 1) throw new FakeApiError("bad_request", 400, `Invalid requests[0].insertText: Index ${index} is not inside a paragraph (the document starts with a table).`);
         const total = this.slots().length;
         if (!Number.isInteger(index) || index < 1 || index > total) throw new FakeApiError("bad_request", 400, `Index ${index} must be within the bounds of an existing paragraph (1..${total})`);
         const at = this.charIndexAt(index);

@@ -1004,8 +1004,9 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   }
   if (result.applied) {
     result.reasons.push("orders_tracked");
-    // Google Docs sync (off unless a business enabled it): a no-op query otherwise; failures never reach the order flow.
-    await triggerOrderSync(businessSlug);
+    // Google Docs sync (off unless a business enabled it): started in the background, never awaited, so Google can neither
+    // delay nor fail the order flow. Anything it cannot finish is retried by the cron tick.
+    void triggerOrderSync(businessSlug);
   }
   return result;
 }
@@ -1686,7 +1687,7 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
   if (res.result !== "applied") return fail(404, "Order not found", "not_found");
   await audit(businessSlug, actor, input.adminId, `order.${action}`, { type: "order", id: orderId }, { ref: order.ref_code, changes, ...(actor === "staff" ? { via: "whatsapp" } : {}) });
   const { data: fresh } = await db.from("ai_agent_orders").select(ORDER_COLUMNS).eq("id", orderId).eq("business_slug", businessSlug).maybeSingle();
-  await triggerOrderSync(businessSlug);
+  void triggerOrderSync(businessSlug);
   return { ok: true, order: (fresh as TrackedOrder | null) ?? order };
 }
 

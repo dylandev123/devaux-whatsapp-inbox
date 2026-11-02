@@ -1,51 +1,66 @@
-// Server-only: the Google Docs order sync engine. Supabase stays the authoritative order record; this reads orders, plans
-// with the pure planner (lib/aiAgent/gdocPlan.ts) against the CURRENT document, writes only the planned lines in one atomic
-// batchUpdate guarded by the document's revision id, and records the result per order. It never sends a WhatsApp message
-// (it does not import the outbox) and never runs while sync is disabled.
+// Server-only: the Google Docs order sync engine. APPEND-ONLY AT THE TOP: a new actionable order becomes one new paragraph at
+// the very start of the document's first tab (lib/aiAgent/gdocInsert.ts). Nothing already in the document is read, rewritten,
+// deleted or reordered; staff edit lines by hand. Supabase stays the authoritative order record. It never sends a WhatsApp
+// message (it does not import the outbox) and never runs while sync is disabled.
 //
-// Concurrency: a database lease (claim_gdoc_sync) allows one run per business at a time; the revision guard rejects a write
-// if a person edited the document between our read and our write, and the run simply re-reads and re-plans. A crash
-// between the document write and the database write is repaired by the planner, which finds the line by its tag.
-// No timers are used here (see tests/aiAgentSchedulerSafety): retries happen on the next cron tick or dashboard action.
+// The document can be hundreds of pages, so a normal run makes NO document read: it reads orders and line rows from Supabase
+// and sends one small insertText per new order.
+//
+// Duplicate prevention and the crash window
+//   1. Before writing, the order's line row is claimed in the database (claim_gdoc_line, one atomic statement against a unique
+//      index): only one caller can ever hold the attempt for an order, whatever the number of runs, triggers or retries.
+//   2. The write is one atomic batchUpdate. Afterwards the row is marked 'synced'.
+//   3. The window between "Google applied the write" and "the row says synced" (a crash, a lost response, a timeout) cannot be
+//      closed from this side: Google offers no idempotency key. So this is AT-LEAST-ONCE with detection, not exactly-once:
+//        * an explicit Google refusal (4xx) means the document is unchanged → row 'failed' → safely retried;
+//        * anything else (timeout, network, 5xx, a crash) leaves the row 'inserting'/'unconfirmed' → the order is NEVER
+//          written again automatically. After a settle period a text-only read looks for the order's small tag ⟨E-xxxxx⟩
+//          in the first tab: found → 'synced'; absent → 'failed' (retry); read impossible → stays 'unconfirmed' and shows in
+//          the dashboard, where a person chooses "it is there" / "add again" / "skip".
+//      Residual risk, stated plainly: if Google were to apply an abandoned request later than the settle period, or a person
+//      deletes the line before it is verified, a duplicate/omission is possible and is shown to staff, never hidden.
+//
+// No timers are used here (see tests/aiAgentBatchWiring): retries happen on the next cron tick or dashboard action.
 
+import { randomUUID } from "crypto";
 import { agentDb } from "@/lib/server/aiAgent/db";
 import { decryptSecret } from "@/lib/server/aiAgent/googleDocs/crypto";
-import { docsClient, GoogleApiError, oauthConfig, refreshAccessToken, type DocsClient } from "@/lib/server/aiAgent/googleDocs/google";
+import { docsClient, GoogleApiError, oauthConfig, refreshAccessToken, TIMEOUT_MS, VERIFY_TIMEOUT_MS, WRITE_TIMEOUT_MS, type DocsClient } from "@/lib/server/aiAgent/googleDocs/google";
 import {
+  claimLine,
   claimSync,
+  finishAttempt,
   isSchemaPending,
   loadConnection,
   loadGdocSettings,
-  loadLines,
+  loadLinesByState,
+  loadLinesForOrders,
   markConnection,
   releaseSync,
   saveGdocSettings,
-  upsertLine,
+  settleLine,
   type GdocSettings,
   type Health,
   type LineRow,
 } from "@/lib/server/aiAgent/googleDocs/store";
-import {
-  findSection,
-  planCreateSection,
-  planInsertLine,
-  planRemoveLine,
-  planRewriteLine,
-  resolvePosition,
-  type DocRequest,
-  type GoogleDocument,
-} from "@/lib/aiAgent/gdocDocument";
-import { planSync, type LinePatch, type LineRecord, type Mode, type SyncAction, type SyncOrder, type SyncPolicy } from "@/lib/aiAgent/gdocPlan";
+import { formatOrderLine } from "@/lib/aiAgent/gdocFormat";
+import { insertLineRequests, planInsertions, type InsertPolicy, type Mode, type SyncOrder } from "@/lib/aiAgent/gdocInsert";
 import { OPEN_ORDER_STATUSES } from "@/lib/aiAgent/orders";
 
-export const SYNC_ORDER_COLUMNS =
-  "id, ref_code, customer_name, contact_number, items, fulfilment_method, delivery_address, requested_for, notes, status, version, attention, created_at";
+export const SYNC_ORDER_COLUMNS = "id, ref_code, customer_name, contact_number, items, fulfilment_method, delivery_address, requested_for, notes, status, attention, created_at";
 
-const BATCH_SIZE = 40;
-const MAX_ITERATIONS = 6;
-const MAX_PRECONDITION_RETRIES = 3;
-const ORDER_LIMIT = 300;
-const WINDOW_MARGIN_MS = 10 * 60_000;
+const ORDER_LIMIT = 500;
+/** Orders written per run (one small request each); the rest waits for the next tick. */
+const MAX_INSERTS_PER_RUN = 15;
+/** An attempt of unknown outcome is only judged after this long, so a slow request still in flight cannot be mistaken for lost. */
+export const SETTLE_MS = 120_000;
+/** Between verification reads of the same unconfirmed line (each read downloads the first tab's text). */
+const VERIFY_COOLDOWN_MS = 10 * 60_000;
+/** After this many unsuccessful verification reads the line is left to a person. */
+export const MAX_VERIFY_ATTEMPTS = 6;
+/** After a failed run the automatic triggers wait this long, so one outage is not hammered by every incoming order. */
+const BACKOFF_MS = 5 * 60_000;
+const DEFAULT_BUDGET_MS = 50_000;
 
 // ── Client ───────────────────────────────────────────────────────────────────
 export interface ClientHandle {
@@ -109,12 +124,18 @@ export function describeError(err: unknown): { health: Health; message: string }
         return { health: "doc_not_found", message: "Google cannot find this document. It may have been deleted, or the connected account cannot see it." };
       case "rate_limited":
         return { health: "error", message: "Google is rate-limiting requests. It will retry on the next run." };
-      case "precondition":
-        return { health: "error", message: "The document kept changing while syncing. It will retry on the next run." };
       case "timeout":
-        return { health: "error", message: `Google took too long to answer (${err.op ?? "request"} timed out). Nothing was changed. Try again in a moment; if it keeps happening, check status.cloud.google.com.` };
+        return { health: "error", message: `Google took too long to answer (${err.op ?? "request"} timed out). ${err.op === "Docs write" ? "The line may or may not have been added: it is checked in the document before it is ever added again." : "Nothing was changed."} Try again in a moment; if it keeps happening, check status.cloud.google.com.` };
       case "network":
-        return { health: "error", message: `Could not reach Google (${err.op ?? "request"}). Nothing was changed. Try again in a moment.` };
+        return { health: "error", message: `Could not reach Google (${err.op ?? "request"}). ${err.op === "Docs write" ? "The line may or may not have been added: it is checked in the document before it is ever added again." : "Nothing was changed."} Try again in a moment.` };
+      case "bad_request":
+        if (err.op === "Docs write") {
+          return {
+            health: "document_problem",
+            message: `Google would not add text at the very start of the first tab (${err.message.slice(0, 120)}). The document may begin with a table or another element that cannot take text above it. Put an empty paragraph at the top of the document, then press “Sync now”.`,
+          };
+        }
+        return { health: "error", message: `Google error: ${err.message.slice(0, 200)}` };
       default:
         return { health: "error", message: `Google error: ${err.message.slice(0, 200)}` };
     }
@@ -123,16 +144,9 @@ export function describeError(err: unknown): { health: Health; message: string }
 }
 
 // ── Orders ───────────────────────────────────────────────────────────────────
-export const policyOf = (s: GdocSettings): SyncPolicy => ({
-  format: s.format,
-  onCompleted: s.on_completed,
-  onCancelled: s.on_cancelled,
-  onCorrected: s.on_corrected,
-  includeIncomplete: s.include_incomplete,
-  syncSince: s.sync_since,
-});
+export const policyOf = (s: GdocSettings): InsertPolicy => ({ format: s.format, includeIncomplete: s.include_incomplete, syncSince: s.sync_since });
 
-async function ordersByIds(businessSlug: string, ids: string[]): Promise<SyncOrder[]> {
+export async function ordersByIds(businessSlug: string, ids: string[]): Promise<SyncOrder[]> {
   const out: SyncOrder[] = [];
   for (let i = 0; i < ids.length; i += 100) {
     const { data, error } = await agentDb().from("ai_agent_orders").select(SYNC_ORDER_COLUMNS).eq("business_slug", businessSlug).in("id", ids.slice(i, i + 100));
@@ -142,7 +156,8 @@ async function ordersByIds(businessSlug: string, ids: string[]): Promise<SyncOrd
   return out;
 }
 
-async function openOrdersSince(businessSlug: string, since: string | null): Promise<SyncOrder[]> {
+/** Open orders created at or after `since` (or all open orders when null), oldest first. */
+export async function openOrders(businessSlug: string, since: string | null): Promise<SyncOrder[]> {
   let query = agentDb().from("ai_agent_orders").select(SYNC_ORDER_COLUMNS).eq("business_slug", businessSlug).in("status", [...OPEN_ORDER_STATUSES]);
   if (since) query = query.gte("created_at", since);
   const { data, error } = await query.order("created_at").limit(ORDER_LIMIT);
@@ -150,146 +165,81 @@ async function openOrdersSince(businessSlug: string, since: string | null): Prom
   return (data ?? []) as SyncOrder[];
 }
 
-/** Orders the automatic sync must consider: new open ones, ones changed since the last good run, and ones with unresolved lines. */
-async function autoCandidates(businessSlug: string, settings: GdocSettings, records: Map<string, LineRow>): Promise<SyncOrder[]> {
-  const since = settings.sync_since;
-  if (!since) return [];
-  const windowStart = new Date(Math.max(Date.parse(since) - 1, Date.parse(settings.last_sync_at ?? since) - WINDOW_MARGIN_MS)).toISOString();
-  const [fresh, changed] = await Promise.all([
-    openOrdersSince(businessSlug, since),
-    agentDb().from("ai_agent_orders").select(SYNC_ORDER_COLUMNS).eq("business_slug", businessSlug).gte("updated_at", windowStart).order("created_at").limit(ORDER_LIMIT),
-  ]);
-  if (changed.error) throw new Error(changed.error.message);
-  const byId = new Map<string, SyncOrder>();
-  for (const o of fresh) byId.set(o.id, o);
-  for (const o of (changed.data ?? []) as SyncOrder[]) byId.set(o.id, o);
-  const unresolved = [...records.values()].filter((r) => r.state !== "synced" && !byId.has(r.order_id)).map((r) => r.order_id);
-  for (const o of await ordersByIds(businessSlug, unresolved)) byId.set(o.id, o);
-  return [...byId.values()];
-}
-
-// ── Requests ─────────────────────────────────────────────────────────────────
-function editRequests(edits: SyncAction[]): DocRequest[] {
-  // Bottom-up, so changing a lower paragraph never moves the indices of one above it.
-  const sorted = [...edits].sort((a, b) => (b.write as { paragraph: { start: number } }).paragraph.start - (a.write as { paragraph: { start: number } }).paragraph.start);
-  return sorted.flatMap((a) => {
-    const w = a.write!;
-    if (w.type === "rewrite") return planRewriteLine(w.paragraph, w.text, a.order.ref_code, { done: w.done });
-    if (w.type === "remove") return planRemoveLine(w.paragraph);
-    return [];
-  });
-}
-
-const toRecord = (order: SyncOrder, patch: LinePatch, prev: LineRecord | undefined): LineRecord => ({
-  order_id: order.id,
-  tag: order.ref_code,
-  state: patch.state,
-  last_text: patch.last_text !== undefined ? patch.last_text : (prev?.last_text ?? null),
-  synced_version: patch.synced_version ?? prev?.synced_version ?? null,
-  synced_status: patch.synced_status ?? prev?.synced_status ?? null,
-  attempts: 0,
-});
-
+// ── Run ──────────────────────────────────────────────────────────────────────
 export interface SyncSummary {
-  status: "ok" | "disabled" | "busy" | "blocked" | "error" | "not_ready";
+  status: "ok" | "disabled" | "busy" | "waiting" | "blocked" | "error" | "not_ready";
+  /** Lines added to the document in this run. */
   inserted: number;
-  updated: number;
-  removed: number;
-  held: number;
+  /** Lines whose earlier, uncertain write was found in the document (marked done, not written again). */
+  confirmed: number;
+  /** Lines whose result is still unknown and need a person. */
+  unconfirmed: number;
   failed: number;
   health?: Health;
   message?: string;
 }
 
-const emptySummary = (status: SyncSummary["status"], message?: string): SyncSummary => ({ status, inserted: 0, updated: 0, removed: 0, held: 0, failed: 0, message });
+const emptySummary = (status: SyncSummary["status"], message?: string): SyncSummary => ({ status, inserted: 0, confirmed: 0, unconfirmed: 0, failed: 0, message });
 
 export interface RunOptions {
   /** "auto" lists orders created since sync was enabled; "import" lists exactly `orderIds` (the explicit one-time import). */
   mode?: Mode;
   orderIds?: string[];
-  force?: boolean;
   /** A dashboard action may run while sync is switched off (never an import or an automatic run). */
   allowDisabled?: boolean;
-  /** A person approved held corrections: apply them instead of holding them again. */
-  approve?: boolean;
+  /** Triggered by an order or the cron tick: after a failed run, wait out the backoff instead of retrying at once. */
+  backoff?: boolean;
+  /** A person pressed a button: verify unconfirmed lines now instead of waiting for the cooldown. */
+  manual?: boolean;
+  /** How long this run may take in total (the hosting function has a hard limit). */
+  budgetMs?: number;
 }
 
 /** One sync pass for one business. Idempotent: running it twice in a row changes nothing the second time. */
 export async function runSync(businessSlug: string, options: RunOptions = {}): Promise<SyncSummary> {
   const mode: Mode = options.mode ?? "auto";
+  const deadline = Date.now() + (options.budgetMs ?? DEFAULT_BUDGET_MS);
+  const remaining = () => deadline - Date.now();
   const settings = await loadGdocSettings(businessSlug);
   if (!settings) return emptySummary("not_ready", "Google Docs sync is not set up in the database yet.");
   if (!settings.enabled && !options.allowDisabled) return emptySummary("disabled");
   if (!settings.document_id || !settings.can_edit) return emptySummary("not_ready", "Choose a document the connected account can edit.");
   if (mode === "auto" && !settings.sync_since) return emptySummary("not_ready", "Sync has not been enabled yet.");
+  if (options.backoff && settings.health !== "ok" && settings.last_attempt_at && Date.now() - Date.parse(settings.last_attempt_at) < BACKOFF_MS) return emptySummary("waiting", settings.last_error ?? undefined);
 
-  const token = await claimSync(businessSlug);
+  const token = await claimSync(businessSlug, Math.max(90, Math.ceil((options.budgetMs ?? DEFAULT_BUDGET_MS) / 1000) + 30));
   if (!token) return emptySummary("busy");
   const summary = emptySummary("ok");
   const documentId = settings.document_id;
   try {
     const { client } = await openClient(businessSlug);
-    const rows = await loadLines(businessSlug, documentId);
-    const records = new Map<string, LineRow>(rows.map((r) => [r.order_id, r]));
-    const policy: SyncPolicy = options.approve ? { ...policyOf(settings), onCorrected: "update" } : policyOf(settings);
-    const orders =
-      mode === "import" ? await ordersByIds(businessSlug, [...new Set(options.orderIds ?? [])].slice(0, ORDER_LIMIT)) : await autoCandidates(businessSlug, settings, records);
 
-    let preconditionRetries = 0;
-    for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
-      let doc: GoogleDocument = await client.getDocument(documentId);
-      let section = findSection(doc, businessSlug);
-      if (section.kind === "broken") throw new SyncBlocked("section_problem", section.reason);
+    // 1. Settle earlier attempts whose outcome is unknown (crash / lost response). Never writes.
+    await reconcile(businessSlug, documentId, client, summary, remaining, options.manual === true);
 
-      let plan = planSync({ orders, records, doc, policy, mode, force: options.force });
-      const inserts = plan.actions.filter((a) => a.write?.type === "insert");
-
-      if (inserts.length > 0 && section.kind === "none") {
-        const position = resolvePosition(doc, settings.insertion);
-        if (!position.ok) throw new SyncBlocked("section_problem", position.reason);
-        await client.batchUpdate(documentId, planCreateSection(businessSlug, position).requests, doc.revisionId);
-        await saveGdocSettings(businessSlug, { section_created_at: new Date().toISOString() });
-        doc = await client.getDocument(documentId);
-        section = findSection(doc, businessSlug);
-        if (section.kind !== "found") throw new SyncBlocked("section_problem", "The AI section could not be created in the document.");
-        plan = planSync({ orders, records, doc, policy, mode, force: options.force });
-      }
-
-      // Record-only outcomes (conflicts, held corrections, adopted lines, policy "leave"): no document write.
-      const recordOnly = plan.actions.filter((a) => !a.write);
-      for (const a of recordOnly) {
-        await upsertLine(businessSlug, documentId, a.order, a.patch);
-        records.set(a.order.id, { ...(records.get(a.order.id) as LineRow), ...toRecord(a.order, a.patch, records.get(a.order.id)) } as LineRow);
-        if (a.patch.state === "conflict" || a.patch.state === "pending_review" || a.patch.state === "missing") summary.held += 1;
-      }
-
-      const edits = plan.actions.filter((a) => a.write && a.write.type !== "insert");
-      const writes = (edits.length > 0 ? edits : plan.actions.filter((a) => a.write?.type === "insert")).slice(0, BATCH_SIZE);
-      if (writes.length === 0) break;
-
-      const requests = edits.length > 0 ? editRequests(writes) : writes.flatMap((a) => planInsertLine(section as Extract<typeof section, { kind: "found" }>, (a.write as { text: string }).text, a.order.ref_code));
+    // 2. Insert the orders that have no line yet (or whose last attempt definitely failed), oldest first so the newest ends on top.
+    const orders = mode === "import" ? await ordersByIds(businessSlug, [...new Set(options.orderIds ?? [])].slice(0, ORDER_LIMIT)) : settings.sync_since ? await openOrders(businessSlug, settings.sync_since) : [];
+    const states = new Map((await loadLinesForOrders(businessSlug, documentId, orders.map((o) => o.id))).map((r) => [r.order_id, r.state as string]));
+    const plan = planInsertions(orders, states, policyOf(settings), mode);
+    for (const order of plan.insert.slice(0, MAX_INSERTS_PER_RUN)) {
+      if (remaining() < WRITE_TIMEOUT_MS / 2) break; // out of time: the rest goes in on the next tick
+      const attemptId = randomUUID();
+      if (!(await claimLine(businessSlug, documentId, order, attemptId))) continue; // someone else owns this order's attempt
+      const key = { businessSlug, documentId, orderId: order.id };
+      const text = formatOrderLine(order, settings.format).text;
       try {
-        await client.batchUpdate(documentId, requests, doc.revisionId);
+        await writeLine(client, documentId, text, order.ref_code, Math.min(WRITE_TIMEOUT_MS, Math.max(5_000, remaining() - 2_000)));
       } catch (err) {
-        if (err instanceof GoogleApiError && err.kind === "precondition" && preconditionRetries < MAX_PRECONDITION_RETRIES) {
-          preconditionRetries += 1; // a person edited the document since we read it: re-read and re-plan
-          continue;
-        }
-        for (const a of writes) {
-          const prev = records.get(a.order.id);
-          await upsertLine(businessSlug, documentId, a.order, { state: "failed", last_text: prev?.last_text ?? null }, { attempts: (prev?.attempts ?? 0) + 1, last_error: describeError(err).message });
-          summary.failed += 1;
-        }
+        const message = describeError(err).message;
+        // An explicit Google refusal proves the document is unchanged → safe to retry. Anything else may have been applied.
+        const unknown = !(err instanceof GoogleApiError) || err.outcomeUnknown;
+        await finishAttempt(key, attemptId, { state: unknown ? "unconfirmed" : "failed", last_error: message });
+        if (unknown) summary.unconfirmed += 1;
+        else summary.failed += 1;
         throw err;
       }
-      for (const a of writes) {
-        await upsertLine(businessSlug, documentId, a.order, a.patch, { wrote: true });
-        records.set(a.order.id, { ...(records.get(a.order.id) as LineRow), ...toRecord(a.order, a.patch, records.get(a.order.id)) } as LineRow);
-        const type = a.write!.type;
-        if (type === "insert") summary.inserted += 1;
-        else if (type === "remove") summary.removed += 1;
-        else summary.updated += 1;
-      }
+      await recordSuccess(key, attemptId, text);
+      summary.inserted += 1;
     }
     await saveGdocSettings(businessSlug, { last_sync_at: new Date().toISOString(), health: "ok", last_error: null });
     return summary;
@@ -306,20 +256,112 @@ export async function runSync(businessSlug: string, options: RunOptions = {}): P
   }
 }
 
-// ── Triggers ─────────────────────────────────────────────────────────────────
-/** After an order is created or changed. Cheap when the feature is off or not set up; never throws into the order flow. */
-export async function triggerOrderSync(businessSlug: string): Promise<void> {
+/** The styled insert; if Google refuses the styling requests, the bare insert still puts the order in the document. */
+async function writeLine(client: DocsClient, documentId: string, text: string, refCode: string, timeoutMs: number): Promise<void> {
   try {
-    const { data, error } = await agentDb().from("ai_agent_gdoc_settings").select("enabled").eq("business_slug", businessSlug).maybeSingle();
-    if (error || !data || (data as { enabled?: boolean }).enabled !== true) return;
-    await runSync(businessSlug);
+    await client.batchUpdate(documentId, insertLineRequests(text, refCode), timeoutMs);
   } catch (err) {
-    if (!isSchemaPending(err)) console.error("[gdocs] order trigger", err instanceof Error ? err.message : err);
+    if (!(err instanceof GoogleApiError) || err.kind !== "bad_request") throw err;
+    await client.batchUpdate(documentId, insertLineRequests(text, refCode, { styled: false }), timeoutMs);
   }
 }
 
-/** Cron tick: every enabled business, most recently attempted last. */
-export async function runDueGoogleDocSyncs(limit = 10): Promise<{ businesses: number; results: Record<string, SyncSummary["status"]> }> {
+/**
+ * The write reached Google; now record it. The record is retried immediately a few times (a transient database blip must not
+ * leave a written line unrecorded). If it still fails, the row stays 'inserting' and the verification above settles it later.
+ */
+async function recordSuccess(key: { businessSlug: string; documentId: string; orderId: string }, attemptId: string, text: string): Promise<void> {
+  let last: unknown;
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      await finishAttempt(key, attemptId, { state: "synced", last_text: text });
+      return;
+    } catch (err) {
+      last = err;
+    }
+  }
+  console.error("[gdocs] line written but not recorded; it will be verified by its tag", key.orderId, last instanceof Error ? last.message : last);
+  throw last;
+}
+
+/**
+ * Settles lines whose insert outcome is unknown by looking for their tag in the first tab's text (ONE bounded read for all of
+ * them). Found → synced. Absent from a successful read → failed (retryable). Read failed → unconfirmed, tried again later, and
+ * after MAX_VERIFY_ATTEMPTS left to a person. Never writes to the document.
+ */
+async function reconcile(businessSlug: string, documentId: string, client: DocsClient, summary: SyncSummary, remaining: () => number, manual: boolean): Promise<void> {
+  const now = Date.now();
+  const due = (await loadLinesByState(businessSlug, documentId, ["inserting", "unconfirmed"])).filter((row) => {
+    if (now - Date.parse(row.attempt_started_at ?? row.updated_at) < SETTLE_MS) return false; // may still be in flight
+    if (manual) return true;
+    if (row.verify_attempts >= MAX_VERIFY_ATTEMPTS) return false;
+    return !row.last_verify_at || now - Date.parse(row.last_verify_at) >= VERIFY_COOLDOWN_MS;
+  });
+  if (due.length === 0) return;
+  // Verification comes first; whatever time is left afterwards decides how many new lines this run can still add.
+  const timeoutMs = Math.min(VERIFY_TIMEOUT_MS, remaining() - 5_000);
+  if (timeoutMs < 5_000) return; // not enough time left in this run; the next one will verify
+  let found: Set<string> | null = null;
+  let failure: string | null = null;
+  try {
+    found = await client.findTags(documentId, due.map((r) => r.tag), timeoutMs);
+  } catch (err) {
+    if (err instanceof GoogleApiError && (err.kind === "invalid_grant" || err.kind === "insufficient_scope" || err.kind === "api_disabled")) throw err;
+    failure = describeError(err).message;
+  }
+  for (const row of due) {
+    const key = { businessSlug, documentId, orderId: row.order_id };
+    if (found === null) {
+      await settleLine(key, { state: "unconfirmed", last_error: failure, verify_attempts: row.verify_attempts + 1 });
+      summary.unconfirmed += 1;
+    } else if (found.has(row.tag)) {
+      await settleLine(key, { state: "synced", verify_attempts: row.verify_attempts + 1 });
+      summary.confirmed += 1;
+    } else {
+      await settleLine(key, { state: "failed", last_error: "The earlier attempt did not reach the document; it will be added again.", verify_attempts: row.verify_attempts + 1 });
+    }
+  }
+}
+
+// ── Triggers ─────────────────────────────────────────────────────────────────
+/** True when a row still needs a person (unknown outcome that verification cannot settle). */
+export const needsPerson = (row: Pick<LineRow, "state" | "verify_attempts">): boolean => row.state === "unconfirmed" && row.verify_attempts >= MAX_VERIFY_ATTEMPTS;
+
+/**
+ * After an order is created or changed. NOT part of the order flow's critical path: it returns at once with the work already
+ * running, and tells the host to keep the function alive until it finishes (Next.js `after`) without delaying the response.
+ * Cheap when the feature is off; never throws into the order flow. A run that is cut short is simply continued by the cron tick.
+ */
+export function triggerOrderSync(businessSlug: string): Promise<void> {
+  const task = (async () => {
+    try {
+      const { data, error } = await agentDb().from("ai_agent_gdoc_settings").select("enabled").eq("business_slug", businessSlug).maybeSingle();
+      if (error || !data || (data as { enabled?: boolean }).enabled !== true) return;
+      await runSync(businessSlug, { backoff: true, budgetMs: 40_000 });
+    } catch (err) {
+      if (!isSchemaPending(err)) console.error("[gdocs] order trigger", err instanceof Error ? err.message : err);
+    }
+  })();
+  keepAlive(task);
+  return task;
+}
+
+function keepAlive(task: Promise<void>): void {
+  import("next/server").then(
+    ({ after }) => {
+      try {
+        after(task);
+      } catch {
+        // Not inside a request (a script, a test): the promise simply runs to completion on its own.
+      }
+    },
+    () => undefined
+  );
+}
+
+/** Cron tick: every enabled business, longest-waiting first, within the time left in the function. */
+export async function runDueGoogleDocSyncs(limit = 10, budgetMs = DEFAULT_BUDGET_MS): Promise<{ businesses: number; results: Record<string, SyncSummary["status"]> }> {
+  const deadline = Date.now() + budgetMs;
   const { data, error } = await agentDb().from("ai_agent_gdoc_settings").select("business_slug").eq("enabled", true).order("last_attempt_at", { ascending: true, nullsFirst: true }).limit(limit);
   if (error) {
     if (isSchemaPending(error)) return { businesses: 0, results: {} };
@@ -327,7 +369,9 @@ export async function runDueGoogleDocSyncs(limit = 10): Promise<{ businesses: nu
   }
   const results: Record<string, SyncSummary["status"]> = {};
   for (const row of (data ?? []) as { business_slug: string }[]) {
-    results[row.business_slug] = (await runSync(row.business_slug)).status;
+    const left = deadline - Date.now();
+    if (left < TIMEOUT_MS) break;
+    results[row.business_slug] = (await runSync(row.business_slug, { backoff: true, budgetMs: left })).status;
   }
   return { businesses: Object.keys(results).length, results };
 }

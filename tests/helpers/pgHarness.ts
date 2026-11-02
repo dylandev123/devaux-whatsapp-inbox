@@ -36,6 +36,7 @@ const MIGRATIONS = [
   "20261110000000_ai_agent_order_numbers_routing_missed_calls.sql",
   "20261111000000_ai_agent_teaching_sessions.sql",
   "20261112000000_ai_agent_google_docs_sync.sql",
+  "20261113000000_ai_agent_gdocs_append_only.sql",
 ];
 
 const BOOTSTRAP = `

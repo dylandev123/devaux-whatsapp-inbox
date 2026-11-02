@@ -1,14 +1,21 @@
 // Server-only: the few Google REST calls the order sync needs, over plain fetch (no SDK). Everything the sync does to a
 // document goes through DocsClient, so tests substitute an in-memory document and the real Google is never touched.
 //
+// The documents involved can be hundreds of pages, so the normal path NEVER downloads a document:
+//   access test   Drive files.get (id, name, mimeType, trashed, capabilities.canEdit) + a Docs API availability probe that
+//                 asks for a document id that cannot exist (Google answers "not found" when the API is on, "disabled" when it
+//                 is off, "insufficient scope" when the token lacks it) — no document body is involved
+//   insert        documents.batchUpdate insertText at index 1 of the first tab — no read, no revision guard needed
+//   recovery      documents.get with a field mask for text only, and only to settle an insert whose outcome is unknown
+//
 // Scopes (the minimum that works for an EXISTING document the admin did not create with this app):
-//   documents                    read the document and insert/replace/delete text in it
+//   documents                    insert text into the document
 //   drive.metadata.readonly      read the document's title and whether the account may edit it (capabilities.canEdit);
 //                                no file content is read through Drive
 //   openid email                 show which Google account is connected
 // No timers are used: every request is bounded by AbortSignal.timeout.
 
-import type { GoogleDocument, DocRequest } from "@/lib/aiAgent/gdocDocument";
+import { tagsPresent, type DocRequest, type TextRunDocument } from "../../../aiAgent/gdocInsert.ts";
 
 export const GOOGLE_SCOPES = [
   "openid",
@@ -25,7 +32,7 @@ export class GoogleApiError extends Error {
   status: number;
   /** Google's machine-readable reason(s), e.g. "SERVICE_DISABLED" — for logs and diagnosis. Never contains credentials. */
   reasons: string[];
-  /** Which Google call failed ("token refresh", "Drive metadata", "Docs read", ...) — set for timeouts and network failures. */
+  /** Which Google call failed ("token refresh", "Drive metadata", "Docs write", ...). */
   op?: string;
   constructor(kind: GoogleErrorKind, status: number, message: string, reasons: string[] = [], op?: string) {
     super(message);
@@ -33,6 +40,13 @@ export class GoogleApiError extends Error {
     this.status = status;
     this.reasons = reasons;
     this.op = op;
+  }
+  /**
+   * True when a WRITE that failed this way may nevertheless have been applied by Google (the answer was lost, or Google failed
+   * after starting). Every other failure is an explicit refusal, so the document is known to be unchanged.
+   */
+  get outcomeUnknown(): boolean {
+    return this.kind === "timeout" || this.kind === "network" || this.kind === "server";
   }
 }
 
@@ -45,10 +59,14 @@ export interface DriveFile {
 }
 
 export interface DocsClient {
+  /** Drive metadata only (title, type, trashed, edit permission). Never the document body. */
   getFile(documentId: string): Promise<DriveFile>;
-  getDocument(documentId: string): Promise<GoogleDocument>;
-  /** One atomic batch. With requiredRevisionId Google rejects it (kind "precondition") if the document changed since that revision. */
-  batchUpdate(documentId: string, requests: DocRequest[], requiredRevisionId?: string): Promise<void>;
+  /** Resolves when the Docs API answers normally for this account; throws api_disabled / insufficient_scope / invalid_grant / timeout / ... */
+  probeDocsApi(): Promise<void>;
+  /** One atomic batchUpdate on the document. Used only to insert at the start of the first tab; never reads the document. */
+  batchUpdate(documentId: string, requests: DocRequest[], timeoutMs?: number): Promise<void>;
+  /** Which of these order tags are in the first tab's text. A text-only, bounded read, used only to settle an unknown insert outcome. */
+  findTags(documentId: string, refCodes: string[], timeoutMs?: number): Promise<Set<string>>;
 }
 
 export interface GoogleOAuthConfig {
@@ -62,9 +80,16 @@ export function oauthConfig(): GoogleOAuthConfig | null {
   return clientId && clientSecret ? { clientId, clientSecret } : null;
 }
 
-// Per attempt. Worst case for the access test is the token refresh plus the (parallel) Drive and Docs reads, i.e. 2 x
+// Per attempt. Worst case for the access test is the token refresh plus the (parallel) Drive and Docs probe, i.e. 2 x
 // TIMEOUT_MS, well inside the 60 s function limit (maxDuration on the google-docs route).
 export const TIMEOUT_MS = 20_000;
+// An insert of one paragraph is quick even in a very large document; a longer wait only delays a retry.
+export const WRITE_TIMEOUT_MS = 25_000;
+// The recovery read downloads the first tab's text (megabytes for hundreds of pages), so it gets longer — and only runs from
+// the background sync, never from a dashboard click.
+export const VERIFY_TIMEOUT_MS = 40_000;
+// A document id Google cannot have issued: used to learn whether the Docs API is reachable without touching any real document.
+const PROBE_DOCUMENT_ID = "devaux-docs-api-availability-check";
 const DOC_MIME = "application/vnd.google-apps.document";
 
 // Google reports the cause of a 403 in several places: error.errors[].reason (Drive v3), error.details[].reason (ErrorInfo,
@@ -101,7 +126,7 @@ export function classify(status: number, body: unknown): GoogleApiError {
 const isTimeout = (err: unknown) => err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
 
 /** One bounded request. Logs only the operation label, host, status and duration — never a URL path (document id), token or body. */
-async function call(fetchImpl: typeof fetch, url: string, init: RequestInit, op = "request"): Promise<unknown> {
+async function call(fetchImpl: typeof fetch, url: string, init: RequestInit, op = "request", timeoutMs = TIMEOUT_MS): Promise<unknown> {
   const host = new URL(url).host;
   // Only idempotent reads are retried, and only after a FAST connection failure; a timeout is never retried (it would
   // double the wait and could exceed the function limit).
@@ -110,12 +135,12 @@ async function call(fetchImpl: typeof fetch, url: string, init: RequestInit, op 
     const started = Date.now();
     let res: Response;
     try {
-      res = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS), cache: "no-store" });
+      res = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs), cache: "no-store" });
     } catch (err) {
       const ms = Date.now() - started;
       if (isTimeout(err)) {
-        console.error("[google-docs call]", `op=${op} host=${host} outcome=timeout after_ms=${ms} limit_ms=${TIMEOUT_MS} attempt=${attempt}`);
-        throw new GoogleApiError("timeout", 0, `Google did not answer the ${op} request within ${TIMEOUT_MS / 1000} seconds`, [], op);
+        console.error("[google-docs call]", `op=${op} host=${host} outcome=timeout after_ms=${ms} limit_ms=${timeoutMs} attempt=${attempt}`);
+        throw new GoogleApiError("timeout", 0, `Google did not answer the ${op} request within ${Math.round(timeoutMs / 1000)} seconds`, [], op);
       }
       console.error("[google-docs call]", `op=${op} host=${host} outcome=network after_ms=${ms} attempt=${attempt}`);
       if (retriable && attempt < 2) continue;
@@ -123,7 +148,11 @@ async function call(fetchImpl: typeof fetch, url: string, init: RequestInit, op 
     }
     const body = await res.json().catch(() => null);
     console.info("[google-docs call]", `op=${op} host=${host} status=${res.status} ms=${Date.now() - started}`);
-    if (!res.ok) throw classify(res.status, body);
+    if (!res.ok) {
+      const err = classify(res.status, body);
+      err.op = op;
+      throw err;
+    }
     return body;
   }
 }
@@ -203,15 +232,27 @@ export function docsClient(accessToken: string, fetchImpl: typeof fetch = fetch)
       };
       return { id: f.id, name: f.name, mimeType: f.mimeType, trashed: f.trashed === true, canEdit: f.capabilities?.canEdit === true };
     },
-    async getDocument(documentId) {
-      return (await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(documentId)}`, { headers: auth }, "Docs read")) as GoogleDocument;
+    async probeDocsApi() {
+      try {
+        await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(PROBE_DOCUMENT_ID)}?fields=documentId`, { headers: auth }, "Docs API check");
+      } catch (err) {
+        // "Not found" (or a refusal for a document that does not exist) is the healthy answer: the API is on and the token works.
+        if (err instanceof GoogleApiError && (err.kind === "not_found" || err.kind === "forbidden" || err.kind === "bad_request")) return;
+        throw err;
+      }
     },
-    async batchUpdate(documentId, requests, requiredRevisionId) {
+    async batchUpdate(documentId, requests, timeoutMs = WRITE_TIMEOUT_MS) {
       await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(documentId)}:batchUpdate`, {
         method: "POST",
         headers: { ...auth, "Content-Type": "application/json" },
-        body: JSON.stringify({ requests, ...(requiredRevisionId ? { writeControl: { requiredRevisionId } } : {}) }),
-      }, "Docs write");
+        body: JSON.stringify({ requests }),
+      }, "Docs write", timeoutMs);
+    },
+    async findTags(documentId, refCodes, timeoutMs = VERIFY_TIMEOUT_MS) {
+      // No includeTabsContent: the response's top-level `body` is the first tab, the only tab the app writes to.
+      const fields = encodeURIComponent("body(content(paragraph(elements(textRun(content)))))");
+      const doc = (await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(documentId)}?fields=${fields}`, { headers: auth }, "Docs verify", timeoutMs)) as TextRunDocument;
+      return tagsPresent(doc, refCodes);
     },
   };
 }

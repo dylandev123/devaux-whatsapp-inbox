@@ -1,11 +1,11 @@
 // Server-only: what the AI Agent dashboard does with the Google Docs sync — connect status, document link and access test
-// (read-only), settings, live-preview data, the one-time import, and resolving held lines. Every function is scoped to one
-// business slug; the document id used for any Google call comes from that business's stored settings, never from a request.
-// Nothing here sends a WhatsApp message, and nothing writes to a document unless sync is enabled and a person asked.
+// (metadata only: the document body is never downloaded), settings, live-preview data, the one-time import, and settling
+// lines whose result is unknown. Every function is scoped to one business slug; the document id used for any Google call comes
+// from that business's stored settings, never from a request. Nothing here sends a WhatsApp message, and nothing writes to a
+// document unless sync is enabled and a person asked.
 
 import { agentDb, audit } from "@/lib/server/aiAgent/db";
-import { decryptSecret } from "@/lib/server/aiAgent/googleDocs/crypto";
-import { encryptionKey } from "@/lib/server/aiAgent/googleDocs/crypto";
+import { decryptSecret, encryptionKey } from "@/lib/server/aiAgent/googleDocs/crypto";
 import { GoogleApiError, isGoogleDocFile, oauthConfig, REQUIRED_SCOPES, revokeToken } from "@/lib/server/aiAgent/googleDocs/google";
 import {
   deleteConnection,
@@ -13,19 +13,16 @@ import {
   loadGdocSettings,
   loadLine,
   loadLines,
-  loadLinesByState,
+  loadLinesForOrders,
   saveGdocSettings,
-  upsertLine,
+  setLineState,
   type GdocSettings,
   type LineRow,
 } from "@/lib/server/aiAgent/googleDocs/store";
-import { describeError, openClient, policyOf, runSync, SYNC_ORDER_COLUMNS, type SyncSummary } from "@/lib/server/aiAgent/googleDocs/sync";
+import { describeError, MAX_VERIFY_ATTEMPTS, openClient, openOrders, ordersByIds, policyOf, runSync, SETTLE_MS, type SyncSummary } from "@/lib/server/aiAgent/googleDocs/sync";
 import { parseDocumentRef } from "@/lib/aiAgent/gdocLink";
-import { findSection, paragraphsWithTag, resolvePosition, type Insertion } from "@/lib/aiAgent/gdocDocument";
-import { formatOrderLine, normalizeFormat, SAMPLE_ORDER, splitTag, withTag, type FormatConfig, type LineOrder } from "@/lib/aiAgent/gdocFormat";
-import { planSync, type OnCorrected, type OnFinished, type SyncOrder } from "@/lib/aiAgent/gdocPlan";
-import { OPEN_ORDER_STATUSES } from "@/lib/aiAgent/orders";
-import { normalizeInsertion } from "@/lib/aiAgent/gdocDocument";
+import { formatOrderLine, normalizeFormat, SAMPLE_ORDER, withTag, type FormatConfig, type LineOrder } from "@/lib/aiAgent/gdocFormat";
+import { planInsertions } from "@/lib/aiAgent/gdocInsert";
 
 export class AdminError extends Error {
   status: number;
@@ -35,20 +32,16 @@ export class AdminError extends Error {
   }
 }
 
-const ORDER_LIMIT = 300;
-
-// ── Dashboard payload ────────────────────────────────────────────────────────
 export interface ProblemLine {
   id: string;
   orderId: string;
   ref: string;
-  state: LineRow["state"];
+  /** failed = the document is known to be unchanged; unconfirmed = Google may or may not have applied the write. */
+  state: "failed" | "unconfirmed";
   customer: string | null;
   orderStatus: string | null;
-  reason: string | null;
-  pendingText: string | null;
-  foundText: string | null;
-  lastText: string | null;
+  /** Why a person is needed, in plain words. */
+  reason: string;
   attempts: number;
   error: string | null;
   updatedAt: string;
@@ -58,20 +51,13 @@ export interface PreviewOrder extends LineOrder {
   id: string;
 }
 
-async function ordersByIds(businessSlug: string, ids: string[]): Promise<SyncOrder[]> {
-  const out: SyncOrder[] = [];
-  for (let i = 0; i < ids.length; i += 100) {
-    const { data, error } = await agentDb().from("ai_agent_orders").select(SYNC_ORDER_COLUMNS).eq("business_slug", businessSlug).in("id", ids.slice(i, i + 100));
-    if (error) throw new Error(error.message);
-    out.push(...((data ?? []) as SyncOrder[]));
-  }
-  return out;
-}
+const PROBLEM_STATES = new Set<LineRow["state"]>(["failed", "unconfirmed", "inserting"]);
 
-async function outstandingOrders(businessSlug: string): Promise<SyncOrder[]> {
-  const { data, error } = await agentDb().from("ai_agent_orders").select(SYNC_ORDER_COLUMNS).eq("business_slug", businessSlug).in("status", [...OPEN_ORDER_STATUSES]).order("created_at").limit(ORDER_LIMIT);
-  if (error) throw new Error(error.message);
-  return (data ?? []) as SyncOrder[];
+function problemReason(l: LineRow, now: number): string {
+  if (l.state === "failed") return "Google refused or could not complete the write, so nothing was added. It is retried automatically.";
+  if (l.state === "inserting" && now - Date.parse(l.attempt_started_at ?? l.updated_at) < SETTLE_MS) return "Being written right now.";
+  if (l.verify_attempts >= MAX_VERIFY_ATTEMPTS) return "Google may or may not have added this line, and the document could not be checked. Look for its order id in the document, then choose below.";
+  return "Google may or may not have added this line. The app will check the document for its order id before ever adding it again.";
 }
 
 export async function getDashboard(businessSlug: string) {
@@ -85,30 +71,29 @@ export async function getDashboard(businessSlug: string) {
   let problems: ProblemLine[] = [];
   const counts: Record<string, number> = {};
   let nextOrders: PreviewOrder[] = [];
+  const open = await openOrders(businessSlug, null);
   if (settings.document_id) {
     const lines = await loadLines(businessSlug, settings.document_id);
     for (const l of lines) counts[l.state] = (counts[l.state] ?? 0) + 1;
-    const bad = lines.filter((l) => l.state !== "synced").sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 100);
+    const now = Date.now();
+    const bad = lines.filter((l) => PROBLEM_STATES.has(l.state)).sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 100);
     const orders = new Map((await ordersByIds(businessSlug, bad.map((l) => l.order_id))).map((o) => [o.id, o]));
     problems = bad.map((l) => ({
       id: l.id,
       orderId: l.order_id,
       ref: l.tag,
-      state: l.state,
+      state: l.state === "failed" ? ("failed" as const) : ("unconfirmed" as const),
       customer: orders.get(l.order_id)?.customer_name ?? null,
       orderStatus: orders.get(l.order_id)?.status ?? null,
-      reason: l.pending_reason,
-      pendingText: l.pending_text,
-      foundText: l.found_text,
-      lastText: l.last_text,
+      reason: problemReason(l, now),
       attempts: l.attempts,
       error: l.last_error,
       updatedAt: l.updated_at,
     }));
     const have = new Set(lines.map((l) => l.order_id));
-    nextOrders = (await outstandingOrders(businessSlug)).filter((o) => !have.has(o.id) && o.items.length > 0).slice(-3).reverse();
+    nextOrders = open.filter((o) => !have.has(o.id) && o.items.length > 0).slice(-3).reverse();
   } else {
-    nextOrders = (await outstandingOrders(businessSlug)).filter((o) => o.items.length > 0).slice(-3).reverse();
+    nextOrders = open.filter((o) => o.items.length > 0).slice(-3).reverse();
   }
 
   return {
@@ -123,13 +108,8 @@ export async function getDashboard(businessSlug: string) {
       canEdit: settings.can_edit,
       accessVerifiedAt: settings.access_verified_at,
       format: settings.format,
-      insertion: settings.insertion,
-      onCompleted: settings.on_completed,
-      onCancelled: settings.on_cancelled,
-      onCorrected: settings.on_corrected,
       includeIncomplete: settings.include_incomplete,
       syncSince: settings.sync_since,
-      sectionCreatedAt: settings.section_created_at,
       lastSyncAt: settings.last_sync_at,
       health: settings.health,
       lastError: settings.last_error,
@@ -164,39 +144,22 @@ export interface AccessReport {
   title: string;
   canEdit: boolean;
   account: string;
-  section: "none" | "found" | "broken";
-  sectionMessage: string | null;
-  /** Where a new section would go, or why that position cannot be used. */
-  position: { ok: true; where: string } | { ok: false; reason: string } | null;
-  lineCount: number;
+  /** The Docs API answered for this account (checked without opening any document). */
+  docsApi: true;
 }
 
-/** Reads the document with the connected account. Never writes. */
-export async function checkAccess(businessSlug: string, documentId: string, insertion: Insertion): Promise<AccessReport> {
+/**
+ * Drive metadata (title, type, trashed, capabilities.canEdit) plus a Docs API availability probe, in parallel. The document
+ * body is never downloaded and nothing is written, so a document of any size is tested in about a second.
+ */
+export async function checkAccess(businessSlug: string, documentId: string): Promise<AccessReport> {
   const { client, email } = await openClient(businessSlug);
-  // Independent reads, so run them together. A Docs failure only matters once Drive says this really is a document.
-  const docRead = client.getDocument(documentId).then((d) => ({ d }), (e: unknown) => ({ e }));
-  const file = await client.getFile(documentId).catch(async (err) => {
-    await docRead;
-    throw err;
-  });
-  if (!isGoogleDocFile(file)) throw new AdminError("That link is not a Google Docs document (it is another kind of Drive file).");
-  if (file.trashed) throw new AdminError("That document is in the trash.");
-  const read = await docRead;
-  if ("e" in read) throw read.e;
-  const doc = read.d;
-  const section = findSection(doc, businessSlug);
-  const position = section.kind === "none" ? resolvePosition(doc, insertion) : null;
-  return {
-    documentId,
-    title: file.name || doc.title || "Untitled document",
-    canEdit: file.canEdit,
-    account: email,
-    section: section.kind,
-    sectionMessage: section.kind === "broken" ? section.reason : null,
-    position: position ? (position.ok ? { ok: true, where: position.where } : { ok: false, reason: position.reason }) : null,
-    lineCount: section.kind === "found" ? section.lines.length : 0,
-  };
+  const [file, probe] = await Promise.allSettled([client.getFile(documentId), client.probeDocsApi()]);
+  if (file.status === "rejected") throw file.reason;
+  if (!isGoogleDocFile(file.value)) throw new AdminError("That link is not a Google Docs document (it is another kind of Drive file).");
+  if (file.value.trashed) throw new AdminError("That document is in the trash.");
+  if (probe.status === "rejected") throw probe.reason;
+  return { documentId, title: file.value.name || "Untitled document", canEdit: file.value.canEdit, account: email, docsApi: true };
 }
 
 function accessError(err: unknown): AdminError {
@@ -213,7 +176,7 @@ export async function setDocument(businessSlug: string, input: string, userId: s
   if (!settings) throw new AdminError("Google Docs sync is not set up in the database yet. Run the migration first.", 409);
   let report: AccessReport;
   try {
-    report = await checkAccess(businessSlug, parsed.documentId, settings.insertion);
+    report = await checkAccess(businessSlug, parsed.documentId);
   } catch (err) {
     throw accessError(err);
   }
@@ -225,10 +188,9 @@ export async function setDocument(businessSlug: string, input: string, userId: s
       document_title: report.title,
       can_edit: report.canEdit,
       access_verified_at: new Date().toISOString(),
-      // A different document must be re-enabled on purpose, and gets its own section.
-      // Its sync start is reset too: the new document begins empty and only gets orders from the moment it is turned on
-      // (older outstanding orders come in through the explicit import).
-      ...(changed ? { enabled: false, section_created_at: null, sync_since: null, health: "ok" as const, last_error: null } : {}),
+      // A different document must be re-enabled on purpose. Its sync start is reset too: it only gets orders from the moment
+      // it is turned on (older outstanding orders come in through the explicit import).
+      ...(changed ? { enabled: false, sync_since: null, health: "ok" as const, last_error: null } : {}),
     },
     userId
   );
@@ -240,7 +202,7 @@ export async function testStoredDocument(businessSlug: string): Promise<AccessRe
   const settings = await loadGdocSettings(businessSlug);
   if (!settings?.document_id) throw new AdminError("Paste a Google Docs link first.");
   try {
-    const report = await checkAccess(businessSlug, settings.document_id, settings.insertion);
+    const report = await checkAccess(businessSlug, settings.document_id);
     await saveGdocSettings(businessSlug, { document_title: report.title, can_edit: report.canEdit, access_verified_at: new Date().toISOString() });
     return report;
   } catch (err) {
@@ -249,15 +211,8 @@ export async function testStoredDocument(businessSlug: string): Promise<AccessRe
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
-const FINISHED: OnFinished[] = ["leave", "mark", "remove"];
-const CORRECTED: OnCorrected[] = ["update", "review"];
-
 export interface ConfigPatch {
   format?: unknown;
-  insertion?: unknown;
-  onCompleted?: unknown;
-  onCancelled?: unknown;
-  onCorrected?: unknown;
   includeIncomplete?: unknown;
 }
 
@@ -266,22 +221,6 @@ export async function saveConfig(businessSlug: string, patch: ConfigPatch, userI
   if (!current) throw new AdminError("Google Docs sync is not set up in the database yet. Run the migration first.", 409);
   const next: Partial<GdocSettings> = {};
   if (patch.format !== undefined) next.format = normalizeFormat(patch.format) as FormatConfig;
-  if (patch.insertion !== undefined) {
-    next.insertion = normalizeInsertion(patch.insertion);
-    // The position only matters until the section exists; after that new lines always go under its start marker.
-  }
-  if (patch.onCompleted !== undefined) {
-    if (!FINISHED.includes(patch.onCompleted as OnFinished)) throw new AdminError("Invalid setting for completed orders");
-    next.on_completed = patch.onCompleted as OnFinished;
-  }
-  if (patch.onCancelled !== undefined) {
-    if (!FINISHED.includes(patch.onCancelled as OnFinished)) throw new AdminError("Invalid setting for cancelled orders");
-    next.on_cancelled = patch.onCancelled as OnFinished;
-  }
-  if (patch.onCorrected !== undefined) {
-    if (!CORRECTED.includes(patch.onCorrected as OnCorrected)) throw new AdminError("Invalid setting for corrected orders");
-    next.on_corrected = patch.onCorrected as OnCorrected;
-  }
   if (patch.includeIncomplete !== undefined) next.include_incomplete = patch.includeIncomplete === true;
   const saved = await saveGdocSettings(businessSlug, next, userId);
   await audit(businessSlug, "admin", userId, "gdocs.save_config", { type: "google_doc" }, { fields: Object.keys(next) });
@@ -299,13 +238,11 @@ export async function setEnabled(businessSlug: string, enabled: boolean, userId:
   if (!current.document_id) throw new AdminError("Paste your Google Docs link before turning sync on.");
   let report: AccessReport;
   try {
-    report = await checkAccess(businessSlug, current.document_id, current.insertion);
+    report = await checkAccess(businessSlug, current.document_id);
   } catch (err) {
     throw accessError(err);
   }
   if (!report.canEdit) throw new AdminError(`${report.account} can only view “${report.title}”. Share the document with edit access, then test again.`);
-  if (report.section === "broken") throw new AdminError(report.sectionMessage ?? "The AI section in the document is damaged.");
-  if (report.position && !report.position.ok) throw new AdminError(report.position.reason);
   const saved = await saveGdocSettings(
     businessSlug,
     {
@@ -313,8 +250,9 @@ export async function setEnabled(businessSlug: string, enabled: boolean, userId:
       document_title: report.title,
       can_edit: true,
       access_verified_at: new Date().toISOString(),
-      // Orders created before this moment are NOT synced automatically; they need the explicit one-time import.
-      sync_since: current.sync_since ?? new Date().toISOString(),
+      // Only orders created from this moment on sync automatically — including after switching sync off and on again.
+      // Earlier ones need the explicit one-time import.
+      sync_since: new Date().toISOString(),
       health: "ok",
       last_error: null,
     },
@@ -333,21 +271,15 @@ export interface ImportPreview {
 export async function importPreview(businessSlug: string): Promise<ImportPreview> {
   const settings = await loadGdocSettings(businessSlug);
   if (!settings?.document_id) throw new AdminError("Paste your Google Docs link first.");
-  const { client } = await openClient(businessSlug).catch((err) => {
-    throw accessError(err);
-  });
-  const doc = await client.getDocument(settings.document_id).catch((err) => {
-    throw accessError(err);
-  });
-  const records = new Map((await loadLines(businessSlug, settings.document_id)).map((l) => [l.order_id, l]));
-  const orders = (await outstandingOrders(businessSlug)).filter((o) => !records.has(o.id));
-  const plan = planSync({ orders, records, doc, policy: policyOf(settings), mode: "import" });
+  const orders = await openOrders(businessSlug, null);
+  const rows = await loadLinesForOrders(businessSlug, settings.document_id, orders.map((o) => o.id));
+  const plan = planInsertions(orders, new Map(rows.map((r) => [r.order_id, r.state as string])), policyOf(settings), "import");
   return {
-    items: plan.actions
-      .filter((a) => a.write?.type === "insert")
-      .map((a) => ({ orderId: a.order.id, ref: a.order.ref_code, line: withTag((a.write as { text: string }).text, a.order.ref_code), missing: formatOrderLine(a.order, settings.format).missing, createdAt: a.order.created_at }))
+    // Newest first, as they will read in the document (they are written oldest first).
+    items: plan.insert
+      .map((o) => ({ orderId: o.id, ref: o.ref_code, line: withTag(formatOrderLine(o, settings.format).text, o.ref_code), missing: formatOrderLine(o, settings.format).missing, createdAt: o.created_at }))
       .reverse(),
-    skipped: [...plan.skipped.map((s) => ({ ref: s.order.ref_code, reason: s.reason })), ...plan.actions.filter((a) => !a.write).map((a) => ({ ref: a.order.ref_code, reason: a.note }))],
+    skipped: plan.skipped.map((s) => ({ ref: s.order.ref_code, reason: s.reason })),
   };
 }
 
@@ -358,67 +290,38 @@ export async function importCommit(businessSlug: string, orderIds: string[], use
   const allowed = new Set(preview.items.map((i) => i.orderId));
   const ids = [...new Set(orderIds)].filter((id) => allowed.has(id));
   if (ids.length === 0) throw new AdminError("None of the selected orders can be imported (they may already be in the document).");
-  const summary = await runSync(businessSlug, { mode: "import", orderIds: ids });
+  const summary = await runSync(businessSlug, { mode: "import", orderIds: ids, manual: true });
   await audit(businessSlug, "admin", userId, "gdocs.import", { type: "google_doc", id: settings.document_id }, { requested: ids.length, inserted: summary.inserted });
   return summary;
 }
 
-// ── Held lines ───────────────────────────────────────────────────────────────
-export type Resolution = "overwrite" | "keep" | "readd" | "ignore" | "retry";
+// ── Lines whose result a person settles ──────────────────────────────────────
+/** present = "I can see it in the document"; again = "it is not there, add it"; skip = "leave this order out". */
+export type Resolution = "present" | "again" | "skip";
 
 export async function resolveLine(businessSlug: string, lineId: string, resolution: Resolution, userId: string): Promise<SyncSummary | { status: "ok" }> {
   const settings = await loadGdocSettings(businessSlug);
   if (!settings?.document_id) throw new AdminError("Paste your Google Docs link first.");
   const line = await loadLine(businessSlug, settings.document_id, lineId);
   if (!line) throw new AdminError("That line was not found.", 404);
-  const [order] = await ordersByIds(businessSlug, [line.order_id]);
-  if (!order) throw new AdminError("The order no longer exists.", 404);
+  if (!["failed", "unconfirmed", "inserting"].includes(line.state)) throw new AdminError("That line is already settled.", 409);
   await audit(businessSlug, "admin", userId, `gdocs.resolve.${resolution}`, { type: "google_doc_line", id: line.id }, { ref: line.tag, state: line.state });
-
-  if (resolution === "ignore" || (resolution === "keep" && line.state === "missing")) {
-    await upsertLine(businessSlug, settings.document_id, order, { state: "synced", last_text: null, synced_version: order.version, synced_status: order.status, pending_text: null, pending_action: null, pending_reason: null, found_text: null });
+  const key = { businessSlug, documentId: settings.document_id, orderId: line.order_id };
+  if (resolution === "present") {
+    await setLineState(key, "synced");
     return { status: "ok" };
   }
-  if (resolution === "keep") {
-    // Keep the person's version. The baseline is left empty ("not something the app wrote"), so the line is never treated as
-    // unedited: a later change to the order is held as a conflict again instead of silently replacing what they chose to keep.
-    const { client } = await openClient(businessSlug).catch((err) => {
-      throw accessError(err);
-    });
-    const found = paragraphsWithTag(await client.getDocument(settings.document_id).catch((err) => { throw accessError(err); }), line.tag);
-    if (found.length !== 1) throw new AdminError(found.length === 0 ? "The line is no longer in the document." : `The tag ${line.tag} appears ${found.length} times in the document. Remove the extra copies first.`);
-    await upsertLine(businessSlug, settings.document_id, order, { state: "synced", last_text: null, synced_version: order.version, synced_status: order.status, pending_text: null, pending_action: null, pending_reason: null, found_text: null });
+  if (resolution === "skip") {
+    await setLineState(key, "skipped");
     return { status: "ok" };
   }
+  // "again": the person has checked the document and the line is not there (or accepts a possible duplicate).
   if (!settings.enabled) throw new AdminError("Turn sync on to let the app write to the document.");
-
-  if (resolution === "overwrite") {
-    const { client } = await openClient(businessSlug).catch((err) => {
-      throw accessError(err);
-    });
-    const found = paragraphsWithTag(await client.getDocument(settings.document_id).catch((err) => { throw accessError(err); }), line.tag);
-    if (found.length !== 1) throw new AdminError(found.length === 0 ? "The line is no longer in the document. Use “Add again” instead." : `The tag ${line.tag} appears ${found.length} times in the document. Remove the extra copies first.`);
-    // Make the document's current text the baseline (so it is "unedited" to the planner) and the order look changed.
-    await upsertLine(businessSlug, settings.document_id, order, { state: "synced", last_text: splitTag(found[0].text).text, synced_version: -1, synced_status: "overwrite", pending_text: null, pending_action: null, pending_reason: null, found_text: null });
-    return runSync(businessSlug, { mode: "import", orderIds: [order.id], force: true, approve: true });
-  }
-  // readd / retry: forget the old line and list the order again at the top.
-  if (resolution === "readd") {
-    await upsertLine(businessSlug, settings.document_id, order, { state: "failed", last_text: null, pending_text: null, pending_action: null, pending_reason: null, found_text: null });
-  } else {
-    await upsertLine(businessSlug, settings.document_id, order, { state: line.state === "failed" ? "failed" : line.state, last_text: line.last_text }, { attempts: 0 });
-  }
-  return runSync(businessSlug, { mode: "import", orderIds: [order.id], force: true, approve: true });
+  await setLineState(key, "failed");
+  return runSync(businessSlug, { mode: "import", orderIds: [line.order_id], manual: true });
 }
 
-export async function retryAllFailed(businessSlug: string, userId: string): Promise<SyncSummary> {
-  const settings = await loadGdocSettings(businessSlug);
-  if (!settings?.document_id) throw new AdminError("Paste your Google Docs link first.");
-  const failed = await loadLinesByState(businessSlug, settings.document_id, ["failed"]);
-  for (const l of failed) {
-    const [order] = await ordersByIds(businessSlug, [l.order_id]);
-    if (order) await upsertLine(businessSlug, settings.document_id, order, { state: "failed", last_text: l.last_text }, { attempts: 0 });
-  }
-  await audit(businessSlug, "admin", userId, "gdocs.retry_failed", { type: "google_doc" }, { count: failed.length });
-  return runSync(businessSlug, { mode: "import", orderIds: failed.map((l) => l.order_id), force: true });
+/** Retry now: every failed line is tried again, and unknown ones are checked against the document. */
+export async function retryNow(businessSlug: string): Promise<SyncSummary> {
+  return runSync(businessSlug, { manual: true });
 }

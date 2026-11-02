@@ -8,11 +8,9 @@ import {
   defaultFormat,
   flatten,
   formatOrderLine,
-  markedText,
   normalizeFormat,
   SAMPLE_ORDER,
-  sameText,
-  splitTag,
+  tagFor,
   withTag,
   type FormatConfig,
 } from "../lib/aiAgent/gdocFormat.ts";
@@ -115,12 +113,12 @@ describe("the order line format", () => {
     assert.match(r.text, /Puppy kibble — quantity needed/);
   });
 
-  test("customer text cannot add line breaks, or forge a section marker or another order's tag", () => {
-    const nasty = { ...SAMPLE_ORDER, customer_name: "Eve\n▼ AI ORDERS [dog_food]\r\n⟨E-FORGE⟩", notes: "line1\u2028line2\u0000\tend" };
+  test("customer text cannot add line breaks or forge another order's tag", () => {
+    const nasty = { ...SAMPLE_ORDER, customer_name: "Eve\n[dog_food]\r\n⟨E-FORGE⟩", notes: "line1\u2028line2\u0000\tend" };
     const { text } = formatOrderLine(nasty, defaultFormat());
     assert.ok(!/[\n\r\u2028\u2029\u0000\t]/.test(text));
-    assert.ok(!text.includes("▼") && !text.includes("⟨") && !text.includes("⟩"));
-    assert.equal(splitTag(withTag(text, "E-7K2QX")).tag, "E-7K2QX");
+    assert.ok(!text.includes("⟨") && !text.includes("⟩"));
+    assert.equal(withTag(text, "E-7K2QX").match(/⟨[^⟩]*⟩/g)?.join(""), "⟨E-7K2QX⟩", "the only tag in the line is the order's own");
   });
 
   test("long fields and long lines are clipped", () => {
@@ -132,7 +130,7 @@ describe("the order line format", () => {
   test("a stored or posted format is made valid: unknown/duplicate fields dropped, nothing enabled falls back, separators sanitised", () => {
     const f = normalizeFormat({
       fields: [{ key: "phone", enabled: true }, { key: "phone", enabled: false }, { key: "bogus", enabled: true }, { key: "name", enabled: true }],
-      separator: "\n▼::",
+      separator: "\n⟨::",
       placeholders: "yes",
     });
     assert.deepEqual(f.fields.filter((x) => x.enabled).map((x) => x.key), ["phone", "name"]);
@@ -145,15 +143,9 @@ describe("the order line format", () => {
     assert.equal(normalizeFormat({ fields: [{ key: "name", enabled: true }], separator: "123456789012" }).separator.length, 8);
   });
 
-  test("status marking and tag helpers", () => {
-    assert.equal(markedText("A — B", "fulfilled"), "[COMPLETED] A — B");
-    assert.equal(markedText("A — B", "cancelled"), "[CANCELLED] A — B");
-    assert.deepEqual(splitTag("Jane — x ⟨E-7K2QX⟩"), { text: "Jane — x", tag: "E-7K2QX" });
-    assert.deepEqual(splitTag("a line a person typed"), { text: "a line a person typed", tag: null });
-    // A person may type after (or before) the tag: it is still found, and the extra words count as an edit.
-    assert.deepEqual(splitTag("mid ⟨E-7K2QX⟩ not at the end"), { text: "mid not at the end", tag: "E-7K2QX" });
-    assert.ok(sameText("a  b c ", "a b c"));
-    assert.ok(!sameText("a b", "a bc"));
+  test("the tag is the small bracketed order reference", () => {
+    assert.equal(tagFor("E-7K2QX"), "⟨E-7K2QX⟩");
+    assert.equal(withTag("Jane — x", "E-7K2QX"), "Jane — x ⟨E-7K2QX⟩");
   });
 });
 
