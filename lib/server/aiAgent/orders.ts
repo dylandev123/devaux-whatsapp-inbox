@@ -108,6 +108,7 @@ import {
 import { MONITOR_BUDGET_REASON, MONITOR_FAILED_REASONS, MONITOR_FILTERED_PREFIX, MONITOR_GATE_REASONS, monitorEligibleChat, type StaffAction, STAFF_CHANGE_FLAGS, staffFlagFor } from "@/lib/aiAgent/orderMonitor";
 import { BLOCK_REASONS, failureReason, outboxState } from "@/lib/aiAgent/outboxStatus";
 import { agentDb, audit, loadSettings } from "@/lib/server/aiAgent/db";
+import { triggerOrderSync } from "@/lib/server/aiAgent/googleDocs/sync";
 import { enqueue, OutboxInsert, OutboxRow } from "@/lib/server/aiAgent/outbox";
 import { businessLabel, isOutbound } from "@/lib/whatsapp";
 
@@ -1001,7 +1002,11 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     });
     open = await loadOpenOrders(businessSlug, chatId);
   }
-  if (result.applied) result.reasons.push("orders_tracked");
+  if (result.applied) {
+    result.reasons.push("orders_tracked");
+    // Google Docs sync (off unless a business enabled it): a no-op query otherwise; failures never reach the order flow.
+    await triggerOrderSync(businessSlug);
+  }
   return result;
 }
 
@@ -1681,6 +1686,7 @@ export async function updateOrderManually(input: ManualInput): Promise<ManualRes
   if (res.result !== "applied") return fail(404, "Order not found", "not_found");
   await audit(businessSlug, actor, input.adminId, `order.${action}`, { type: "order", id: orderId }, { ref: order.ref_code, changes, ...(actor === "staff" ? { via: "whatsapp" } : {}) });
   const { data: fresh } = await db.from("ai_agent_orders").select(ORDER_COLUMNS).eq("id", orderId).eq("business_slug", businessSlug).maybeSingle();
+  await triggerOrderSync(businessSlug);
   return { ok: true, order: (fresh as TrackedOrder | null) ?? order };
 }
 

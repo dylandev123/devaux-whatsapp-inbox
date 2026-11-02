@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { verifySchedulerSecret } from "@/lib/server/aiAgent/auth";
 import { processDueBatches } from "@/lib/server/aiAgent/decide";
 import { runDueLearningDigests } from "@/lib/server/aiAgent/learningDigest";
+import { runDueGoogleDocSyncs } from "@/lib/server/aiAgent/googleDocs/sync";
 
 // Scheduler entry point: processes every batch whose quiet period or maximum
 // wait has elapsed, plus batches whose worker died (expired lease). Idempotent
@@ -23,7 +24,12 @@ async function run(request: Request) {
       console.error("[cron/ai-agent/batches] learning digests", err);
       return null;
     });
-    return NextResponse.json({ ok: true, ...batches, learningDigests: learning });
+    // Google Docs order sync (only businesses that turned it on): catches order changes made outside a customer turn.
+    const googleDocs = await runDueGoogleDocSyncs().catch((err) => {
+      console.error("[cron/ai-agent/batches] google docs sync", err);
+      return null;
+    });
+    return NextResponse.json({ ok: true, ...batches, learningDigests: learning, googleDocs });
   } catch (err) {
     console.error("[cron/ai-agent/batches]", err);
     return NextResponse.json({ error: "Failed to process batches" }, { status: 500 });

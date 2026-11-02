@@ -8,6 +8,7 @@ import { ActivityPanel } from "@/components/admin/aiAgent/ActivityPanel";
 import { ContactPermissions } from "@/components/admin/aiAgent/ContactPermissions";
 import { ConversationsPanel } from "@/components/admin/aiAgent/ConversationsPanel";
 import { EscalationsPanel } from "@/components/admin/aiAgent/EscalationsPanel";
+import { GoogleDocsPanel } from "@/components/admin/aiAgent/GoogleDocsPanel";
 import { EvaluationPanel } from "@/components/admin/aiAgent/EvaluationPanel";
 import { KnowledgePanel } from "@/components/admin/aiAgent/KnowledgePanel";
 import { MemoryPanel } from "@/components/admin/aiAgent/MemoryPanel";
@@ -24,6 +25,7 @@ const TABS = [
   { id: "knowledge", label: "Knowledge" },
   { id: "escalations", label: "Escalations" },
   { id: "orders", label: "Orders" },
+  { id: "gdocs", label: "Google Docs" },
   { id: "memory", label: "Memory" },
   { id: "takeover", label: "Takeover" },
   { id: "review", label: "Review" },
@@ -55,6 +57,15 @@ export function AiAgentPage() {
   useEffect(() => {
     refreshBusinesses();
   }, [refreshBusinesses]);
+
+  // Returning from Google's consent screen: open the Google Docs tab for the business that started it.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("gdocs")) return;
+    setTab("gdocs");
+    const business = params.get("business");
+    if (business) setBusinessSlug(business);
+  }, []);
 
   useEffect(() => {
     if (!businessSlug) return;
@@ -146,6 +157,7 @@ export function AiAgentPage() {
           {tab === "knowledge" && <KnowledgePanel businessSlug={businessSlug} />}
           {tab === "escalations" && <EscalationsPanel businessSlug={businessSlug} observe={s?.mode === "observe"} />}
           {tab === "orders" && <OrdersPanel businessSlug={businessSlug} settings={s} />}
+          {tab === "gdocs" && <GoogleDocsPanel key={businessSlug} businessSlug={businessSlug} />}
           {tab === "memory" && <MemoryPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "takeover" && <ConversationsPanel businessSlug={businessSlug} chats={chats} />}
           {tab === "review" && <ReviewPanel businessSlug={businessSlug} />}

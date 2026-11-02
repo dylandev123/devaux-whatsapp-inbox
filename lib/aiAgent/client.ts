@@ -662,3 +662,109 @@ export const aiAgentApi = {
   simulate: (b: string, text: string, chatId: string | null) =>
     api<SimulationView>("/api/ai-agent/test", send("POST", { businessSlug: b, text, chatId })),
 };
+
+// ── Google Docs order sync ───────────────────────────────────────────────────
+// Mirrors lib/server/aiAgent/googleDocs/admin.ts (getDashboard / AccessReport / ImportPreview). Admin-only routes.
+export interface GoogleDocsPreviewOrder {
+  id: string;
+  ref_code: string;
+  customer_name: string | null;
+  contact_number: string | null;
+  items: { product: string; quantity: string | null; variant: string | null; size: string | null }[];
+  fulfilment_method: "delivery" | "collection" | null;
+  delivery_address: string | null;
+  requested_for: string | null;
+  notes: string | null;
+  status: string;
+  source: "next" | "sample";
+}
+
+export interface GoogleDocsProblem {
+  id: string;
+  orderId: string;
+  ref: string;
+  state: "conflict" | "pending_review" | "missing" | "failed" | "synced";
+  customer: string | null;
+  orderStatus: string | null;
+  reason: string | null;
+  pendingText: string | null;
+  foundText: string | null;
+  lastText: string | null;
+  attempts: number;
+  error: string | null;
+  updatedAt: string;
+}
+
+export type GoogleDocsDashboard =
+  | { setupPending: true; configured: { oauth: boolean; encryptionKey: boolean } }
+  | {
+      setupPending: false;
+      configured: { oauth: boolean; encryptionKey: boolean };
+      redirectUriHint: string;
+      connection: { email: string; status: "connected" | "revoked" | "error"; error: string | null; scopesOk: boolean; connectedAt: string } | null;
+      settings: {
+        enabled: boolean;
+        documentId: string | null;
+        documentTitle: string | null;
+        canEdit: boolean;
+        accessVerifiedAt: string | null;
+        format: import("@/lib/aiAgent/gdocFormat").FormatConfig;
+        insertion: import("@/lib/aiAgent/gdocDocument").Insertion;
+        onCompleted: "leave" | "mark" | "remove";
+        onCancelled: "leave" | "mark" | "remove";
+        onCorrected: "update" | "review";
+        includeIncomplete: boolean;
+        syncSince: string | null;
+        sectionCreatedAt: string | null;
+        lastSyncAt: string | null;
+        health: "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "section_problem" | "error";
+        lastError: string | null;
+      };
+      counts: Record<string, number>;
+      problems: GoogleDocsProblem[];
+      previewOrders: GoogleDocsPreviewOrder[];
+    };
+
+export interface GoogleDocsAccess {
+  documentId: string;
+  title: string;
+  canEdit: boolean;
+  account: string;
+  section: "none" | "found" | "broken";
+  sectionMessage: string | null;
+  position: { ok: true; where: string } | { ok: false; reason: string } | null;
+  lineCount: number;
+}
+
+export interface GoogleDocsSyncResult {
+  status: string;
+  inserted: number;
+  updated: number;
+  removed: number;
+  held: number;
+  failed: number;
+  message?: string;
+}
+
+export interface GoogleDocsImportPreview {
+  items: { orderId: string; ref: string; line: string; missing: string[]; createdAt: string }[];
+  skipped: { ref: string; reason: string }[];
+}
+
+const gdocs = <T>(businessSlug: string, action: string, extra: Record<string, unknown> = {}) =>
+  api<T>("/api/ai-agent/google-docs", send("POST", { businessSlug, action, ...extra }));
+
+export const googleDocsApi = {
+  get: (b: string) => api<GoogleDocsDashboard>(`/api/ai-agent/google-docs${q(b)}`),
+  connectUrl: (b: string) => `/api/ai-agent/google-docs/connect${q(b)}`,
+  setDocument: (b: string, input: string) => gdocs<{ access: GoogleDocsAccess }>(b, "set_document", { input }),
+  testAccess: (b: string) => gdocs<{ access: GoogleDocsAccess }>(b, "test_access"),
+  saveConfig: (b: string, config: Record<string, unknown>) => gdocs<{ ok: true }>(b, "save_config", { config }),
+  setEnabled: (b: string, enabled: boolean) => gdocs<{ ok: true }>(b, "set_enabled", { enabled }),
+  syncNow: (b: string) => gdocs<{ result: GoogleDocsSyncResult }>(b, "sync_now"),
+  importPreview: (b: string) => gdocs<{ preview: GoogleDocsImportPreview }>(b, "import_preview"),
+  importCommit: (b: string, orderIds: string[]) => gdocs<{ result: GoogleDocsSyncResult }>(b, "import_commit", { orderIds, confirm: true }),
+  resolve: (b: string, lineId: string, resolution: "overwrite" | "keep" | "readd" | "ignore" | "retry") => gdocs<{ result: GoogleDocsSyncResult | { status: "ok" } }>(b, "resolve", { lineId, resolution }),
+  retryAll: (b: string) => gdocs<{ result: GoogleDocsSyncResult }>(b, "retry_all"),
+  disconnect: (b: string) => gdocs<{ ok: true }>(b, "disconnect"),
+};

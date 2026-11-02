@@ -27,7 +27,8 @@ test("no in-memory timers anywhere in the scheduling or decision code", () => {
     "lib/server/aiAgent/decide.ts",
     "lib/server/aiAgent/scheduler.ts",
     "app/api/cron/ai-agent/batches/route.ts",
-    ...readdirSync(join(process.cwd(), "lib/server/aiAgent")).map((f) => `lib/server/aiAgent/${f}`),
+    // Every source file under lib/server/aiAgent, including subdirectories (googleDocs/).
+    ...(readdirSync(join(process.cwd(), "lib/server/aiAgent"), { recursive: true }) as string[]).filter((f) => f.endsWith(".ts")).map((f) => `lib/server/aiAgent/${f}`),
   ];
   for (const f of new Set(files)) assert.doesNotMatch(read(f), /\bsetTimeout\s*\(|\bsetInterval\s*\(/, `${f} must not use timers`);
 });
