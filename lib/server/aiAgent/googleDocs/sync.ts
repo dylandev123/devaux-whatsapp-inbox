@@ -111,6 +111,10 @@ export function describeError(err: unknown): { health: Health; message: string }
         return { health: "error", message: "Google is rate-limiting requests. It will retry on the next run." };
       case "precondition":
         return { health: "error", message: "The document kept changing while syncing. It will retry on the next run." };
+      case "timeout":
+        return { health: "error", message: `Google took too long to answer (${err.op ?? "request"} timed out). Nothing was changed. Try again in a moment; if it keeps happening, check status.cloud.google.com.` };
+      case "network":
+        return { health: "error", message: `Could not reach Google (${err.op ?? "request"}). Nothing was changed. Try again in a moment.` };
       default:
         return { health: "error", message: `Google error: ${err.message.slice(0, 200)}` };
     }

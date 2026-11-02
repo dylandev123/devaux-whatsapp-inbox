@@ -18,18 +18,21 @@ export const GOOGLE_SCOPES = [
 ] as const;
 export const REQUIRED_SCOPES = ["https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/drive.metadata.readonly"] as const;
 
-export type GoogleErrorKind = "invalid_grant" | "forbidden" | "insufficient_scope" | "api_disabled" | "not_found" | "precondition" | "rate_limited" | "server" | "network" | "bad_request";
+export type GoogleErrorKind = "invalid_grant" | "forbidden" | "insufficient_scope" | "api_disabled" | "not_found" | "precondition" | "rate_limited" | "server" | "network" | "timeout" | "bad_request";
 
 export class GoogleApiError extends Error {
   kind: GoogleErrorKind;
   status: number;
   /** Google's machine-readable reason(s), e.g. "SERVICE_DISABLED" — for logs and diagnosis. Never contains credentials. */
   reasons: string[];
-  constructor(kind: GoogleErrorKind, status: number, message: string, reasons: string[] = []) {
+  /** Which Google call failed ("token refresh", "Drive metadata", "Docs read", ...) — set for timeouts and network failures. */
+  op?: string;
+  constructor(kind: GoogleErrorKind, status: number, message: string, reasons: string[] = [], op?: string) {
     super(message);
     this.kind = kind;
     this.status = status;
     this.reasons = reasons;
+    this.op = op;
   }
 }
 
@@ -59,7 +62,9 @@ export function oauthConfig(): GoogleOAuthConfig | null {
   return clientId && clientSecret ? { clientId, clientSecret } : null;
 }
 
-const TIMEOUT_MS = 12_000;
+// Per attempt. Worst case for the access test is the token refresh plus the (parallel) Drive and Docs reads, i.e. 2 x
+// TIMEOUT_MS, well inside the 60 s function limit (maxDuration on the google-docs route).
+export const TIMEOUT_MS = 20_000;
 const DOC_MIME = "application/vnd.google-apps.document";
 
 // Google reports the cause of a 403 in several places: error.errors[].reason (Drive v3), error.details[].reason (ErrorInfo,
@@ -93,16 +98,34 @@ export function classify(status: number, body: unknown): GoogleApiError {
   return make("bad_request");
 }
 
-async function call(fetchImpl: typeof fetch, url: string, init: RequestInit): Promise<unknown> {
-  let res: Response;
-  try {
-    res = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS), cache: "no-store" });
-  } catch (err) {
-    throw new GoogleApiError("network", 0, err instanceof Error ? err.message : "Could not reach Google");
+const isTimeout = (err: unknown) => err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+
+/** One bounded request. Logs only the operation label, host, status and duration — never a URL path (document id), token or body. */
+async function call(fetchImpl: typeof fetch, url: string, init: RequestInit, op = "request"): Promise<unknown> {
+  const host = new URL(url).host;
+  // Only idempotent reads are retried, and only after a FAST connection failure; a timeout is never retried (it would
+  // double the wait and could exceed the function limit).
+  const retriable = (init.method ?? "GET") === "GET" || op === "token refresh";
+  for (let attempt = 1; ; attempt++) {
+    const started = Date.now();
+    let res: Response;
+    try {
+      res = await fetchImpl(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS), cache: "no-store" });
+    } catch (err) {
+      const ms = Date.now() - started;
+      if (isTimeout(err)) {
+        console.error("[google-docs call]", `op=${op} host=${host} outcome=timeout after_ms=${ms} limit_ms=${TIMEOUT_MS} attempt=${attempt}`);
+        throw new GoogleApiError("timeout", 0, `Google did not answer the ${op} request within ${TIMEOUT_MS / 1000} seconds`, [], op);
+      }
+      console.error("[google-docs call]", `op=${op} host=${host} outcome=network after_ms=${ms} attempt=${attempt}`);
+      if (retriable && attempt < 2) continue;
+      throw new GoogleApiError("network", 0, err instanceof Error ? err.message : "Could not reach Google", [], op);
+    }
+    const body = await res.json().catch(() => null);
+    console.info("[google-docs call]", `op=${op} host=${host} status=${res.status} ms=${Date.now() - started}`);
+    if (!res.ok) throw classify(res.status, body);
+    return body;
   }
-  const body = await res.json().catch(() => null);
-  if (!res.ok) throw classify(res.status, body);
-  return body;
 }
 
 // ── OAuth ────────────────────────────────────────────────────────────────────
@@ -136,7 +159,7 @@ export async function exchangeCode(cfg: GoogleOAuthConfig, code: string, redirec
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: tokenBody(cfg, { code, redirect_uri: redirectUri, grant_type: "authorization_code", code_verifier: verifier }),
-  })) as { access_token?: string; refresh_token?: string; scope?: string };
+  }, "code exchange")) as { access_token?: string; refresh_token?: string; scope?: string };
   if (!body.access_token) throw new GoogleApiError("bad_request", 400, "Google did not return an access token");
   return { accessToken: body.access_token, refreshToken: body.refresh_token ?? null, scopes: (body.scope ?? "").split(/\s+/).filter(Boolean) };
 }
@@ -146,7 +169,7 @@ export async function refreshAccessToken(cfg: GoogleOAuthConfig, refreshToken: s
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: tokenBody(cfg, { refresh_token: refreshToken, grant_type: "refresh_token" }),
-  })) as { access_token?: string };
+  }, "token refresh")) as { access_token?: string };
   if (!body.access_token) throw new GoogleApiError("invalid_grant", 400, "Google did not return an access token");
   return body.access_token;
 }
@@ -156,11 +179,11 @@ export async function revokeToken(token: string, fetchImpl: typeof fetch = fetch
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ token }),
-  });
+  }, "token revoke");
 }
 
 export async function fetchAccountEmail(accessToken: string, fetchImpl: typeof fetch = fetch): Promise<string> {
-  const body = (await call(fetchImpl, "https://openidconnect.googleapis.com/v1/userinfo", { headers: { Authorization: `Bearer ${accessToken}` } })) as { email?: string };
+  const body = (await call(fetchImpl, "https://openidconnect.googleapis.com/v1/userinfo", { headers: { Authorization: `Bearer ${accessToken}` } }, "account lookup")) as { email?: string };
   if (!body.email) throw new GoogleApiError("bad_request", 400, "Google did not share the account email");
   return body.email;
 }
@@ -171,7 +194,7 @@ export function docsClient(accessToken: string, fetchImpl: typeof fetch = fetch)
   const id = (documentId: string) => encodeURIComponent(documentId);
   return {
     async getFile(documentId) {
-      const f = (await call(fetchImpl, `https://www.googleapis.com/drive/v3/files/${id(documentId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,trashed,capabilities(canEdit)")}`, { headers: auth })) as {
+      const f = (await call(fetchImpl, `https://www.googleapis.com/drive/v3/files/${id(documentId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,trashed,capabilities(canEdit)")}`, { headers: auth }, "Drive metadata")) as {
         id: string;
         name: string;
         mimeType: string;
@@ -181,14 +204,14 @@ export function docsClient(accessToken: string, fetchImpl: typeof fetch = fetch)
       return { id: f.id, name: f.name, mimeType: f.mimeType, trashed: f.trashed === true, canEdit: f.capabilities?.canEdit === true };
     },
     async getDocument(documentId) {
-      return (await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(documentId)}`, { headers: auth })) as GoogleDocument;
+      return (await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(documentId)}`, { headers: auth }, "Docs read")) as GoogleDocument;
     },
     async batchUpdate(documentId, requests, requiredRevisionId) {
       await call(fetchImpl, `https://docs.googleapis.com/v1/documents/${id(documentId)}:batchUpdate`, {
         method: "POST",
         headers: { ...auth, "Content-Type": "application/json" },
         body: JSON.stringify({ requests, ...(requiredRevisionId ? { writeControl: { requiredRevisionId } } : {}) }),
-      });
+      }, "Docs write");
     },
   };
 }

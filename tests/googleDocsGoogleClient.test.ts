@@ -121,3 +121,38 @@ describe("403 causes are told apart (permission, scope, disabled API)", () => {
     assert.equal(k(500, { message: "x" }), "server");
   });
 });
+
+describe("Google call timeouts and network failures", () => {
+  const timeoutErr = () => Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+
+  test("a timeout is its own error kind, names the operation and is not retried", async () => {
+    let n = 0;
+    const impl = (async () => { n++; throw timeoutErr(); }) as unknown as typeof fetch;
+    const err = await refreshAccessToken(cfg, "RT", impl).catch((e) => e);
+    assert.ok(err instanceof GoogleApiError);
+    assert.equal(err.kind, "timeout");
+    assert.equal(err.op, "token refresh");
+    assert.equal(n, 1);
+    assert.ok(!err.message.includes("RT") && !err.message.includes("shh"));
+  });
+
+  test("Drive and Docs timeouts are told apart", async () => {
+    const impl = (async () => { throw timeoutErr(); }) as unknown as typeof fetch;
+    const c = docsClient("AT", impl);
+    assert.equal(((await c.getFile("doc1").catch((e) => e)) as GoogleApiError).op, "Drive metadata");
+    assert.equal(((await c.getDocument("doc1").catch((e) => e)) as GoogleApiError).op, "Docs read");
+  });
+
+  test("a fast connection failure on a read is retried once; a write never is", async () => {
+    let n = 0;
+    const flaky = (async () => { n++; if (n === 1) throw new TypeError("fetch failed"); return new Response(JSON.stringify({ access_token: "AT" }), { status: 200 }); }) as unknown as typeof fetch;
+    assert.equal(await refreshAccessToken(cfg, "RT", flaky), "AT");
+    assert.equal(n, 2);
+    let w = 0;
+    const down = (async () => { w++; throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
+    const err = await docsClient("AT", down).batchUpdate("doc1", []).catch((e) => e);
+    assert.equal(err.kind, "network");
+    assert.equal(w, 1);
+  });
+
+});

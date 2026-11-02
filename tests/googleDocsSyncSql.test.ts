@@ -13,6 +13,7 @@ import { pgAvailable, TestPg } from "./helpers/pgHarness.ts";
 import { pgSupabase } from "./helpers/pgSupabase.ts";
 import { FakeApiError, FakeGoogleDoc } from "./helpers/fakeGoogleDoc.ts";
 import { fakeClient } from "./helpers/fakeDocsClient.ts";
+import { GoogleApiError } from "../lib/server/aiAgent/googleDocs/google.ts";
 
 register("./helpers/tsLoader.mjs", import.meta.url, { data: { root: process.cwd() } });
 
@@ -127,6 +128,19 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     assert.equal(dash.setupPending, false);
     if (!dash.setupPending) assert.equal(dash.settings.enabled, false);
     await noWhatsapp();
+  });
+
+  test("a Google timeout or outage during the access test gives a distinct message, a 504 for timeouts, and saves nothing", async () => {
+    const slow = { ...client, getDocument: async () => { throw new GoogleApiError("timeout", 0, "x", [], "Docs read"); } };
+    client = slow as never;
+    const t = await admin.setDocument(A, LINK_A, USER).catch((e: any) => e);
+    assert.equal(t.status, 504);
+    assert.match(t.message, /too long.*Docs read timed out.*Nothing was changed/);
+    client = { ...fakeClient(docs), getFile: async () => { throw new GoogleApiError("network", 0, "x", [], "Drive metadata"); } } as never;
+    const n = await admin.setDocument(A, LINK_A, USER).catch((e: any) => e);
+    assert.equal(n.status, 400);
+    assert.match(n.message, /Could not reach Google.*Drive metadata/);
+    assert.equal((await settingsRow())?.document_id ?? null, null, "a failed test saves no document");
   });
 
   test("pasting a link tests access WITHOUT writing; a view-only or non-Doc file is refused for sync", async () => {

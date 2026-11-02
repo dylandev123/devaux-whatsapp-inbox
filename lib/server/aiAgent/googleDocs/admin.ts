@@ -174,10 +174,17 @@ export interface AccessReport {
 /** Reads the document with the connected account. Never writes. */
 export async function checkAccess(businessSlug: string, documentId: string, insertion: Insertion): Promise<AccessReport> {
   const { client, email } = await openClient(businessSlug);
-  const file = await client.getFile(documentId);
+  // Independent reads, so run them together. A Docs failure only matters once Drive says this really is a document.
+  const docRead = client.getDocument(documentId).then((d) => ({ d }), (e: unknown) => ({ e }));
+  const file = await client.getFile(documentId).catch(async (err) => {
+    await docRead;
+    throw err;
+  });
   if (!isGoogleDocFile(file)) throw new AdminError("That link is not a Google Docs document (it is another kind of Drive file).");
   if (file.trashed) throw new AdminError("That document is in the trash.");
-  const doc = await client.getDocument(documentId);
+  const read = await docRead;
+  if ("e" in read) throw read.e;
+  const doc = read.d;
   const section = findSection(doc, businessSlug);
   const position = section.kind === "none" ? resolvePosition(doc, insertion) : null;
   return {
@@ -196,7 +203,7 @@ function accessError(err: unknown): AdminError {
   if (err instanceof AdminError) return err;
   const { message } = describeError(err);
   if (err instanceof GoogleApiError) console.error("[google-docs access]", `kind=${err.kind} status=${err.status} reasons=${err.reasons.join(",")} message=${err.message.slice(0, 300)}`);
-  return new AdminError(message, err instanceof GoogleApiError && err.kind === "not_found" ? 404 : 400);
+  return new AdminError(message, err instanceof GoogleApiError && err.kind === "not_found" ? 404 : err instanceof GoogleApiError && err.kind === "timeout" ? 504 : 400);
 }
 
 export async function setDocument(businessSlug: string, input: string, userId: string): Promise<AccessReport> {
