@@ -3,7 +3,7 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { buildAuthUrl, docsClient, exchangeCode, fetchAccountEmail, GOOGLE_SCOPES, GoogleApiError, refreshAccessToken, REQUIRED_SCOPES, revokeToken } from "../lib/server/aiAgent/googleDocs/google.ts";
+import { classify, buildAuthUrl, docsClient, exchangeCode, fetchAccountEmail, GOOGLE_SCOPES, GoogleApiError, refreshAccessToken, REQUIRED_SCOPES, revokeToken } from "../lib/server/aiAgent/googleDocs/google.ts";
 
 const cfg = { clientId: "client-id.apps.googleusercontent.com", clientSecret: "shh" };
 type Call = { url: string; method: string; headers: Record<string, string>; body: string | null };
@@ -98,5 +98,26 @@ describe("Google OAuth and API calls", () => {
     await revokeToken("RT", f.impl);
     assert.equal(f.calls[0].url, "https://oauth2.googleapis.com/revoke");
     assert.equal(new URLSearchParams(f.calls[0].body!).get("token"), "RT");
+  });
+});
+
+describe("403 causes are told apart (permission, scope, disabled API)", () => {
+  const k = (status: number, error: unknown) => classify(status, { error }).kind;
+  test("genuine file permission denial stays forbidden", () => {
+    assert.equal(k(403, { message: "The caller does not have permission", status: "PERMISSION_DENIED" }), "forbidden");
+    assert.equal(k(403, { message: "The user does not have sufficient permissions for this file.", errors: [{ reason: "insufficientFilePermissions" }] }), "forbidden");
+  });
+  test("an insufficient OAuth scope is its own kind", () => {
+    assert.equal(k(403, { message: "Request had insufficient authentication scopes.", status: "PERMISSION_DENIED", details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "ACCESS_TOKEN_SCOPE_INSUFFICIENT" }] }), "insufficient_scope");
+    assert.equal(k(403, { message: "Request had insufficient authentication scopes.", errors: [{ reason: "insufficientPermissions" }] }), "insufficient_scope");
+  });
+  test("a disabled Google API is not reported as a permission problem", () => {
+    assert.equal(k(403, { message: "Google Drive API has not been used in project 1 before or it is disabled.", status: "PERMISSION_DENIED", details: [{ reason: "SERVICE_DISABLED" }] }), "api_disabled");
+    assert.equal(k(403, { message: "Drive API disabled", errors: [{ reason: "accessNotConfigured" }] }), "api_disabled");
+  });
+  test("rate limits by reason, and 404 / 5xx unchanged", () => {
+    assert.equal(k(403, { message: "x", errors: [{ reason: "userRateLimitExceeded" }] }), "rate_limited");
+    assert.equal(k(404, { message: "File not found" }), "not_found");
+    assert.equal(k(500, { message: "x" }), "server");
   });
 });

@@ -717,7 +717,7 @@ export type GoogleDocsDashboard =
         syncSince: string | null;
         sectionCreatedAt: string | null;
         lastSyncAt: string | null;
-        health: "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "section_problem" | "error";
+        health: "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "insufficient_scope" | "section_problem" | "error";
         lastError: string | null;
       };
       counts: Record<string, number>;

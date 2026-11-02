@@ -18,15 +18,18 @@ export const GOOGLE_SCOPES = [
 ] as const;
 export const REQUIRED_SCOPES = ["https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/drive.metadata.readonly"] as const;
 
-export type GoogleErrorKind = "invalid_grant" | "forbidden" | "not_found" | "precondition" | "rate_limited" | "server" | "network" | "bad_request";
+export type GoogleErrorKind = "invalid_grant" | "forbidden" | "insufficient_scope" | "api_disabled" | "not_found" | "precondition" | "rate_limited" | "server" | "network" | "bad_request";
 
 export class GoogleApiError extends Error {
   kind: GoogleErrorKind;
   status: number;
-  constructor(kind: GoogleErrorKind, status: number, message: string) {
+  /** Google's machine-readable reason(s), e.g. "SERVICE_DISABLED" — for logs and diagnosis. Never contains credentials. */
+  reasons: string[];
+  constructor(kind: GoogleErrorKind, status: number, message: string, reasons: string[] = []) {
     super(message);
     this.kind = kind;
     this.status = status;
+    this.reasons = reasons;
   }
 }
 
@@ -59,19 +62,35 @@ export function oauthConfig(): GoogleOAuthConfig | null {
 const TIMEOUT_MS = 12_000;
 const DOC_MIME = "application/vnd.google-apps.document";
 
-function classify(status: number, body: unknown): GoogleApiError {
+// Google reports the cause of a 403 in several places: error.errors[].reason (Drive v3), error.details[].reason (ErrorInfo,
+// e.g. SERVICE_DISABLED / ACCESS_TOKEN_SCOPE_INSUFFICIENT) and error.status. A 403 is NOT always "no permission on the file".
+function errorReasons(err: unknown): string[] {
+  const e = err as { status?: unknown; errors?: { reason?: unknown }[]; details?: { reason?: unknown }[] } | null;
+  if (!e || typeof e !== "object") return [];
+  const out = [e.status, ...(Array.isArray(e.errors) ? e.errors.map((x) => x?.reason) : []), ...(Array.isArray(e.details) ? e.details.map((x) => x?.reason) : [])];
+  return out.filter((r): r is string => typeof r === "string" && r !== "");
+}
+
+export function classify(status: number, body: unknown): GoogleApiError {
   const err = (body as { error?: unknown } | null)?.error;
   const message =
     typeof err === "string" ? err : typeof (err as { message?: unknown } | undefined)?.message === "string" ? ((err as { message: string }).message) : `Google returned ${status}`;
-  const reason = String((err as { status?: unknown } | undefined)?.status ?? "");
-  if (status === 400 && /FAILED_PRECONDITION/i.test(reason)) return new GoogleApiError("precondition", status, message);
-  if (status === 400 && err === "invalid_grant") return new GoogleApiError("invalid_grant", status, "Google access was revoked or expired");
-  if (status === 401) return new GoogleApiError("invalid_grant", status, "Google rejected the credentials");
-  if (status === 403) return new GoogleApiError(/rate|quota/i.test(message) ? "rate_limited" : "forbidden", status, message);
-  if (status === 404) return new GoogleApiError("not_found", status, message);
-  if (status === 429) return new GoogleApiError("rate_limited", status, message);
-  if (status >= 500) return new GoogleApiError("server", status, message);
-  return new GoogleApiError("bad_request", status, message);
+  const reasons = errorReasons(err);
+  const has = (re: RegExp) => reasons.some((r) => re.test(r));
+  const make = (kind: GoogleErrorKind) => new GoogleApiError(kind, status, message, reasons);
+  if (status === 400 && has(/FAILED_PRECONDITION/i)) return make("precondition");
+  if (status === 400 && err === "invalid_grant") return new GoogleApiError("invalid_grant", status, "Google access was revoked or expired", reasons);
+  if (status === 401) return make("invalid_grant");
+  if (status === 403) {
+    if (has(/^(SERVICE_DISABLED|accessNotConfigured)$/)) return make("api_disabled");
+    if (has(/^ACCESS_TOKEN_SCOPE_INSUFFICIENT$/) || /insufficient authentication scopes/i.test(message)) return make("insufficient_scope");
+    if (has(/^(rateLimitExceeded|userRateLimitExceeded|quotaExceeded|dailyLimitExceeded|RATE_LIMIT_EXCEEDED|RESOURCE_EXHAUSTED)$/) || /rate limit|quota/i.test(message)) return make("rate_limited");
+    return make("forbidden");
+  }
+  if (status === 404) return make("not_found");
+  if (status === 429) return make("rate_limited");
+  if (status >= 500) return make("server");
+  return make("bad_request");
 }
 
 async function call(fetchImpl: typeof fetch, url: string, init: RequestInit): Promise<unknown> {

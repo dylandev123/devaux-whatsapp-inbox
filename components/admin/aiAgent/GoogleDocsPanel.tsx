@@ -20,6 +20,7 @@ const HEALTH_TEXT: Record<Settings["health"], string> = {
   needs_reconnect: "Google needs to be reconnected",
   no_access: "No edit access to the document",
   doc_not_found: "Document not found",
+  insufficient_scope: "Google permission missing — reconnect",
   section_problem: "AI section needs attention",
   error: "Last sync failed",
 };

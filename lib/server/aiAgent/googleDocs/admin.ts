@@ -195,6 +195,7 @@ export async function checkAccess(businessSlug: string, documentId: string, inse
 function accessError(err: unknown): AdminError {
   if (err instanceof AdminError) return err;
   const { message } = describeError(err);
+  if (err instanceof GoogleApiError) console.error("[google-docs access]", `kind=${err.kind} status=${err.status} reasons=${err.reasons.join(",")} message=${err.message.slice(0, 300)}`);
   return new AdminError(message, err instanceof GoogleApiError && err.kind === "not_found" ? 404 : 400);
 }
 

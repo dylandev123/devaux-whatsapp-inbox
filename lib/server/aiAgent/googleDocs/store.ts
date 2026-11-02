@@ -14,7 +14,7 @@ export function isSchemaPending(err: unknown): boolean {
   return ["42P01", "42883", "PGRST205", "PGRST202"].includes(e?.code ?? "") || m.includes("could not find the table") || m.includes("could not find the function") || m.includes("does not exist") || m.includes("schema cache");
 }
 
-export type Health = "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "section_problem" | "error";
+export type Health = "ok" | "needs_reconnect" | "no_access" | "doc_not_found" | "insufficient_scope" | "section_problem" | "error";
 
 export interface GdocSettings {
   business_slug: string;

@@ -100,7 +100,11 @@ export function describeError(err: unknown): { health: Health; message: string }
       case "invalid_grant":
         return { health: "needs_reconnect", message: "Google access was revoked or expired. Reconnect the Google account." };
       case "forbidden":
-        return { health: "no_access", message: "The connected Google account cannot edit this document (or its permission was removed)." };
+        return { health: "no_access", message: "The connected Google account does not have permission to open this document. Share it with that account (edit access), then test again." };
+      case "insufficient_scope":
+        return { health: "insufficient_scope", message: "The Google connection is missing a required permission (Docs or Drive). Disconnect, then connect again and allow every requested permission." };
+      case "api_disabled":
+        return { health: "error", message: "Google API error: the Google Docs or Google Drive API is not enabled for the app’s Google Cloud project. Enable both APIs in Google Cloud Console, then try again." };
       case "not_found":
         return { health: "doc_not_found", message: "Google cannot find this document. It may have been deleted, or the connected account cannot see it." };
       case "rate_limited":
