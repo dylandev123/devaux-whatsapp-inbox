@@ -37,6 +37,7 @@ const MIGRATIONS = [
   "20261111000000_ai_agent_teaching_sessions.sql",
   "20261112000000_ai_agent_google_docs_sync.sql",
   "20261113000000_ai_agent_gdocs_append_only.sql",
+  "20261114000000_ai_agent_south_locations.sql",
 ];
 
 const BOOTSTRAP = `

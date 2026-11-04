@@ -54,7 +54,7 @@ describe("the insert request", () => {
   test("the line is the configured format with the small tag, and indices count UTF-16 units (emoji)", () => {
     const o = order({ customer_name: "Zoë 🐶 Smith", notes: "gate 🔒" });
     const text = formatOrderLine(o, format).text;
-    assert.equal(text, "Zoë 🐶 Smith — +17585550142 — Rodney Bay — 3 × Chicken — gate 🔒");
+    assert.equal(text, "Rodney Bay — Zoë 🐶 Smith — +1 (758) 555-0142 — 3 × Chicken — gate 🔒 — #E-AAAAA");
     const doc = new FakeGoogleDoc("d", [{ text: "Existing 🎉 notes" }]);
     insertOne(doc, text, o.ref_code);
     const [first, second] = doc.paragraphs();

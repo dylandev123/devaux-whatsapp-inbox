@@ -363,6 +363,54 @@ export function turnDrafts(proposal: {
   return out;
 }
 
+const sameText = (a: string | null | undefined, b: string | null | undefined) => norm(a) === norm(b);
+const either = (a: string | null | undefined, b: string | null | undefined) => !norm(a) || !norm(b) || norm(a) === norm(b);
+
+/**
+ * One customer message with several product lines is ONE order. The model sometimes returns each line as its own order
+ * ("2 large bags … for St Remy" and "1 small … for Narural at St Remy"). Drafts that start new orders in the same turn are
+ * folded into the first when nothing says they are different deliveries: the same place (or none), the same day (or none), the same
+ * recipient (or none). A different address, day, recipient, or an explicit reference to an open order keeps them apart.
+ */
+export function mergeSameTurnDrafts<T extends { target: string | null; draft: OrderRequestDraft }>(drafts: T[]): T[] {
+  const isNew = (t: string | null) => t === null || t === "new";
+  const out: T[] = [];
+  for (const d of drafts) {
+    const first = out[0];
+    const joinable =
+      first !== undefined &&
+      isNew(first.target) &&
+      isNew(d.target) &&
+      d.draft.items.length > 0 &&
+      either(first.draft.delivery_address, d.draft.delivery_address) &&
+      either(first.draft.requested_for, d.draft.requested_for) &&
+      either(first.draft.customer_name, d.draft.customer_name) &&
+      either(first.draft.contact_phone, d.draft.contact_phone) &&
+      either(fulfilmentMethod(first.draft.delivery_preference), fulfilmentMethod(d.draft.delivery_preference));
+    if (!joinable) {
+      out.push(d);
+      continue;
+    }
+    const items = [...first.draft.items];
+    for (const item of d.draft.items) if (!items.some((i) => sameLines([toLine(i)], [toLine(item)]))) items.push(item);
+    const notes = [first.draft.notes, d.draft.notes].filter((n): n is string => Boolean(n && n.trim()));
+    out[0] = {
+      ...first,
+      draft: {
+        ...first.draft,
+        items,
+        delivery_address: first.draft.delivery_address ?? d.draft.delivery_address,
+        delivery_preference: first.draft.delivery_preference ?? d.draft.delivery_preference,
+        requested_for: first.draft.requested_for ?? d.draft.requested_for,
+        customer_name: first.draft.customer_name ?? d.draft.customer_name,
+        contact_phone: first.draft.contact_phone ?? d.draft.contact_phone,
+        notes: notes.length ? [...new Set(notes.filter((n, i) => notes.findIndex((m) => sameText(m, n)) === i))].join(" · ") : null,
+      },
+    };
+  }
+  return out;
+}
+
 // ── Status transitions ───────────────────────────────────────────────────────
 
 export interface PlanInput {

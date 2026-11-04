@@ -110,6 +110,8 @@ export interface AgentSettings {
   /** Missed-call rule (lib/aiAgent/missedCalls.ts). Absent/false = off. */
   missed_call_enabled?: boolean | null;
   missed_call_message?: string | null;
+  /** The business's own South Deliveries list (ai_agent_settings.south_locations, migration 20261114000000): [{ group, names[] }]. Null = the built-in table. */
+  south_locations?: unknown;
   missed_call_cooldown_minutes?: number | null;
 }
 
@@ -166,6 +168,11 @@ export interface OrderRequestDraft {
   customer_name?: string | null;
   /** Daily order tracking only: a different number to reach for the delivery ("call my driver on 758…"). Never the sender's own. */
   contact_phone?: string | null;
+  /**
+   * Daily order tracking only: true when the sender is placing this order FOR somebody else (staff, a driver, a relative) and
+   * "customer_name" / "contact_phone" are THAT person's. The server still requires both to be written in the message.
+   */
+  placed_for_other?: boolean;
 }
 
 /** A further, distinct order the same customer turn started (daily order tracking). */
@@ -724,6 +731,7 @@ function parseOrderDraft(order: Record<string, unknown>): OrderRequestDraft {
   const requestedFor = cleanText(order.requested_for, 200);
   const customerName = cleanText(order.customer_name, 80);
   const contactPhone = cleanText(order.contact_phone, 30);
+  const placedForOther = order.placed_for_other === true;
   return {
     items: parseItems(order.items),
     delivery_address: cleanText(order.delivery_address),
@@ -732,6 +740,7 @@ function parseOrderDraft(order: Record<string, unknown>): OrderRequestDraft {
     ...(requestedFor ? { requested_for: requestedFor } : {}),
     ...(customerName ? { customer_name: customerName } : {}),
     ...(contactPhone ? { contact_phone: contactPhone } : {}),
+    ...(placedForOther ? { placed_for_other: true } : {}),
   };
 }
 

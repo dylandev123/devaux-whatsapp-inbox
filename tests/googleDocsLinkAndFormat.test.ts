@@ -61,9 +61,9 @@ describe("parsing a pasted Google Docs link", () => {
 });
 
 describe("the order line format", () => {
-  test("default: Name — Phone — Location — Product/Quantity — Notes", () => {
+  test("default: Location — Name — Phone — Product/Quantity — Notes — Delivery date — Order ref", () => {
     const { text } = formatOrderLine(SAMPLE_ORDER, defaultFormat());
-    assert.equal(text, "Jane Joseph — +17585550142 — Rodney Bay, near Baywalk — 3 × Chicken & rice (5kg), 1 × Puppy kibble — Call on arrival");
+    assert.equal(text, "Rodney Bay, near Baywalk — Jane Joseph — +1 (758) 555-0142 — 3 × Chicken & rice (5kg), 1 × Puppy kibble — Call on arrival — Friday — #E-7K2QX");
   });
 
   test("fields can be switched off, reordered and given another separator", () => {
@@ -90,21 +90,21 @@ describe("the order line format", () => {
   test("a missing detail is shown as a visible placeholder, never guessed", () => {
     const sparse = { ...SAMPLE_ORDER, customer_name: null, contact_number: null, delivery_address: null, fulfilment_method: null, notes: null };
     const { text, missing } = formatOrderLine(sparse, defaultFormat());
-    assert.equal(text, "(no name) — (no phone) — (no location) — 3 × Chicken & rice (5kg), 1 × Puppy kibble");
-    assert.deepEqual(missing, ["Name", "Phone", "Location"]);
+    assert.equal(text, "(no location) — (no name) — (no phone) — 3 × Chicken & rice (5kg), 1 × Puppy kibble — Friday — #E-7K2QX");
+    assert.deepEqual(missing, ["Location", "Name", "Phone"]);
   });
 
   test("an @lid or too-short number is not presented as a phone; collection is not a missing location", () => {
     assert.match(formatOrderLine({ ...SAMPLE_ORDER, contact_number: "12" }, defaultFormat()).text, /\(no phone\)/);
     const pick = formatOrderLine({ ...SAMPLE_ORDER, delivery_address: null, fulfilment_method: "collection" }, defaultFormat());
-    assert.match(pick.text, /— Collection —/);
+    assert.match(pick.text, /^Collection — /);
     assert.deepEqual(pick.missing, []);
   });
 
   test("with placeholders off, missing core details are left out but still reported", () => {
     const f = { ...defaultFormat(), placeholders: false };
     const r = formatOrderLine({ ...SAMPLE_ORDER, contact_number: null, notes: null }, f);
-    assert.equal(r.text, "Jane Joseph — Rodney Bay, near Baywalk — 3 × Chicken & rice (5kg), 1 × Puppy kibble");
+    assert.equal(r.text, "Rodney Bay, near Baywalk — Jane Joseph — 3 × Chicken & rice (5kg), 1 × Puppy kibble — Friday — #E-7K2QX");
     assert.deepEqual(r.missing, ["Phone"]);
   });
 
@@ -137,7 +137,7 @@ describe("the order line format", () => {
     assert.equal(f.fields.length, 8);
     assert.equal(f.separator, "::");
     assert.equal(f.placeholders, true);
-    assert.deepEqual(normalizeFormat({ fields: [{ key: "name", enabled: false }] }).fields.filter((x) => x.enabled).map((x) => x.key), ["name", "phone", "location", "items", "notes"]);
+    assert.deepEqual(normalizeFormat({ fields: [{ key: "name", enabled: false }] }).fields.filter((x) => x.enabled).map((x) => x.key), ["location", "name", "phone", "items", "notes", "date", "ref"]);
     assert.equal(normalizeFormat(null).separator, " — ");
     assert.equal(normalizeFormat({ fields: [{ key: "name", enabled: true }], separator: "   " }).separator, " — ");
     assert.equal(normalizeFormat({ fields: [{ key: "name", enabled: true }], separator: "123456789012" }).separator.length, 8);

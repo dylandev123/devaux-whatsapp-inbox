@@ -74,6 +74,15 @@ whole order; on a confirmed or ambiguous case it is **flagged for staff**, not a
   redelivery cannot post it twice.
 * Products, quantities, variants, sizes, addresses and times are kept only if the customer wrote them.
 
+### The 8 AM post is the same report as `!orders` (Nov 2026)
+
+The scheduled post and a manual `!orders` call the same code (`buildSummaryNow`): a fresh database read at the moment the report is built,
+no snapshot or cache. Every report states when it was built (`🕗 Generated Wed 4 Nov, 8:00 AM`, Saint Lucia time), so an order that
+arrived at 8:14 can be told apart from a bug: it is correctly absent from the 8:00 post and present in the next report. A report still
+waiting in the outbox 15 minutes after it was built (bridge offline) is closed as `stale_reply` and never delivered late; the scheduler
+then builds a fresh one, but only inside the morning catch-up window (6 hours). One post per business per local day is guaranteed by
+the unique run key plus the outbox dedupe key.
+
 ### Order days and `!orders`
 
 **The day an order is for.** `requested_for` keeps the customer's words, resolved to a calendar day when they are

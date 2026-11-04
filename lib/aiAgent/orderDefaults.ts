@@ -16,9 +16,32 @@
 import { DEFAULT_ORDERS_TIMEZONE, localParts, type FulfilmentMethod, type OrderFields, type TrackedOrder } from "./orders.ts";
 import { normalizeText } from "./escalationUpdates.ts";
 import { addDays, requestedDate } from "./orderText.ts";
+import { classifyDeliveryRegion, type RegionConfig } from "./deliveryRegions.ts";
 
 /** Marks a stored day the business rules chose: "Fri 30 Oct (default)" or "Fri 30 Oct (default, morning)". */
 const DEFAULT_DAY = /^(\w{3} \d{1,2} \w{3}) \(default(?:, (.+))?\)$/i;
+
+/**
+ * South deliveries are not daily: the driver goes when there is enough for a run, so no day is assumed for them. A south order
+ * with no day staff or the customer actually gave carries this marker instead of a "(default)" day. "Date to be confirmed (south)"
+ * or "Date to be confirmed (south, morning)". A question such as "when are you next in Soufrière?" is not a date.
+ */
+const SOUTH_PENDING_DAY = /^date to be confirmed \(south(?:, (.+))?\)$/i;
+
+export function isSouthPendingDay(requestedFor: string | null | undefined): boolean {
+  return SOUTH_PENDING_DAY.test((requestedFor ?? "").trim());
+}
+
+/** The stored form of a south order's unconfirmed day; `wording` keeps a time of day or the customer's own words ("when next in Soufrière"). */
+export function southPendingDayText(wording?: string | null): string {
+  const w = (wording ?? "").replace(/[()]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+  return w ? `Date to be confirmed (south, ${w})` : "Date to be confirmed (south)";
+}
+
+/** True when the order goes to a reviewed southern destination (delivery only). */
+export function isSouthDelivery(o: { fulfilment_method?: string | null; delivery_address?: string | null }, regions?: RegionConfig): boolean {
+  return o.fulfilment_method !== "collection" && classifyDeliveryRegion(o.delivery_address, regions).region === "south";
+}
 
 /** Local hour (inclusive) from which an undated order request is for tomorrow. */
 export const DEFAULT_ORDER_CUTOFF_HOUR = 9;
@@ -52,7 +75,9 @@ export type DateSource =
   /** No day was named: the 9 AM business default. */
   | "default"
   /** Words were given but no single day can be read ("next week", "Friday or Saturday"): a person must look. */
-  | "unreadable";
+  | "unreadable"
+  /** A south delivery whose day nobody has confirmed yet: deliberately no day, and not a gap. */
+  | "pending";
 
 export interface EffectiveDate {
   /** YYYY-MM-DD in the business's timezone, or null when `source` is "unreadable". */
@@ -74,6 +99,7 @@ export function defaultedDayText(dateKey: string, wording?: string | null): stri
 
 export function effectiveDate(o: Pick<TrackedOrder, "requested_for" | "first_message_at">, timezone: string = DEFAULT_ORDERS_TIMEZONE): EffectiveDate {
   const text = (o.requested_for ?? "").trim();
+  if (SOUTH_PENDING_DAY.test(text)) return { date: null, source: "pending" };
   if (DEFAULT_DAY.test(text)) {
     const date = requestedDate(text, o.first_message_at, timezone);
     if (date) return { date, source: "default" };
@@ -105,7 +131,8 @@ export function effectiveMethod(o: Pick<TrackedOrder, "fulfilment_method">): Eff
 export function withCreationDefaults(
   fields: OrderFields,
   requestedAtIso: string,
-  timezone: string = DEFAULT_ORDERS_TIMEZONE
+  timezone: string = DEFAULT_ORDERS_TIMEZONE,
+  regions?: RegionConfig
 ): { fields: OrderFields; defaulted: ("fulfilment_method" | "requested_for")[] } {
   const next: OrderFields = { ...fields };
   const defaulted: ("fulfilment_method" | "requested_for")[] = [];
@@ -115,7 +142,12 @@ export function withCreationDefaults(
     defaulted.push("fulfilment_method");
   }
   const day = effectiveDate({ requested_for: next.requested_for, first_message_at: requestedAtIso }, timezone);
-  if (day.source === "default" && !isDefaultedDay(next.requested_for)) {
+  // A south delivery never gets the next-day default (and a day nobody can read is not a gap either): it waits for a confirmed day.
+  if (day.source !== "stated" && day.source !== "pending" && isSouthDelivery(next, regions)) {
+    const wording = isTimeOnlyPhrase(next.requested_for) || day.source === "unreadable" ? next.requested_for : null;
+    next.requested_for = southPendingDayText(wording);
+    defaulted.push("requested_for");
+  } else if (day.source === "default" && !isDefaultedDay(next.requested_for)) {
     const key = defaultOrderDate(requestedAtIso, timezone);
     if (key) {
       next.requested_for = defaultedDayText(key, next.requested_for);
@@ -130,6 +162,11 @@ export function withCreationDefaults(
  * offer the merge for `requested_for`: the stored default with the new wording, or `proposed` unchanged when it names a day.
  */
 export function keepDefaultedDay(current: string | null | undefined, proposed: string | null): string | null {
+  if (isSouthPendingDay(current)) {
+    // Only a day somebody can read replaces "date to be confirmed"; a time of day or an unreadable question changes nothing.
+    if (proposed === null || isTimeOnlyPhrase(proposed)) return null;
+    return requestedDate(proposed, new Date().toISOString(), DEFAULT_ORDERS_TIMEZONE) ? proposed : null;
+  }
   if (!isDefaultedDay(current)) return proposed;
   if (proposed === null) return null;
   if (!isTimeOnlyPhrase(proposed)) return proposed;

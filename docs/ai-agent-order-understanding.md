@@ -108,6 +108,30 @@ district geography, kept deliberately short (district seats plus localities I am
 `AI_AGENT_SOUTH_LOCATIONS_JSON` (`{"south":[{"group":"Laborie","names":["Laborie"]}],"ambiguous":[…],"nonSouth":[…]}`); a malformed value
 falls back to the built-in table and can never switch the safeguards off.
 
+### South Deliveries are not daily (Nov 2026)
+
+A delivery to a South destination never gets the "tomorrow" default. Its day stays **Date to be confirmed (south)** until the customer
+or staff name a real one; it is listed under **🧭 South Deliveries — date to be confirmed** in `!orders` and the 8 AM post, is never
+"overdue", "day not clear" or "missing a day", and a question such as "When are you next in Soufrière?" is not a date. Dennery is a
+South destination (alongside Vieux Fort, Choiseul, Laborie, Soufrière and Micoud). The list is edited in **AI agent → Setup → South
+Deliveries** (stored in `ai_agent_settings.south_locations`, migration `20261114000000`; until it is run the built-in list is used). An
+address such as "St Remy" is completed with the South destination the same message names ("St Remy, Soufrière"). A staff-set day
+(`!order #REF delivery Thu 5 Nov`) turns it into an ordinary dated south order. Existing orders are not rewritten.
+
+## One message, one order; numbers belong to their product (Nov 2026)
+
+* Several product lines in one customer message are one order. Separate orders in one message are kept only when the place, the day or
+  the recipient differ, or the model names an open order (`mergeSameTurnDrafts`).
+* Each number is checked against the product it stands in front of (`lib/aiAgent/orderLines.ts`): "Need 2 case acid 10 lbs cal hypo" is
+  2 × acid (case) and 1 × cal hypo (10 lbs). A weight is a size, never a quantity; a size with no count is one item; no count and no size
+  stays unknown and staff are asked. "(damaged)" after a product is that product's variant.
+* "Bill to <name>" is kept in the notes as `Bill to Anthony Macnamara`; a payment line (`$155 Paid in store`) is kept as written.
+* A sign-off ("Thanks / Louise") is the sender's own name. It is kept in the notes beside the WhatsApp name
+  (`Signed by Louise (WhatsApp name: Tara)`); the verified contact name and the customer's profile are never replaced.
+* **Ordering for somebody else.** A name line followed by a phone line (or the model flagging `placed_for_other` with a name and phone the
+  sender wrote) makes that person the delivery customer: name and phone on the order, `Placed by <sender> (<sender phone>)` last in the
+  notes. The sender's own profile is never touched and later messages from the sender do not replace the recipient.
+
 ## Reviewing existing orders (read-only)
 
 Orders → **Check orders against their conversations** (`GET /api/ai-agent/orders/review`, admin only) loads each outstanding order's stored

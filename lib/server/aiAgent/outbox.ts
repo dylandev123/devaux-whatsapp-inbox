@@ -140,7 +140,37 @@ export async function outboxForEvent(eventId: string): Promise<OutboxRow[]> {
   return (data ?? []) as OutboxRow[];
 }
 
+/** An order report (the 8 AM post, or an !orders answer) still waiting to be collected this long after it was built is out of date. */
+export const STALE_REPORT_AFTER_MS = 15 * 60_000;
+/** The outbox keys of order reports: the scheduled/manual summary and an !orders answer. Everything else is a message that stays valid. */
+export const ORDER_REPORT_KEY_PREFIXES = ["ordersummary:", "ordersview:"] as const;
+
+/**
+ * A report is a picture of the orders at one moment. If the bridge was offline and could not collect it, it must not be posted
+ * hours later as if it were current: it is closed as not sent ("stale_reply", a recognised intentional block) and, for the morning
+ * summary, the scheduler builds a fresh one (runScheduledSummary sees an unsent run and queues a new report from the database).
+ * Returns how many were closed.
+ */
+export async function expireStaleReports(now: Date = new Date()): Promise<number> {
+  const cutoff = new Date(now.getTime() - STALE_REPORT_AFTER_MS).toISOString();
+  let closed = 0;
+  for (const prefix of ORDER_REPORT_KEY_PREFIXES) {
+    const { data, error } = await agentDb()
+      .from("ai_agent_outbox")
+      .update({ status: "failed", error: "stale_reply: this order report waited more than 15 minutes to be sent, so it was not posted (its orders may have changed)" })
+      .eq("status", "pending")
+      .like("dedupe_key", `${prefix}%`)
+      .lt("created_at", cutoff)
+      .select("id");
+    if (error) throw new Error(error.message);
+    closed += (data ?? []).length;
+  }
+  return closed;
+}
+
 export async function claimOutbox(businessSlug: string | null, limit: number): Promise<BridgeOutboxItem[]> {
+  // Never hand out an old order report; it would show yesterday's list as today's.
+  await expireStaleReports().catch((err) => console.error("[aiAgent] expireStaleReports", err instanceof Error ? err.message : err));
   const { data, error } = await agentDb().rpc("claim_ai_agent_outbox", {
     p_business_slug: businessSlug,
     p_limit: limit,

@@ -16,6 +16,7 @@ import { OrdersPanel } from "@/components/admin/aiAgent/OrdersPanel";
 import { RoutingPanel } from "@/components/admin/aiAgent/RoutingPanel";
 import { ReviewPanel } from "@/components/admin/aiAgent/ReviewPanel";
 import { SettingsCard } from "@/components/admin/aiAgent/SettingsCard";
+import { SouthDeliveriesCard } from "@/components/admin/aiAgent/SouthDeliveriesCard";
 import { TestConsole } from "@/components/admin/aiAgent/TestConsole";
 import { inputClass, Notice } from "@/components/admin/aiAgent/ui";
 
@@ -150,6 +151,8 @@ export function AiAgentPage() {
           {tab === "setup" && (
             <>
               <SettingsCard key={`${businessSlug}:${s.updated_at}`} businessSlug={businessSlug} data={data} onSaved={onSettingsSaved} />
+              <SouthDeliveriesCard key={`south:${businessSlug}:${s.updated_at}`} businessSlug={businessSlug} data={data} onSaved={onSettingsSaved} />
+              <SouthDeliveriesCard key={`south:${businessSlug}:${s.updated_at}`} businessSlug={businessSlug} data={data} onSaved={onSettingsSaved} />
               <ContactPermissions businessSlug={businessSlug} scope={s.contact_scope} onScopeSaved={onSettingsSaved} />
             </>
           )}

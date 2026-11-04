@@ -6,10 +6,11 @@ import { validateBatchWindow } from "@/lib/aiAgent/batching";
 import { isValidTimezone } from "@/lib/aiAgent/orders";
 import { normalizeGroupJid } from "@/lib/aiAgent/chatDirectory";
 import { validateMissedCallConfig } from "@/lib/aiAgent/missedCalls";
+import { parseSouthLocationsText } from "@/lib/aiAgent/deliveryRegions";
 import { parseRoutingRules, type RoutedCategory, routedGroups, validateRoutingRules } from "@/lib/aiAgent/routing";
 import { loadBusinessChats } from "@/lib/server/aiAgent/chats";
 import { jsonError, readJson, requireAdmin } from "@/lib/server/aiAgent/auth";
-import { agentDb, audit, ensureSettings, isMissingColumn, LEGACY_SETTINGS_COLUMNS, loadSettings, NEW_SETTINGS_COLUMNS, resolveBusinessSlug, SETTINGS_COLUMNS } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, ensureSettings, isMissingColumn, LEGACY_SETTINGS_COLUMNS, loadSettings, NEW_SETTINGS_COLUMNS, NO_SOUTH_SETTINGS_COLUMNS, resolveBusinessSlug, ROUTING_SETTINGS_COLUMNS, SETTINGS_COLUMNS, SOUTH_SETTINGS_COLUMNS } from "@/lib/server/aiAgent/db";
 import { getAiSettings } from "@/lib/server/aiSettings";
 
 // Admin-only (middleware.ts ADMIN_API_PREFIXES + requireAdmin()).
@@ -71,6 +72,7 @@ interface Payload {
   missedCallEnabled?: unknown;
   missedCallMessage?: unknown;
   missedCallCooldownMinutes?: unknown;
+  southLocationsText?: unknown;
 }
 
 /** Every group another business already uses (staff, orders or a routing rule): a routed group is never shared across businesses. */
@@ -264,6 +266,14 @@ export async function PUT(request: Request) {
     if (checked.message !== undefined) patch.missed_call_message = checked.message;
     if (checked.cooldownMinutes !== undefined) patch.missed_call_cooldown_minutes = checked.cooldownMinutes;
   }
+  if (body.southLocationsText !== undefined) {
+    if (body.southLocationsText === null || (typeof body.southLocationsText === "string" && body.southLocationsText.trim() === "")) patch.south_locations = null;
+    else if (typeof body.southLocationsText === "string") {
+      const parsed = parseSouthLocationsText(body.southLocationsText);
+      if (!parsed.ok) return jsonError(parsed.error, 400);
+      patch.south_locations = parsed.locations;
+    } else return jsonError("southLocationsText must be text", 400);
+  }
   if (body.staffAuthorizedSenders !== undefined) {
     // Verified WhatsApp identities only: phone numbers or exact …@lid ids — never names.
     const parsed = parseAuthorizedSenders(body.staffAuthorizedSenders);
@@ -287,7 +297,10 @@ export async function PUT(request: Request) {
     const write = (columns: string) => agentDb().from("ai_agent_settings").update(patch).eq("business_slug", businessSlug).select(columns).single();
     let { data, error } = await write(SETTINGS_COLUMNS);
     // The page keeps working before migration 20261110000000 is run (the new settings simply cannot be saved yet).
-    if (error && isMissingColumn(error) && !Object.keys(patch).some((k) => (NEW_SETTINGS_COLUMNS as readonly string[]).includes(k))) ({ data, error } = await write(LEGACY_SETTINGS_COLUMNS));
+    const patchHas = (columns: readonly string[]) => Object.keys(patch).some((k) => columns.includes(k));
+    if (error && isMissingColumn(error) && !patchHas(NEW_SETTINGS_COLUMNS)) ({ data, error } = await write(NO_SOUTH_SETTINGS_COLUMNS));
+    if (error && isMissingColumn(error) && !patchHas(NEW_SETTINGS_COLUMNS)) ({ data, error } = await write(LEGACY_SETTINGS_COLUMNS));
+    if (error && isMissingColumn(error) && patchHas(SOUTH_SETTINGS_COLUMNS) && !patchHas(ROUTING_SETTINGS_COLUMNS)) return jsonError("Run migration 20261114000000_ai_agent_south_locations.sql in Supabase first, then save the South Deliveries list again.", 409);
     if (error) throw new Error(error.message);
     if (!data) throw new Error("Settings not found");
     await audit(businessSlug, "admin", admin.userId, "settings.update", { type: "settings", id: businessSlug }, {

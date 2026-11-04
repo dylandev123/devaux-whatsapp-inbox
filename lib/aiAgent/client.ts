@@ -70,6 +70,8 @@ export interface SettingsPatch {
   missedCallEnabled?: boolean;
   missedCallMessage?: string;
   missedCallCooldownMinutes?: number;
+  /** South Deliveries list as text, one destination per line ("Soufrière: Anse Chastanet, St Remy"). null/"" = the built-in list. */
+  southLocationsText?: string | null;
 }
 
 export interface CallEventView {
@@ -457,9 +459,9 @@ export type OrderView = TrackedOrder & {
   /** The business default (delivery) filled in a missing delivery/collection choice. */
   method_defaulted?: boolean;
   /** "stated": a readable day was given; "default": the 9 AM business default; "unreadable": words nobody can read. */
-  date_source?: "stated" | "default" | "unreadable";
+  date_source?: "stated" | "default" | "unreadable" | "pending";
   /** Where the order belongs today (open orders only). */
-  bucket?: "overdue" | "today" | "tomorrow" | "later" | "undated" | "review" | null;
+  bucket?: "overdue" | "today" | "tomorrow" | "later" | "undated" | "review" | "south" | null;
   /** The reviewed southern destination ("Vieux Fort", "Laborie"…) of a DELIVERY, from its current address; null when not clearly south. */
   south_group?: string | null;
   /** Missing essentials, as field keys ("items", "quantity", "fulfilment_method", "delivery_address", "requested_for"). */

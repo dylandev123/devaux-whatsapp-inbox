@@ -203,7 +203,7 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     const lines = linesOf(docs[DOC_A]);
     assert.equal(lines.length, 1);
     assert.ok(lines[0].includes(`⟨${fresh}⟩`) && !lines.some((l) => l.includes(old)));
-    assert.match(lines[0], /^Jane — \+1758555\d+ — Rodney Bay — 2 × Chicken ⟨E-NEW01⟩$/);
+    assert.match(lines[0], /^Rodney Bay — Jane — \+1 \(758\) 555-\d+ — 2 × Chicken — #E-NEW01 ⟨E-NEW01⟩$/);
     assert.equal(docs[DOC_A].lines()[0], lines[0], "the new line is the very first paragraph of the document");
     assert.deepEqual(docs[DOC_A].paragraphs().slice(1), before, "every existing paragraph is still there, in order, with its styles");
     assert.equal(docs[DOC_A].textReads, 0, "no document download on the normal path");
@@ -221,7 +221,7 @@ describe("Google Docs order sync (real server code, real SQL)", { skip: !pgAvail
     await sync.runSync(A);
     const lines = linesOf(docs[DOC_A]);
     assert.deepEqual(lines.map((x) => x.match(/⟨(E-[A-Z0-9]+)⟩/)![1]), [third, second, first]);
-    assert.ok(lines[0].startsWith("Cara") && lines[2].startsWith("Alice"));
+    assert.ok(lines[0].includes("— Cara —") && lines[2].includes("— Alice —"));
     assert.equal(docs[DOC_A].lines()[3], "DELIVERIES");
 
     const batches = docs[DOC_A].batches.length;

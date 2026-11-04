@@ -64,12 +64,30 @@ import {
 } from "@/lib/aiAgent/orderHistory";
 import { loadStaffLocationSafe, loadStaffUsualProductSafe } from "@/lib/server/aiAgent/customerStaffMemory";
 import { type AddressEvent, type AddressProvenance, addressProvenance, isInferredAddress, sameAddress } from "@/lib/aiAgent/orderAddress";
-import { deliveryContactIn, effectiveDate, groundedContactPhone, isPhoneOnlyNote, keepDefaultedDay, nameStated, withCreationDefaults, withDeliveryContact } from "@/lib/aiAgent/orderDefaults";
+import { deliveryContactIn, effectiveDate, groundedContactPhone, isDefaultedDay, isPhoneOnlyNote, isSouthDelivery, keepDefaultedDay, nameStated, phonesIn, southPendingDayText, withCreationDefaults, withDeliveryContact } from "@/lib/aiAgent/orderDefaults";
+import { classifyDeliveryRegion, regionConfigFrom, southGroupsMentioned } from "@/lib/aiAgent/deliveryRegions";
+import {
+  BILL_TO_PREFIX,
+  billingInstruction,
+  isPlacedForOther,
+  lineRecipientNotes,
+  nanpDigits,
+  noteSegment,
+  paymentNote,
+  PLACED_BY_PREFIX,
+  placedByText,
+  readRecipientBlock,
+  type Recipient,
+  SIGNED_BY_PREFIX,
+  signedName,
+  withNoteSegment,
+} from "@/lib/aiAgent/orderLines";
 import { classifyOrderIntent, INTENT_REASON_CODE, staffRecentlyOfferedDelivery } from "@/lib/aiAgent/orderIntent";
 import { agreedDeliveryDate, type ConversationLine, isAffirmation } from "@/lib/aiAgent/staffDelivery";
 import { anchorRequestedFor, applyQuantityAdjustments, guardRemovedItems, messageTimeFor, quantityAdjustments, refineOrderDraft, statedThisTurn } from "@/lib/aiAgent/orderText";
 import { buildOrdersView, type OrdersView, orderDate, viewKind } from "@/lib/aiAgent/orderViews";
 import {
+  CATCH_UP_HOURS,
   coverageWarning,
   type Coverage,
   computeMissing,
@@ -87,6 +105,7 @@ import {
   isWholeOrderCancellation,
   localParts,
   mergeDraft,
+  mergeSameTurnDrafts,
   MISSING_TEXT,
   OPEN_ORDER_STATUSES,
   ORDER_REVIEW_ATTENTION,
@@ -374,6 +393,11 @@ export async function loadOrderNames(businessSlug: string, orders: TrackedOrder[
     if (!profileByChat.has(row.chat_id)) profileByChat.set(row.chat_id, row.contact_name);
   }
   for (const o of orders) {
+    // An order placed for somebody else is listed under the person it is for, never under the chat's own profile name.
+    if (isPlacedForOther(o.notes) && isReliableName(o.customer_name)) {
+      names[o.id] = { name: o.customer_name!.trim(), source: "order", all: [o.customer_name!.trim()] };
+      continue;
+    }
     const c = o.contact_number ? byPhone.get(o.contact_number) : undefined;
     names[o.id] = pickCustomerName({
       orderNameLocked: o.manual_locked_fields.includes("customer_name") ? o.customer_name : null,
@@ -476,13 +500,14 @@ export function rowFrom(
   existing: TrackedOrder | null,
   fields: OrderFields,
   plan: ReturnType<typeof planOrderUpdate>,
-  ctx: { chatId: string; phone: string | null; messageIds: string[]; firstAt: string; lastAt: string; locked?: string[]; conflicts?: FieldConflicts }
+  ctx: { chatId: string; phone: string | null; messageIds: string[]; firstAt: string; lastAt: string; locked?: string[]; conflicts?: FieldConflicts; recipientPhone?: string | null }
 ): OrderRow {
   const confirmed = plan.status === "confirmed";
   return {
     ref_code: existing?.ref_code ?? "",
     chat_id: ctx.chatId,
-    contact_number: ctx.phone ?? existing?.contact_number ?? null,
+    // An order placed FOR somebody else keeps that person's number: the sender's own number (ctx.phone) never replaces it.
+    contact_number: existing && isPlacedForOther(existing.notes) ? existing.contact_number : (ctx.recipientPhone ?? ctx.phone ?? existing?.contact_number ?? null),
     customer_name: fields.customer_name,
     status: plan.status,
     items: fields.items,
@@ -601,6 +626,24 @@ const cleanName = (name: string | null, chatId: string) => {
   return n && n !== chatId && isReliableName(n) ? n.slice(0, 120) : null;
 };
 
+/** The person an order is being placed for, or null when the sender is ordering for themselves. Both a name and a phone the sender WROTE are required. */
+function recipientFor(draft: OrderRequestDraft, segments: string[], customerWords: string[], senderPhone: string | null, senderName: string | null, single: boolean): Recipient | null {
+  let found: Recipient | null = single ? readRecipientBlock(segments, senderPhone) : null;
+  if (!found && draft.placed_for_other === true && draft.customer_name && draft.contact_phone && isReliableName(draft.customer_name) && nameStated(draft.customer_name, customerWords)) {
+    const digits = phonesIn(draft.contact_phone)[0];
+    const written = phonesIn(customerWords.join("\n"));
+    if (digits && written.some((w) => w.slice(-7) === digits.slice(-7)) && !(senderPhone && senderPhone.slice(-7) === digits.slice(-7))) {
+      found = { name: draft.customer_name.trim().slice(0, 120), phone: nanpDigits(digits) };
+    }
+  }
+  // Writing your own name and number is not ordering for somebody else.
+  if (found && senderName && normalizeText(senderName) === normalizeText(found.name)) return null;
+  return found;
+}
+
+const sameRecipient = (o: Pick<TrackedOrder, "customer_name" | "contact_number">, r: Recipient): boolean =>
+  (o.contact_number ?? "").slice(-7) === r.phone.slice(-7) || normalizeText(o.customer_name ?? "") === normalizeText(r.name);
+
 /**
  * Folds one customer turn into the customer's orders. Idempotent per `dedupeBase`: running the same turn twice
  * (a batch retry) changes nothing the second time. Confirmation comes only from the customer's own unambiguous
@@ -611,7 +654,9 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   const result: TrackResult = { applied: 0, reasons: [] };
   const { businessSlug, chatId, segments } = args;
   const name = cleanName(args.customerName, chatId);
-  const drafts = args.proposal ? turnDrafts(args.proposal) : [];
+  // One message with several product lines is one order: drafts that are not clearly different deliveries are folded together.
+  const drafts = args.proposal ? mergeSameTurnDrafts(turnDrafts(args.proposal)) : [];
+  const regions = regionConfigFrom(args.settings.south_locations);
   const ctx = { chatId, phone: args.phone, messageIds: args.messageIds, firstAt: args.firstAt, lastAt: args.lastAt };
   const tz = tzOf(args.settings);
 
@@ -785,7 +830,11 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
   }
 
   for (const [index, { target, draft }] of withItems.entries()) {
-    const resolved = resolveOrderTarget(open, target, draft);
+    // Who is this order for? Somebody placing an order for another person (staff, a driver, a relative) names them with their phone;
+    // that person is the delivery customer. The sender is kept in the notes and their own profile is never touched.
+    const recipient = recipientFor(draft, segments, args.customerWords, args.phone, name, withItems.length === 1);
+    let resolved: ReturnType<typeof resolveOrderTarget> = resolveOrderTarget(open, target, draft);
+    if (recipient && !(resolved.kind === "merge" && isPlacedForOther(resolved.order.notes) && sameRecipient(resolved.order, recipient))) resolved = { kind: "create" };
     const existing = resolved.kind === "merge" ? resolved.order : null;
     // The customer's records, used only where their words leave a gap and only from reliable orders.
     const pool = reliableHistory(history, existing ? [existing.id] : []);
@@ -844,6 +893,20 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     });
     // Plainly stated quantities and delivery/collection are recorded even when the model left them out.
     const refined = refineOrderDraft(grounded, segments, args.customerWords);
+    // "2 bags for St Remy" in a message that says Soufrière: the address is completed with the south destination the customer
+    // named, so the order is recognised (and marked) as a South Delivery. Never when the address points anywhere else.
+    if (refined.delivery_address && classifyDeliveryRegion(refined.delivery_address, regions).region !== "south") {
+      const groups = southGroupsMentioned(segments, regions);
+      if (groups.length === 1 && !normalizeText(refined.delivery_address).includes(normalizeText(groups[0])) && classifyDeliveryRegion(`${refined.delivery_address} ${groups[0]}`, regions).region === "south") {
+        refined.delivery_address = `${refined.delivery_address}, ${groups[0]}`;
+      }
+    }
+    // A later, shorter restatement of the place ("St Remy") never strips the south destination already on the order.
+    if (existing?.delivery_address && refined.delivery_address && classifyDeliveryRegion(existing.delivery_address, regions).region === "south") {
+      const held = normalizeText(existing.delivery_address);
+      const said = normalizeText(refined.delivery_address);
+      if (held !== said && held.startsWith(said)) refined.delivery_address = existing.delivery_address;
+    }
     // Is this really an order? An invoice, quotation, price or product discussion names products without anyone asking for a
     // delivery. A NEW order candidate is classified from the customer's words, the staff replies around them and what it holds;
     // an order that already exists is never cancelled or demoted by this, and a doubtful one is held for review, off every list.
@@ -873,7 +936,8 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
     //  * a different delivery number goes into the notes, never into contact_number (the verified sender stays the customer);
     //  * a note that is only a phone number is that contact, not a "note".
     const statedName = !name && draft.customer_name && isReliableName(draft.customer_name) && nameStated(draft.customer_name, args.customerWords) ? draft.customer_name.slice(0, 120) : null;
-    const contactDigits = groundedContactPhone({ contact_phone: draft.contact_phone, notes: refined.notes ?? draft.notes }, args.customerWords, args.phone);
+    // The recipient's number is the order's phone, not an "alternate delivery contact".
+    const contactDigits = recipient ? null : groundedContactPhone({ contact_phone: draft.contact_phone, notes: refined.notes ?? draft.notes }, args.customerWords, args.phone);
     if (isPhoneOnlyNote(refined.notes)) refined.notes = null;
 
     const fillFor = (cur: TrackedOrder | null): HistoryFill =>
@@ -933,7 +997,37 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       // The alternate delivery contact survives later turns whose cumulative note no longer repeats it.
       const keptContact = contactDigits ?? deliveryContactIn(cur?.notes);
       if (keptContact && (forMerge.notes || contactDigits)) forMerge.notes = withDeliveryContact(forMerge.notes ?? cur?.notes ?? null, keptContact);
-      const merged = mergeDraft(cur ? fieldsOf(cur) : null, forMerge, cur?.manual_locked_fields ?? [], name ?? statedName, (field, proposed) => statedThisTurn(field, proposed, segments, cur?.items ?? []));
+      // Facts the customer's words carry that a model's free-text note loses: who placed it, who signed it, who to bill, what was paid,
+      // and who each product line is for. They live in the notes as short readable segments (a person can edit them); staff-locked notes are left alone.
+      if (!cur?.manual_locked_fields.includes("notes")) {
+        const turnTexts = [...segments].reverse();
+        let notes = forMerge.notes ?? null;
+        const base = () => notes ?? cur?.notes ?? null;
+        if (notes) for (const prefix of [PLACED_BY_PREFIX, SIGNED_BY_PREFIX, BILL_TO_PREFIX]) {
+          const held = noteSegment(cur?.notes, prefix);
+          if (held) notes = withNoteSegment(notes, held, prefix);
+        }
+        const signed = turnTexts.map(signedName).find(Boolean) ?? null;
+        if (signed && name && !recipient && normalizeText(signed) !== normalizeText(name) && !normalizeText(name).split(" ").includes(normalizeText(signed))) {
+          notes = withNoteSegment(base(), `${SIGNED_BY_PREFIX}${signed} (WhatsApp name: ${name})`, SIGNED_BY_PREFIX);
+        }
+        const bill = billingInstruction(turnTexts);
+        if (bill) notes = withNoteSegment(base(), bill, BILL_TO_PREFIX);
+        const paid = paymentNote(turnTexts);
+        if (paid) notes = withNoteSegment(base(), paid);
+        for (const who of lineRecipientNotes(refined.items, segments)) notes = withNoteSegment(base(), who);
+        // Who placed it always comes last, so the note reads "$155 Paid in store · Placed by Gary Devaux (+1758…)".
+        if (recipient) notes = withNoteSegment(base(), placedByText(name, args.phone), PLACED_BY_PREFIX);
+        else if (noteSegment(base(), PLACED_BY_PREFIX)) notes = withNoteSegment(base(), noteSegment(base(), PLACED_BY_PREFIX)!, PLACED_BY_PREFIX);
+        if (notes !== null && notes !== (cur?.notes ?? null)) forMerge.notes = notes;
+      }
+      const merged = mergeDraft(cur ? fieldsOf(cur) : null, forMerge, cur?.manual_locked_fields ?? [], recipient ? recipient.name : (name ?? statedName), (field, proposed) => statedThisTurn(field, proposed, segments, cur?.items ?? []));
+      // A south order that had been given the next-day default (before its address was known to be south) loses that assumed day.
+      if (cur && !cur.manual_locked_fields.includes("requested_for") && isDefaultedDay(merged.fields.requested_for) && isSouthDelivery(merged.fields, regions)) {
+        const marker = southPendingDayText();
+        merged.changes.push({ field: "requested_for", before: merged.fields.requested_for, after: marker });
+        merged.fields.requested_for = marker;
+      }
       // "Deliver somewhere else": the address on the order is no longer right; the customer will give the new one.
       if (cur && fill.clearAddress && merged.fields.delivery_address) {
         if (cur.manual_locked_fields.includes("delivery_address")) merged.conflicts.push({ field: "delivery_address", before: cur.delivery_address, after: null });
@@ -944,7 +1038,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
       }
       // A NEW order is stored with the business defaults (delivery; today before 9 AM else tomorrow, from the customer's
       // message time), so every later read shows the same day. Explicit values and staff edits are never touched.
-      const created = cur ? null : withCreationDefaults(merged.fields, ctx.firstAt, tz);
+      const created = cur ? null : withCreationDefaults(merged.fields, ctx.firstAt, tz, regions);
       const fields = created ? created.fields : merged.fields;
       const changed = cur ? merged.changes.length > 0 : true;
       const confirmsAddress =
@@ -976,7 +1070,7 @@ export async function trackOrders(args: TrackArgs): Promise<TrackResult> {
         if (!result.reasons.includes(code)) result.reasons.push(code);
       }
       return {
-        row: rowFrom(cur, fields, finalPlan, { ...ctx, conflicts }),
+        row: rowFrom(cur, fields, finalPlan, { ...ctx, conflicts, recipientPhone: recipient?.phone ?? null }),
         event:
           cur && !changed && conflictsChanged && finalPlan.event === "no_change"
             ? "locked_field_conflict"
@@ -1796,7 +1890,7 @@ export async function buildSummaryNow(settings: AgentSettings, trigger: "schedul
   const [orders, coverage] = await Promise.all([loadOutstandingOrders(settings.business_slug), loadCoverage(settings, now)]);
   const names = await loadOrderNames(settings.business_slug, orders);
   const warning = coverageWarning(coverage);
-  const built = buildOrdersView({ view, orders, names, now, timezone: tzOf(settings), warning, addresses: await loadAddressProvenance(settings.business_slug, orders) });
+  const built = buildOrdersView({ view, orders, names, now, timezone: tzOf(settings), warning, addresses: await loadAddressProvenance(settings.business_slug, orders), regions: regionConfigFrom(settings.south_locations) });
   return { text: built.parts.join("\n\n"), parts: built.parts, numbered: built.numbered, shown: built.shown, attention: built.counts.attention, overdue: built.counts.overdue };
 }
 
@@ -1898,7 +1992,9 @@ export async function runScheduledSummary(settings: AgentSettings, now: Date = n
       await audit(slug, "system", null, "orders.summary_resumed", { type: "order_summary_run", id: existing.id });
       return "resumed";
     }
-    if (existing.status === "queued" && existing.outbox_id && existing.attempts < MAX_ATTEMPTS) {
+    // A "morning" list is only rebuilt inside the same catch-up window as the first attempt; later it stays missed, never a stale re-post.
+    const withinWindow = localParts(now, tzOf(settings)).minutes < hourOf(settings) * 60 + CATCH_UP_HOURS * 60;
+    if (existing.status === "queued" && existing.outbox_id && existing.attempts < MAX_ATTEMPTS && withinWindow) {
       const { data } = await agentDb().from("ai_agent_outbox").select("status, error, dispatched_at, created_at").eq("id", existing.outbox_id).maybeSingle();
       if (data && provablyUnsent(data)) {
         const bumped = await agentDb()

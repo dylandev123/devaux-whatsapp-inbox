@@ -288,7 +288,7 @@ describe("bulk completion scope", () => {
   test("only open orders for today are in scope; tomorrow, later, overdue and undated are counted, never included", () => {
     const scope = bulkScope([tomorrow, today, later, overdue, undated, done, cancelled, todayDefault], ctx);
     assert.deepEqual(scope.today.map((o) => o.id).sort(), [today.id, todayDefault.id].sort());
-    assert.deepEqual(scope.excluded, { tomorrow: 1, later: 1, overdue: 1, undated: 1 });
+    assert.deepEqual(scope.excluded, { tomorrow: 1, later: 1, overdue: 1, undated: 1, south: 0 });
   });
 
   test("the St Lucia midnight decides what is 'today'", () => {
@@ -321,7 +321,7 @@ describe("bulk completion scope", () => {
   });
 
   test("nothing to complete says so, and says what was left alone", () => {
-    assert.match(BULK_REPLY.none(ctx.today, { tomorrow: 2, later: 0, overdue: 1, undated: 0 }), /Nothing outstanding for today[\s\S]*3 other open orders left alone/);
+    assert.match(BULK_REPLY.none(ctx.today, { tomorrow: 2, later: 0, overdue: 1, undated: 0, south: 0 }), /Nothing outstanding for today[\s\S]*3 other open orders left alone/);
   });
 
   test("the result lists completed, skipped and failed orders and how to retry", () => {

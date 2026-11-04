@@ -7,6 +7,9 @@
 
 import type { OrderLine } from "./orders.ts";
 import { formatLine } from "./orders.ts";
+import { classifyDeliveryRegion, type RegionConfig } from "./deliveryRegions.ts";
+import { isSouthPendingDay } from "./orderDefaults.ts";
+import { normalizeText } from "./escalationUpdates.ts";
 
 export const FIELD_KEYS = ["name", "phone", "location", "items", "notes", "date", "ref", "status"] as const;
 export type FieldKey = (typeof FIELD_KEYS)[number];
@@ -26,6 +29,8 @@ export const FIELD_LABELS: Record<FieldKey, string> = {
 const CORE: ReadonlySet<FieldKey> = new Set(["name", "phone", "location", "items"]);
 
 export interface FormatConfig {
+  /** 2 = the field order was chosen (or defaulted) under the location-first layout. Absent = saved before it existed. */
+  layout?: 2;
   fields: { key: FieldKey; enabled: boolean }[];
   separator: string;
   /** Show "(no phone)" etc. for a missing core detail. false = leave it out. */
@@ -34,10 +39,14 @@ export interface FormatConfig {
 
 export const DEFAULT_SEPARATOR = " — ";
 export const SEPARATOR_PRESETS = [" — ", " | ", " - ", ", ", " · ", "; "] as const;
-const DEFAULT_ENABLED: readonly FieldKey[] = ["name", "phone", "location", "items", "notes"];
+/** LOCATION — CUSTOMER NAME — PHONE — PRODUCTS/QUANTITY — NOTES — DELIVERY DATE — ORDER REF (status stays off unless asked for). */
+const DEFAULT_ENABLED: readonly FieldKey[] = ["location", "name", "phone", "items", "notes", "date", "ref"];
+/** The order every configuration saved before the location-first layout started from. Not changed by the administrator = still this. */
+const LEGACY_ORDER: readonly FieldKey[] = ["name", "phone", "location", "items", "notes", "date", "ref", "status"];
 
 export function defaultFormat(): FormatConfig {
   return {
+    layout: 2,
     fields: [...DEFAULT_ENABLED, ...FIELD_KEYS.filter((k) => !DEFAULT_ENABLED.includes(k))].map((key) => ({ key, enabled: DEFAULT_ENABLED.includes(key) })),
     separator: DEFAULT_SEPARATOR,
     placeholders: true,
@@ -62,7 +71,11 @@ export function normalizeFormat(raw: unknown): FormatConfig {
   if (fields.length === 0) return { ...base, placeholders: r.placeholders === false ? false : true };
   for (const key of FIELD_KEYS) if (!seen.has(key)) fields.push({ key, enabled: false });
   if (!fields.some((f) => f.enabled)) return { ...base, separator: sanitizeSeparator(r.separator), placeholders: r.placeholders !== false };
-  return { fields, separator: sanitizeSeparator(r.separator), placeholders: r.placeholders !== false };
+  // A configuration saved before the location-first layout that still has the old default ORDER was never re-ordered by the
+  // administrator, so it follows the new default order. Which fields are switched on, the separator and the placeholder choice are kept.
+  const untouchedLegacy = (r as { layout?: unknown }).layout !== 2 && fields.every((f, i) => f.key === LEGACY_ORDER[i]);
+  const ordered = untouchedLegacy ? defaultFormat().fields.map((d) => ({ key: d.key, enabled: fields.find((f) => f.key === d.key)?.enabled ?? false })) : fields;
+  return { layout: 2, fields: ordered, separator: sanitizeSeparator(r.separator), placeholders: r.placeholders !== false };
 }
 
 export function sanitizeSeparator(value: unknown): string {
@@ -103,9 +116,11 @@ export function flatten(value: string | null | undefined, max = FIELD_MAX): stri
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
-function phoneText(digits: string | null): string | null {
+/** "+1 (758) 484-7702" for a 11-digit North American number (Saint Lucia is +1 758); any other length keeps the plain "+digits". */
+export function phoneText(digits: string | null): string | null {
   const d = (digits ?? "").replace(/\D/g, "");
-  return d.length >= 7 && d.length <= 15 ? `+${d}` : null;
+  if (d.length < 7 || d.length > 15) return null;
+  return d.length === 11 && d.startsWith("1") ? `+1 (${d.slice(1, 4)}) ${d.slice(4, 7)}-${d.slice(7)}` : `+${d}`;
 }
 
 function itemsText(items: OrderLine[]): string | null {
@@ -120,7 +135,10 @@ export interface FormattedLine {
   missing: string[];
 }
 
-export function formatOrderLine(order: LineOrder, format: FormatConfig): FormattedLine {
+export const SOUTH_MARKER = "SOUTH DELIVERY";
+export const DATE_PENDING_TEXT = "Date to be confirmed";
+
+export function formatOrderLine(order: LineOrder, format: FormatConfig, regions?: RegionConfig): FormattedLine {
   const parts: string[] = [];
   const missing: string[] = [];
   for (const { key, enabled } of format.fields) {
@@ -147,7 +165,7 @@ export function formatOrderLine(order: LineOrder, format: FormatConfig): Formatt
         value = flatten(order.notes) || null;
         break;
       case "date":
-        value = flatten(order.requested_for, 60) || null;
+        value = isSouthPendingDay(order.requested_for) ? DATE_PENDING_TEXT : flatten(order.requested_for, 60) || null;
         break;
       case "ref":
         value = `#${flatten(order.ref_code, 20)}`;
@@ -161,6 +179,12 @@ export function formatOrderLine(order: LineOrder, format: FormatConfig): Formatt
     if (!enabled) continue;
     if (value) parts.push(value);
     else if (placeholder && format.placeholders && CORE.has(key)) parts.push(placeholder);
+  }
+  // A south delivery says so first, whatever order the fields are in: the driver plans one southern run from these lines.
+  const south = order.fulfilment_method === "collection" ? null : classifyDeliveryRegion(order.delivery_address, regions);
+  if (south?.region === "south") {
+    const named = normalizeText(order.delivery_address ?? "").includes(normalizeText(south.group));
+    parts.unshift(named ? SOUTH_MARKER : `${SOUTH_MARKER} (${south.group})`);
   }
   let text = parts.join(format.separator);
   if (text.length > LINE_MAX) text = `${text.slice(0, LINE_MAX - 1)}…`;

@@ -362,11 +362,11 @@ export interface BulkScope {
   /** Open orders for TODAY (the business's local day). The only ones a completion may touch. */
   today: TrackedOrder[];
   /** Open orders deliberately left alone, by why. */
-  excluded: { tomorrow: number; later: number; overdue: number; undated: number };
+  excluded: { tomorrow: number; later: number; overdue: number; undated: number; south: number };
 }
 
 export function bulkScope(orders: TrackedOrder[], ctx: DayContext): BulkScope {
-  const scope: BulkScope = { today: [], excluded: { tomorrow: 0, later: 0, overdue: 0, undated: 0 } };
+  const scope: BulkScope = { today: [], excluded: { tomorrow: 0, later: 0, overdue: 0, undated: 0, south: 0 } };
   const byDate = (a: TrackedOrder, b: TrackedOrder) => Date.parse(a.first_message_at) - Date.parse(b.first_message_at);
   for (const o of orders) {
     if (!isOpenStatus(o.status)) continue;
@@ -404,7 +404,7 @@ export const BULK_REPLY = {
     const { code, dateKey, scope, names } = args;
     const listed = scope.today.slice(0, MAX_LISTED);
     const unconfirmed = scope.today.filter((o) => o.status !== "confirmed").length;
-    const left = Object.entries({ tomorrow: scope.excluded.tomorrow, later: scope.excluded.later, overdue: scope.excluded.overdue, "no clear day": scope.excluded.undated })
+    const left = Object.entries({ tomorrow: scope.excluded.tomorrow, later: scope.excluded.later, overdue: scope.excluded.overdue, "no clear day": scope.excluded.undated, "south, day to be confirmed": scope.excluded.south })
       .filter(([, n]) => n > 0)
       .map(([k, n]) => `${n} ${k}`);
     return [
@@ -421,7 +421,7 @@ export const BULK_REPLY = {
     ].join("\n");
   },
   none: (dateKey: string, excluded: BulkScope["excluded"]) => {
-    const left = excluded.tomorrow + excluded.later + excluded.overdue + excluded.undated;
+    const left = excluded.tomorrow + excluded.later + excluded.overdue + excluded.undated + excluded.south;
     return `✅ Nothing outstanding for today (${dayLabel(dateKey)}) — nothing to complete.${left > 0 ? ` ${plural(left, "other open order")} left alone (see !orders all).` : ""}`;
   },
   discarded: (code: string) => `🗑 ${code} discarded. No order was completed.`,

@@ -8,7 +8,7 @@
 // cancels or deletes an order: an old order stays listed under Overdue until a person completes or cancels it.
 
 import { type AddressProvenance, addressTag } from "./orderAddress.ts";
-import { classifyDeliveryRegion, southGroupOrder } from "./deliveryRegions.ts";
+import { classifyDeliveryRegion, type RegionConfig, southGroupOrder } from "./deliveryRegions.ts";
 import { effectiveDate, effectiveMethod } from "./orderDefaults.ts";
 import { addDays, resolveRequestedDay } from "./orderText.ts";
 import {
@@ -65,7 +65,8 @@ export function parseOrdersView(arg: string, now: Date, timezone: string = DEFAU
 // ── Dates ────────────────────────────────────────────────────────────────────
 
 /** "review": might not be an order; it is in no day's list until a person confirms it. */
-export type Bucket = "overdue" | "today" | "tomorrow" | "later" | "undated" | "review";
+/** "south": a south delivery whose day nobody has confirmed yet. South runs are not daily, so it is never overdue, undated or missing a day. */
+export type Bucket = "overdue" | "today" | "tomorrow" | "later" | "undated" | "review" | "south";
 
 export interface DayContext {
   timezone: string;
@@ -97,6 +98,7 @@ export const dayLabel = (dateKey: string): string => addDays(dateKey, 0).label;
  */
 export function bucketOf(o: Pick<TrackedOrder, "requested_for" | "first_message_at"> & Partial<Pick<TrackedOrder, "status" | "attention">>, ctx: DayContext): Bucket {
   if (o.status !== undefined && o.attention !== undefined && isUnderReview({ status: o.status, attention: o.attention })) return "review";
+  if (effectiveDate(o, ctx.timezone).source === "pending") return "south";
   const date = orderDate(o, ctx.timezone);
   if (date === null) return localParts(new Date(o.first_message_at), ctx.timezone).dateKey < ctx.today ? "overdue" : "undated";
   if (date < ctx.today) return "overdue";
@@ -131,8 +133,10 @@ export interface OrderCounts {
   tomorrow: number;
   later: number;
   overdue: number;
-  /** Open orders with no readable day, of any age (a superset of the "undated" bucket). */
+  /** Open orders with no readable day, of any age (a superset of the "undated" bucket). South deliveries waiting for a day are counted in `south`. */
   undated: number;
+  /** Open south deliveries whose day is still to be confirmed. */
+  south: number;
   missing: number;
   attention: number;
   /** Open orders waiting for a person to say whether they are orders. Counted in `open`, in no day. */
@@ -141,7 +145,7 @@ export interface OrderCounts {
 
 /** The numbers shown beside the views (WhatsApp footer, website tabs): one definition for both. */
 export function countOrders(orders: TrackedOrder[], ctx: DayContext): OrderCounts {
-  const counts: OrderCounts = { open: 0, today: 0, tomorrow: 0, later: 0, overdue: 0, undated: 0, missing: 0, attention: 0, review: 0 };
+  const counts: OrderCounts = { open: 0, today: 0, tomorrow: 0, later: 0, overdue: 0, undated: 0, south: 0, missing: 0, attention: 0, review: 0 };
   for (const o of orders) {
     if (!isOpenStatus(o.status)) continue;
     counts.open += 1;
@@ -152,7 +156,7 @@ export function countOrders(orders: TrackedOrder[], ctx: DayContext): OrderCount
     }
     const bucket = bucketOf(o, ctx);
     if (bucket !== "undated" && bucket !== "review") counts[bucket] += 1;
-    if (orderDate(o, ctx.timezone) === null) counts.undated += 1;
+    if (bucket !== "south" && orderDate(o, ctx.timezone) === null) counts.undated += 1;
     if (orderGaps(o, ctx.timezone).length > 0) counts.missing += 1;
     if (needsAttention(o, ctx)) counts.attention += 1;
   }
@@ -169,7 +173,7 @@ export function selectOrders(view: OrdersView, orders: TrackedOrder[], ctx: DayC
   const inBucket = (...wanted: Bucket[]) => open.filter((o) => wanted.includes(bucketOf(o, ctx)));
   switch (view.type) {
     case "default":
-      return inBucket("today", "tomorrow").sort(byDate);
+      return inBucket("today", "tomorrow", "south").sort(byDate);
     case "today":
       return inBucket("today").sort(byDate);
     case "tomorrow":
@@ -183,7 +187,7 @@ export function selectOrders(view: OrdersView, orders: TrackedOrder[], ctx: DayC
     case "overdue":
       return inBucket("overdue").sort(byDate);
     case "undated":
-      return open.filter((o) => orderDate(o, ctx.timezone) === null).sort(byDate);
+      return open.filter((o) => orderDate(o, ctx.timezone) === null && bucketOf(o, ctx) !== "south").sort(byDate);
     case "missing":
       return open.filter((o) => orderGaps(o, ctx.timezone).length > 0).sort(byDate);
   }
@@ -228,7 +232,9 @@ export function orderViewBlock(o: TrackedOrder, index: number, names: OrderNames
     opts.showDate
       ? date
         ? `🗓 ${dayLabel(date)}`
-        : o.requested_for
+        : day.source === "pending"
+          ? "🗓 date to be confirmed"
+          : o.requested_for
           ? `🗓 “${safeText(o.requested_for, 40)}” (no date read)`
           : "🗓 no day"
       : "",
@@ -255,8 +261,8 @@ interface Chunk {
 }
 
 /** Packs chunks into WhatsApp-sized messages; a heading never ends a message, and overflow is counted, not hidden. */
-function pack(title: string, chunks: Chunk[]): { parts: string[]; omitted: number } {
-  const base = title.length + 12;
+function pack(title: string, chunks: Chunk[], subtitle = ""): { parts: string[]; omitted: number } {
+  const base = title.length + subtitle.length + 12;
   const bodies: Chunk[][] = [[]];
   let size = base;
   let omitted = 0;
@@ -275,21 +281,21 @@ function pack(title: string, chunks: Chunk[]): { parts: string[]; omitted: numbe
     size += chunk.text.length + 2;
   }
   const total = bodies.length;
-  const parts = bodies.map((body, i) => [`${title}${total > 1 ? ` (${i + 1}/${total})` : ""}`, ...body.map((c) => c.text)].join("\n\n"));
+  const parts = bodies.map((body, i) => [`${title}${total > 1 ? ` (${i + 1}/${total})` : ""}${subtitle ? `\n${subtitle}` : ""}`, ...body.map((c) => c.text)].join("\n\n"));
   return { parts, omitted };
 }
 
 export const SOUTH_HEADING = "🧭 *South Deliveries*";
 
 /** The southern deliveries among `orders` (all of them deliveries), grouped by destination in the table's order. */
-export function southDeliveries(orders: TrackedOrder[]): { group: string; orders: TrackedOrder[] }[] {
+export function southDeliveries(orders: TrackedOrder[], regions?: RegionConfig): { group: string; orders: TrackedOrder[] }[] {
   const byGroup = new Map<string, TrackedOrder[]>();
   for (const o of orders) {
     if (effectiveMethod(o).method !== "delivery") continue;
-    const region = classifyDeliveryRegion(o.delivery_address);
+    const region = classifyDeliveryRegion(o.delivery_address, regions);
     if (region.region === "south") byGroup.set(region.group, [...(byGroup.get(region.group) ?? []), o]);
   }
-  const order = southGroupOrder();
+  const order = southGroupOrder(regions);
   return [...byGroup.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0])).map(([group, list]) => ({ group, orders: list }));
 }
 
@@ -308,6 +314,8 @@ export interface OrdersViewInput {
   warning?: string | null;
   /** Address provenance by order id (loadAddressProvenance). Missing entries read as the customer's own address. */
   addresses?: Record<string, AddressProvenance>;
+  /** The business's own South Deliveries list (regionConfigFrom). Default: the reviewed table. */
+  regions?: RegionConfig;
 }
 
 /** The stored kind of a report: one list per kind (and per date for a specific day) stays current. */
@@ -319,6 +327,14 @@ export interface OrdersViewResult {
   numbered: { n: number; order: TrackedOrder }[];
   shown: number;
   counts: OrderCounts;
+}
+
+/** "🕗 Generated Wed 4 Nov, 8:00 AM" in the business's timezone: when the data in this report was read, so an old list cannot pass for a fresh one. */
+export function generatedStamp(now: Date, timezone: string = DEFAULT_ORDERS_TIMEZONE): string {
+  const local = localParts(now, timezone);
+  const h24 = Math.floor(local.minutes / 60);
+  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+  return `🕗 Generated ${dayLabel(local.dateKey)}, ${h12}:${String(local.minutes % 60).padStart(2, "0")} ${h24 < 12 ? "AM" : "PM"}`;
 }
 
 /** The text of an !orders answer (also the morning post and the dashboard's "send now"). */
@@ -352,7 +368,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       }
       // Deliveries going to a reviewed southern destination are listed together under it (one run for the driver); each
       // order appears once, in exactly one of the two lists. Anything not clearly southern stays in the ordinary Delivery list.
-      const south = southDeliveries(group);
+      const south = southDeliveries(group, input.regions);
       const rest = group.filter((o) => !south.some((g) => g.orders.includes(o)));
       if (rest.length > 0) {
         chunks.push({ text: METHOD_HEADING.delivery, heading: true });
@@ -367,6 +383,19 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       }
     }
   };
+  /** South deliveries nobody has given a day yet: one section, by destination. They are never "today", "tomorrow" or overdue. */
+  const southPending = (list: TrackedOrder[]) => {
+    const groups = southDeliveries(list, input.regions);
+    const placed = new Set(groups.flatMap((g) => g.orders));
+    if (list.length === 0) return;
+    chunks.push({ text: `${SOUTH_HEADING} — date to be confirmed (${list.length})`, heading: true });
+    for (const g of groups) {
+      chunks.push({ text: `📍 *${g.group}* (${g.orders.length})`, heading: true });
+      for (const o of g.orders) chunks.push({ text: numbered(o, { showDate: false }) });
+    }
+    for (const o of list.filter((x) => !placed.has(x))) chunks.push({ text: numbered(o, { showDate: false }) });
+  };
+  const pendingSouth = picked.filter((o) => bucketOf(o, ctx) === "south");
   const flat = (orders: TrackedOrder[], showDate = true) => orders.forEach((o) => chunks.push({ text: numbered(o, { showDate }) }));
   const reviewing = input.orders.filter(isUnderReview).sort((a, b) => Date.parse(a.first_message_at) - Date.parse(b.first_message_at));
 
@@ -379,10 +408,11 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
     case "default":
       title = `📋 *ORDERS — ${dayLabel(ctx.today)}*`;
       empty = "✅ Nothing outstanding for today or tomorrow.";
-      if (picked.length > 0) {
+      if (picked.length > 0 && picked.length > pendingSouth.length) {
         dayBlock(ctx.today);
         dayBlock(ctx.tomorrow);
       }
+      southPending(pendingSouth);
       if (fresh.length > 0) {
         chunks.push({ text: `❔ *DAY NOT CLEAR (${fresh.length})*`, heading: true });
         flat(fresh);
@@ -405,11 +435,12 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
       title = "📋 *ALL OUTSTANDING ORDERS*";
       empty = "✅ No outstanding orders.";
       for (const key of [...new Set(picked.map((o) => orderDate(o, tz)).filter((d): d is string => d !== null))].sort()) dayBlock(key);
-      const noDay = picked.filter((o) => orderDate(o, tz) === null);
+      const noDay = picked.filter((o) => orderDate(o, tz) === null && bucketOf(o, ctx) !== "south");
       if (noDay.length > 0) {
         chunks.push({ text: `❔ *DAY NOT CLEAR (${noDay.length})*`, heading: true });
         flat(noDay);
       }
+      southPending(pendingSouth);
       if (reviewing.length > 0) {
         chunks.push({ text: `🔎 *MIGHT NOT BE AN ORDER (${reviewing.length})*`, heading: true });
         flat(reviewing, false);
@@ -458,7 +489,7 @@ export function buildOrdersView(input: OrdersViewInput): OrdersViewResult {
   const footer = [input.warning, ...pointers].filter((x): x is string => Boolean(x));
   if (footer.length > 0) chunks.push({ text: footer.join("\n") });
 
-  const packed = pack(title, chunks);
+  const packed = pack(title, chunks, generatedStamp(input.now, tz));
   if (packed.omitted > 0) packed.parts[packed.parts.length - 1] += `\n\n…and ${plural(packed.omitted, "more order")} — see the Orders page in the inbox.`;
   return { parts: packed.parts, numbered: numberedOrders, shown: picked.length + (view.type === "default" ? fresh.length : 0), counts };
 }

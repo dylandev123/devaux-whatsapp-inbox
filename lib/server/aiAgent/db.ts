@@ -2,8 +2,10 @@
 // (supabase/migrations/20261022000000_ai_agent.sql). Every ai_agent_* table is
 // admin-read-only under RLS, so all writes funnel through here — callers are
 // either admin API routes (middleware.ts + requireAdmin()) or bridge routes
-// (AI_AGENT_BRIDGE_SECRET). Never import from a client component.
+// (AI_AGENT_BRIDGE_SECRET). Never import
+// from a client component.
 
+import { regionConfigFrom } from "@/lib/aiAgent/deliveryRegions";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { randomBytes } from "crypto";
 import { AgentSettings, generateRefCode, isValidBusinessSlug, KnowledgeKind } from "@/lib/aiAgent/engine";
@@ -72,11 +74,18 @@ export async function ensureSettings(businessSlug: string): Promise<AgentSetting
 }
 
 export const SETTINGS_COLUMNS =
-  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, default_customer_mode, passive_learning_scope, knowledge_confirm_via_whatsapp, orders_tracking_enabled, orders_summary_enabled, orders_group_jid, orders_group_name, orders_timezone, orders_summary_hour, orders_customer_confirms, orders_tracking_since, auto_learning_enabled, routing_rules, missed_call_enabled, missed_call_message, missed_call_cooldown_minutes, updated_at";
+  "business_slug, enabled, mode, contact_scope, autonomy, staff_group_jid, staff_group_name, auto_takeover_minutes, max_auto_replies_per_hour, send_holding_reply, staff_notices_enabled, batching_enabled, batch_quiet_seconds, batch_max_wait_seconds, customer_memory_enabled, staff_authorized_senders, default_customer_mode, passive_learning_scope, knowledge_confirm_via_whatsapp, orders_tracking_enabled, orders_summary_enabled, orders_group_jid, orders_group_name, orders_timezone, orders_summary_hour, orders_customer_confirms, orders_tracking_since, auto_learning_enabled, routing_rules, missed_call_enabled, missed_call_message, missed_call_cooldown_minutes, south_locations, updated_at";
 
 /** The columns added by 20261110000000 (routing + missed calls). Until that migration is run the app reads the rest and these features stay off. */
-export const NEW_SETTINGS_COLUMNS = ["routing_rules", "missed_call_enabled", "missed_call_message", "missed_call_cooldown_minutes"] as const;
-export const LEGACY_SETTINGS_COLUMNS = SETTINGS_COLUMNS.split(", ").filter((c) => !(NEW_SETTINGS_COLUMNS as readonly string[]).includes(c)).join(", ");
+export const ROUTING_SETTINGS_COLUMNS = ["routing_rules", "missed_call_enabled", "missed_call_message", "missed_call_cooldown_minutes"] as const;
+/** Added by 20261114000000 (the editable South Deliveries list). Until it is run, everything else is still read, routing and missed calls included. */
+export const SOUTH_SETTINGS_COLUMNS = ["south_locations"] as const;
+export const NEW_SETTINGS_COLUMNS = [...ROUTING_SETTINGS_COLUMNS, ...SOUTH_SETTINGS_COLUMNS] as const;
+const without = (drop: readonly string[]) => SETTINGS_COLUMNS.split(", ").filter((c) => !drop.includes(c)).join(", ");
+/** Before 20261114000000: the full shape minus the South list. */
+export const NO_SOUTH_SETTINGS_COLUMNS = without(SOUTH_SETTINGS_COLUMNS);
+/** Before 20261110000000: routing, missed calls and the South list all off. */
+export const LEGACY_SETTINGS_COLUMNS = without(NEW_SETTINGS_COLUMNS);
 
 /** Postgres "undefined_column": the schema is older than this code (the migration has not been run yet). */
 export const isMissingColumn = (error: { code?: string; message?: string } | null) => error?.code === "42703" || /column .* does not exist/i.test(error?.message ?? "");
@@ -85,9 +94,16 @@ export async function loadSettings(businessSlug: string): Promise<AgentSettings 
   const read = (columns: string) => agentDb().from("ai_agent_settings").select(columns).eq("business_slug", businessSlug).maybeSingle();
   let { data, error } = await read(SETTINGS_COLUMNS);
   // Deploying before the migration must not take the agent down: read the older shape, with the new features off.
+  if (error && isMissingColumn(error)) ({ data, error } = await read(NO_SOUTH_SETTINGS_COLUMNS));
   if (error && isMissingColumn(error)) ({ data, error } = await read(LEGACY_SETTINGS_COLUMNS));
   if (error) throw new Error(error.message);
   return (data as unknown as AgentSettings | null) ?? null;
+}
+
+/** The business's South Deliveries list (its own, else the built-in table). A failed read falls back to the built-in table. */
+export async function loadRegions(businessSlug: string) {
+  const settings = await loadSettings(businessSlug).catch(() => null);
+  return regionConfigFrom(settings?.south_locations);
 }
 
 export interface KnowledgeRow {

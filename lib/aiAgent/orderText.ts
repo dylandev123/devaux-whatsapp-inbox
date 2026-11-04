@@ -11,6 +11,7 @@
 import type { OrderItem, OrderRequestDraft } from "./engine.ts";
 import { normalizeText, productKey } from "./escalationUpdates.ts";
 import { type EditableOrderField, fulfilmentMethod, localParts, type OrderLine } from "./orders.ts";
+import { reconcileLineQuantities } from "./orderLines.ts";
 
 // ── Quantities ───────────────────────────────────────────────────────────────
 
@@ -206,7 +207,8 @@ export function detectFulfilment(customerTexts: string[]): "delivery" | "collect
  */
 export function refineOrderDraft(draft: OrderRequestDraft, turnTexts: string[], allTexts: string[]): OrderRequestDraft {
   if (draft.items.length === 0) return draft;
-  let out = fillStatedQuantities(draft, allTexts);
+  // Then each number is checked against the product it actually stands in front of (a count is never carried to the next product).
+  let out = reconcileLineQuantities(fillStatedQuantities(draft, allTexts), turnTexts);
   const fromTurn = detectFulfilment(turnTexts);
   const ever = new Set(allTexts.map((t) => detectFulfilment([t])).filter(Boolean));
   const method = fromTurn ?? (ever.size === 1 ? [...ever][0] : null);

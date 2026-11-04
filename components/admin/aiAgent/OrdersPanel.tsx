@@ -197,7 +197,7 @@ function OrderCard({ businessSlug, order, onChanged }: { businessSlug: string; o
           {order.fulfilment_method === "collection" ? "Collection" : order.fulfilment_method === "delivery" ? "Delivery" : "Delivery (default)"}
         </span>
         <span className={`rounded px-1.5 py-0.5 font-medium ${order.bucket === "overdue" ? "bg-red-50 text-red-700" : order.fulfilment_date ? "bg-zinc-100 text-zinc-700" : "bg-amber-50 text-amber-800"}`}>
-          {order.bucket === "review" ? "Possible order — on no delivery list yet" : order.fulfilment_date_label ? `For ${order.fulfilment_date_label}${order.bucket === "overdue" ? " — overdue" : order.bucket === "today" ? " (today)" : order.bucket === "tomorrow" ? " (tomorrow)" : ""}${timeOfDay(order.requested_for) ? ` · ${timeOfDay(order.requested_for)}` : ""}` : order.bucket === "overdue" ? "Day unclear — overdue" : "Day unclear"}
+          {order.bucket === "review" ? "Possible order — on no delivery list yet" : order.bucket === "south" ? "South delivery — date to be confirmed" : order.fulfilment_date_label ? `For ${order.fulfilment_date_label}${order.bucket === "overdue" ? " — overdue" : order.bucket === "today" ? " (today)" : order.bucket === "tomorrow" ? " (tomorrow)" : ""}${timeOfDay(order.requested_for) ? ` · ${timeOfDay(order.requested_for)}` : ""}` : order.bucket === "overdue" ? "Day unclear — overdue" : "Day unclear"}
         </span>
         {order.date_source === "unreadable" && order.requested_for && <span className="text-zinc-500">“{order.requested_for}”</span>}
         {order.delivery_address && <span>— {order.delivery_address}</span>}
@@ -654,7 +654,7 @@ function GroupedOrders({ orders, businessSlug, onChanged }: { orders: OrderView[
     const key = o.fulfilment_date ?? "none";
     let day = days.find((d) => d.key === key);
     if (!day) {
-      day = { key, label: o.fulfilment_date_label ?? (o.bucket === "overdue" ? "Day unclear — first mentioned before today" : "Day unclear"), orders: [] };
+      day = { key, label: o.fulfilment_date_label ?? (o.bucket === "south" ? "South deliveries — date to be confirmed" : o.bucket === "overdue" ? "Day unclear — first mentioned before today" : "Day unclear"), orders: [] };
       days.push(day);
     }
     day.orders.push(o);

@@ -4,7 +4,7 @@
 // from that business's stored settings, never from a request. Nothing here sends a WhatsApp message, and nothing writes to a
 // document unless sync is enabled and a person asked.
 
-import { agentDb, audit } from "@/lib/server/aiAgent/db";
+import { agentDb, audit, loadRegions } from "@/lib/server/aiAgent/db";
 import { decryptSecret, encryptionKey } from "@/lib/server/aiAgent/googleDocs/crypto";
 import { GoogleApiError, isGoogleDocFile, oauthConfig, REQUIRED_SCOPES, revokeToken } from "@/lib/server/aiAgent/googleDocs/google";
 import {
@@ -274,10 +274,11 @@ export async function importPreview(businessSlug: string): Promise<ImportPreview
   const orders = await openOrders(businessSlug, null);
   const rows = await loadLinesForOrders(businessSlug, settings.document_id, orders.map((o) => o.id));
   const plan = planInsertions(orders, new Map(rows.map((r) => [r.order_id, r.state as string])), policyOf(settings), "import");
+  const regions = await loadRegions(businessSlug);
   return {
     // Newest first, as they will read in the document (they are written oldest first).
     items: plan.insert
-      .map((o) => ({ orderId: o.id, ref: o.ref_code, line: withTag(formatOrderLine(o, settings.format).text, o.ref_code), missing: formatOrderLine(o, settings.format).missing, createdAt: o.created_at }))
+      .map((o) => ({ orderId: o.id, ref: o.ref_code, line: withTag(formatOrderLine(o, settings.format, regions).text, o.ref_code), missing: formatOrderLine(o, settings.format, regions).missing, createdAt: o.created_at }))
       .reverse(),
     skipped: plan.skipped.map((s) => ({ ref: s.order.ref_code, reason: s.reason })),
   };

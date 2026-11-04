@@ -5,8 +5,22 @@ can be hundreds of pages). Supabase stays the authoritative order record; the do
 Managed from **AI Agent → Google Docs**. **Off by default** for every business.
 
 ```
-Name — Phone — Location — Product/Quantity — Notes ⟨E-7K2QX⟩
+Location — Customer name — Phone — Product/Quantity — Notes — Delivery date — Order ref ⟨E-7K2QX⟩
 ```
+
+The field order, which fields are on, and the separator stay configurable in the dashboard. The default is the line above (location
+first, then name, phone, products, notes, delivery date, order reference). A configuration saved before this layout that still has the
+old default *order* (name, phone, location, …) moves to the new order automatically; the fields you switched on or off and your
+separator are kept, and a configuration you re-ordered yourself is never rearranged. Lines already in the document are never rewritten.
+
+A **South Delivery** starts with `SOUTH DELIVERY` (plus the destination when the address does not name it), whatever the field order:
+
+```
+SOUTH DELIVERY — St Remy, Soufrière — Tara — +1 (758) 719-0614 — 2 × Birbo Chicken (large), 1 × Birbo Chicken (small) — Signed by Louise (WhatsApp name: Tara) — Date to be confirmed — #O-EKM84 ⟨O-EKM84⟩
+```
+
+An order placed for someone else shows the person it is for, with the sender in the notes
+(`… — Tamara Amos — +1 (758) 484-7702 — 1 × Bandit (damaged, 25kg) — $155 Paid in store · Placed by Gary Devaux (+17587162997) — …`).
 
 ## What it does (and never does)
 

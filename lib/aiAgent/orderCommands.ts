@@ -382,6 +382,7 @@ export function moreInfoReply(args: { order: TrackedOrder; name: ResolvedName | 
       // The actual date only. Whether it was said, agreed by staff or defaulted stays in the order's history, not in this line.
       const day = effectiveDate(o, timezone);
       if (day.source === "unreadable") return [`When: ${clip(o.requested_for ?? "", 80)} — no date read`];
+      if (day.source === "pending") return ["Day: to be confirmed (south delivery — set it with !order #REF delivery <date>)"];
       const time = timeOfDay(o.requested_for);
       return [`Day: ${dayLabel(day.date!)}${time ? ` · ${time}` : ""}`];
     })(),

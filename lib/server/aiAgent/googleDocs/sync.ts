@@ -23,7 +23,7 @@
 // No timers are used here (see tests/aiAgentBatchWiring): retries happen on the next cron tick or dashboard action.
 
 import { randomUUID } from "crypto";
-import { agentDb } from "@/lib/server/aiAgent/db";
+import { agentDb, loadRegions } from "@/lib/server/aiAgent/db";
 import { decryptSecret } from "@/lib/server/aiAgent/googleDocs/crypto";
 import { docsClient, GoogleApiError, oauthConfig, refreshAccessToken, TIMEOUT_MS, VERIFY_TIMEOUT_MS, WRITE_TIMEOUT_MS, type DocsClient } from "@/lib/server/aiAgent/googleDocs/google";
 import {
@@ -213,6 +213,8 @@ export async function runSync(businessSlug: string, options: RunOptions = {}): P
   const documentId = settings.document_id;
   try {
     const { client } = await openClient(businessSlug);
+    // The business's own South Deliveries list decides which lines start with SOUTH DELIVERY.
+    const regions = await loadRegions(businessSlug);
 
     // 1. Settle earlier attempts whose outcome is unknown (crash / lost response). Never writes.
     await reconcile(businessSlug, documentId, client, summary, remaining, options.manual === true);
@@ -226,7 +228,7 @@ export async function runSync(businessSlug: string, options: RunOptions = {}): P
       const attemptId = randomUUID();
       if (!(await claimLine(businessSlug, documentId, order, attemptId))) continue; // someone else owns this order's attempt
       const key = { businessSlug, documentId, orderId: order.id };
-      const text = formatOrderLine(order, settings.format).text;
+      const text = formatOrderLine(order, settings.format, regions).text;
       try {
         await writeLine(client, documentId, text, order.ref_code, Math.min(WRITE_TIMEOUT_MS, Math.max(5_000, remaining() - 2_000)));
       } catch (err) {
